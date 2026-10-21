@@ -142,8 +142,7 @@ pub fn decode_tensor_info(bytes: &[u8]) -> Result<Vec<TensorInfoRaw>> {
         let data = TensorInfoData::ref_from_bytes(&head.data).map_err(cast)?;
         let count = (data.tensor_num.get() as usize).min(data.tensors.len());
         let mut tensors = Vec::with_capacity(count);
-        for i in 0..count {
-            let tensor = &data.tensors[i];
+        for tensor in data.tensors.iter().take(count) {
             tensors.push(TensorDescRaw {
                 tensor_type: tensor.tensor_type.get(),
                 format: tensor.format.get(),
