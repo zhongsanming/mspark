@@ -1,0 +1,8 @@
+[package]
+name = "mspark-df"
+version = "0.1.0"
+edition = "2024"
+description = "Compile-time dataflow: a node is a data type, dependencies are resolved statically."
+
+[dependencies]
+anyhow = "1"

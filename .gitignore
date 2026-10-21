@@ -1,0 +1,9 @@
+/.direnv
+/result
+
+
+# Added by cargo
+
+/target
+/prof_*
+__pycache__/

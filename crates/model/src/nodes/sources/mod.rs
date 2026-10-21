@@ -1,0 +1,39 @@
+//! Source nodes: each raw stream is a graph root.
+
+pub mod api_event;
+pub mod dvpp;
+pub mod ffts_profile;
+pub mod hbm;
+pub mod hccs;
+pub mod l2_cache;
+pub mod llc;
+pub mod lpm;
+pub mod net;
+pub mod node_basic_info;
+pub mod npu_mem;
+pub mod npu_module_mem;
+pub mod pcie;
+pub mod qos;
+pub mod stars_soc;
+pub mod stars_soc_profile;
+pub mod task_track;
+pub mod tensor_info;
+pub mod ts_track;
+pub mod tscpu;
+
+pub use api_event::ApiEventRow;
+pub use dvpp::DvppRow;
+pub use hbm::HbmRecord;
+pub use hccs::HccsRateRow;
+pub use l2_cache::L2CacheRow;
+pub use llc::{LLC_READ_SLOTS, LlcRecord};
+pub use net::{NetSample, NicRow, RoceRow};
+pub use node_basic_info::NodeBasicInfoRow;
+pub use npu_mem::NpuMemRow;
+pub use npu_module_mem::NpuModuleMemRow;
+pub use pcie::PcieRecord;
+pub use qos::QosRow;
+pub use stars_soc_profile::SocProfileRecord;
+pub use task_track::TaskTrackRow;
+pub use tensor_info::TensorInfoRow;
+pub use tscpu::TscpuRecord;
