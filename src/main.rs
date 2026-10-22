@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use mspark_df::{Ctx, Store, resolve};
 use mspark_model::NetSample;
 use mspark_model::raw;
@@ -492,10 +492,49 @@ fn list_devices(prof: &Path) -> Result<Vec<PathBuf>> {
     Ok(devices)
 }
 
+/// The `PROF_*` directory that owns a `device_N` directory.
+fn prof_root_of(device: &Path) -> &Path {
+    device.parent().unwrap_or(device)
+}
+
+/// All device directories under `prof`.
+///
+/// A single capture holds `device_*` directly. A multi-process run (e.g. one
+/// DDP rank per process) produces one `PROF_*` directory per rank instead, so a
+/// directory of such captures is accepted as one logical profile.
+fn collect_devices(prof: &Path) -> Result<Vec<PathBuf>> {
+    let mut devices = list_devices(prof)?;
+    if devices.is_empty() {
+        for entry in std::fs::read_dir(prof)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("PROF_") {
+                devices.extend(list_devices(&entry.path())?);
+            }
+        }
+    }
+    devices.sort();
+    devices.dedup();
+    Ok(devices)
+}
+
 fn devices(prof: &Path, only: Option<&str>) -> Result<Vec<PathBuf>> {
+    let all = collect_devices(prof)?;
     match only {
-        Some(name) => Ok(vec![prof.join(name)]),
-        None => list_devices(prof),
+        Some(name) => {
+            let matched: Vec<PathBuf> = all
+                .into_iter()
+                .filter(|device| device.file_name().is_some_and(|n| n == name))
+                .collect();
+            if matched.is_empty() {
+                bail!("no device named `{name}` under {}", prof.display());
+            }
+            Ok(matched)
+        }
+        None => Ok(all),
     }
 }
 
@@ -505,7 +544,10 @@ fn build_ctx(prof: &Path, device: &Path) -> Result<(Ctx, DeviceInfo)> {
         .with_context(|| format!("loading context for {}", device.display()))?;
     let clock = load_clock(device, info.host_freq_mhz, info.hwts_freq_mhz)
         .with_context(|| format!("loading time logs for {}", device.display()))?;
-    let mut ctx = Ctx::new(prof).with_device(device);
+    // Each device carries its own capture root, so a merged multi-process
+    // profile still reads host data from the right directory.
+    let root = prof_root_of(device);
+    let mut ctx = Ctx::new(root).with_device(device);
     ctx.insert(info.clone());
     ctx.insert(clock);
     // Host id→text dictionaries are loaded before any node runs.
@@ -1848,7 +1890,7 @@ fn device_timeline(prof: &Path, device: &Path) -> Result<(Vec<TraceEvent>, usize
 
         // --- CANN host track ---
         let api_events = resolve::<ApiEventRow>(&mut store, &ctx)?;
-        let host_clock = load_host_clock(prof)?;
+        let host_clock = load_host_clock(prof_root_of(device))?;
         let cann_pid = (info.pid << 10) | (7 << 5) | 31;
         push_process_meta(&mut events, cann_pid, "CANN", "CPU", 7);
         let mut api_tids: Vec<u32> = api_events.iter().map(|e| e.thread_id).collect();
