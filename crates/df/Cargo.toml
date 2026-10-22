@@ -1,8 +1,18 @@
 [package]
 name = "mspark-df"
-version = "0.1.0"
-edition = "2024"
-description = "Compile-time dataflow: a node is a data type, dependencies are resolved statically."
+description = "Compile-time dataflow framework: a node is a data type, dependencies are resolved statically."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE"]
 
 [dependencies]
-anyhow = "1"
+anyhow.workspace = true
+
+[lints]
+workspace = true
