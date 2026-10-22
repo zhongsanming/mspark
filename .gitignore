@@ -5,6 +5,11 @@
 # Added by cargo
 
 /target
-/prof_*
 __pycache__/
-/prof.tar.xz
+
+# Local profiling captures and exported artifacts
+/mspark_*/
+/prof_*
+/PROF_*
+/*.tar.xz
+/*.html
