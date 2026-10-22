@@ -154,6 +154,31 @@ Verified against a fresh V4 (910B) capture with the current `msprof`:
 dead ends — several were investigated to the point of proving they are *not* the
 cause, which is usually the expensive part.
 
+## Publishing
+
+Dependencies are hoisted into `[workspace.dependencies]` and the shared package
+fields (`version`, `edition`, `rust-version`, `license`, `repository`, `readme`,
+`keywords`, `categories`) live in `[workspace.package]`; every crate opts in
+with `field.workspace = true`.
+
+MSRV is **1.88** (`slice::as_chunks`).
+
+The internal crates are referenced with both `path` and `version`, so publish in
+dependency order — each step must be on crates.io before the next resolves:
+
+```bash
+cargo publish -p mspark-df
+cargo publish -p mspark-model
+cargo publish -p mspark
+```
+
+`cargo publish --dry-run -p mspark-df` passes end to end. The other two resolve
+their internal dependency from the registry, so they only verify after the
+previous step is published.
+
+> `license = "GLWTPL"` is not an SPDX identifier, so crates.io may reject the
+> upload. If it does, switch the workspace field to `license-file = "LICENSE"`.
+
 ## License
 
 [GLWTPL](./LICENSE)
