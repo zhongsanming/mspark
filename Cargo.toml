@@ -6,6 +6,9 @@ resolver = "3"
 name = "mspark"
 version = "0.1.0"
 edition = "2024"
+license = "GLWTPL"
+repository = "https://github.com/zhongsanming/mspark"
+keywords = ["ascend", "npu", "profile", "msprof"]
 
 [dependencies]
 rayon = "1"
@@ -13,5 +16,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 palc = "0.0.2"
-mspark-df = { path = "crates/df" }
-mspark-model = { path = "crates/model" }
+mspark-df = { version = "0.1.0", path = "crates/df" }
+mspark-model = { version = "0.1.0", path = "crates/model" }
