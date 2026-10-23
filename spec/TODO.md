@@ -281,6 +281,20 @@ So the port is: read `FLIP_TASK` rows from `task_track`, walk them against
 task_track field and key by `(stream, task, batch)`. No reverse engineering
 required, and no unknown fields.
 
+**Attempted and reverted.** Assigning computed batches to `DeviceTask` while
+keying `task_track` by its *raw* high-16 field mixes two different batch spaces:
+`kernel_name` collapsed from 55 580 to 4 368 of 85 241. msprof computes the batch
+on **both** sides — `TaskTrackParser.format_task_track_data` calls
+`FlipCalculator.compute_batch_id(self._task_track_data, self._task_flip_data)`
+when the chip is all-data-export, exactly as `AscendTaskGenerator` does for device
+tasks.
+
+Remaining work, in order:
+1. convert flip and task timestamps into one clock domain (they arrive from
+   different streams — this is what the attempt got wrong);
+2. run the same flip walk over `task_track` rows *and* `DeviceTask`s;
+3. then split the id field and key by `(stream, task, batch)` on both sides.
+
 Concrete next steps:
 1. find `batch_id` in the `stars_soc`/ACSQ record so `DeviceTask` can be keyed by
    `(stream, task, batch)`; only then does splitting the task_track field pay off;
