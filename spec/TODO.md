@@ -256,10 +256,21 @@ as `DeviceTask` from `stars_soc` ACSQ pairs. We do not need a `duration` field i
 the task_track record at all; we need to **join `hccl_info` attributes to our
 `DeviceTask`s** on `(stream, task, batch, context)`.
 
+**Batch field (measured, reverted):** `TASK_TRACK_FMT = "HHIIIQHHHHQQ"` splits the
+32-bit task field into `task_id` (low 16) and `batch_id` (high 16). On a device
+capture **16 388 of 85 241 records carry batch = 1** — exactly the number of
+duplicated `(stream, task)` keys seen earlier.
+
+Splitting the field and keying on `(stream, task_id)` was tried and **made things
+worse**: `kernel_name` dropped from 55 580 to 46 223 of 85 241, because batch 0
+and batch 1 then collide on one key and the map keeps only one name.
+Disambiguating needs `batch_id` on the *device* side too (`DeviceTask`), which
+`stars_soc` must carry somewhere we have not mapped — so this is blocked on that,
+not on the task_track side.
+
 Concrete next steps:
-1. extend `TaskTrackRow` with `batch_id` (and thread/model) so the join key is
-   complete — `TASK_TRACK_FMT = "HHIIIQHHHHQQ"` gives device, stream, task,
-   batch, task_type, kernel_name, model_id;
+1. find `batch_id` in the `stars_soc`/ACSQ record so `DeviceTask` can be keyed by
+   `(stream, task, batch)`; only then does splitting the task_track field pay off;
 2. read `connection_id` and `struct_type` from the api_event stream (we parse
    api_event already for `api_statistic`);
 3. then implement T22's CSV times, the Communication track `dur`, and T26's two
