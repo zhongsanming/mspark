@@ -241,10 +241,10 @@ fn as_u64(v: &Value, key: &str) -> Option<u64> {
 /// `DivideByPowersOfTenWithPrecision(value, highPrecision, 3, 3)`.
 ///
 /// `high = true` appends a tab (absolute-time columns, so Excel keeps text).
-pub fn fmt_us(ns: u64, high: bool) -> String {
+pub fn fmt_us(ns: u64, high: bool) -> compact_str::CompactString {
     // Written by hand: the previous `to_string` + slicing + `format!` version
     // allocated three times per event, and this runs once per timeline event.
-    let mut s = String::with_capacity(if high { 23 } else { 22 });
+    let mut s = compact_str::CompactString::new("");
     let int = ns / 1000;
     let frac = ns % 1000;
     if int == 0 {

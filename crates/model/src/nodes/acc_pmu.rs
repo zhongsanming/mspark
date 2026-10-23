@@ -9,7 +9,7 @@ use super::sources::SocProfileRecord;
 /// `[read_bandwidth, read_ost, write_bandwidth, write_ost]`, max per timestamp.
 #[derive(Debug, Clone)]
 pub struct AccPmuSample {
-    pub ts_us: String,
+    pub ts_us: compact_str::CompactString,
     pub values: [u64; 4],
 }
 

@@ -1125,9 +1125,9 @@ fn host_local_offset_milli(prof_root: &Path) -> Result<i128> {
     Ok(get("collectionTimeBegin")? * 1000 - get("clockMonotonicRaw")?)
 }
 
-fn host_ts_us(start_ns: u64, offset_milli: i128) -> String {
+fn host_ts_us(start_ns: u64, offset_milli: i128) -> compact_str::CompactString {
     let milli = start_ns as i128 + offset_milli;
-    format!("{}.{:03}", milli / 1000, milli % 1000)
+    compact_str::format_compact!("{}.{:03}", milli / 1000, milli % 1000)
 }
 
 fn host_cpu_rows(samples: &[HostCpuUsageRow], offset_milli: i128) -> Vec<CounterRow> {
@@ -1959,7 +1959,8 @@ impl Serialize for Num {
 }
 
 /// Ordered argument map (insertion order is part of the output contract).
-struct Args(Vec<(&'static str, Num)>);
+/// Argument list with static keys, inline for the common 1-4 arguments.
+struct Args(smallvec::SmallVec<[(&'static str, Num); 4]>);
 
 impl Serialize for Args {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -1974,7 +1975,7 @@ impl Serialize for Args {
 /// Argument list with static keys: the keys are literals, so this avoids a
 /// `String` allocation per argument per event.
 fn args(items: Vec<(&'static str, Num)>) -> Args {
-    Args(items)
+    Args(smallvec::SmallVec::from_vec(items))
 }
 
 /// One Chrome-trace event. Field order here is the serialized key order.
@@ -1984,7 +1985,7 @@ struct TraceEvent {
     pid: u32,
     tid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ts: Option<String>,
+    ts: Option<compact_str::CompactString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dur: Option<f64>,
     ph: &'static str,
@@ -2004,7 +2005,14 @@ impl TraceEvent {
         }
     }
 
-    fn complete(name: String, pid: u32, tid: u32, ts: String, dur: f64, args: Args) -> Self {
+    fn complete(
+        name: String,
+        pid: u32,
+        tid: u32,
+        ts: compact_str::CompactString,
+        dur: f64,
+        args: Args,
+    ) -> Self {
         Self {
             name,
             pid,
@@ -2016,7 +2024,13 @@ impl TraceEvent {
         }
     }
 
-    fn counter(name: String, pid: u32, tid: u32, ts: String, args: Args) -> Self {
+    fn counter(
+        name: String,
+        pid: u32,
+        tid: u32,
+        ts: compact_str::CompactString,
+        args: Args,
+    ) -> Self {
         Self {
             name,
             pid,
@@ -2032,7 +2046,7 @@ impl TraceEvent {
 struct CounterRow {
     name: String,
     tid: u32,
-    ts: String,
+    ts: compact_str::CompactString,
     args: Vec<(&'static str, Num)>,
 }
 
@@ -2042,7 +2056,8 @@ const SIO_COUNTERS: [&str; 8] = [
 const ACC_PMU_COUNTERS: [&str; 4] = ["read_bandwidth", "read_ost", "write_bandwidth", "write_ost"];
 
 fn sio_rows(samples: &[SioSample]) -> Vec<CounterRow> {
-    let mut grouped: BTreeMap<(String, usize), BTreeMap<u16, u32>> = BTreeMap::new();
+    let mut grouped: BTreeMap<(compact_str::CompactString, usize), BTreeMap<u16, u32>> =
+        BTreeMap::new();
     for sample in samples {
         for (i, value) in sample.bandwidth.iter().enumerate() {
             grouped
@@ -2151,7 +2166,7 @@ fn write_counter(events: &mut Vec<TraceEvent>, pid: u32, row: &CounterRow) {
         pid,
         row.tid,
         row.ts.clone(),
-        Args(row.args.clone()),
+        Args(smallvec::SmallVec::from_vec(row.args.clone())),
     ));
 }
 
@@ -2530,7 +2545,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
                 tid,
                 row.ts_us.clone(),
                 row.dur_us,
-                Args(Vec::new()),
+                Args(smallvec::SmallVec::new()),
             ));
             total += 1;
         }
@@ -2905,7 +2920,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
         // Overlap Analysis
         let overlap_pid = golden_pid_for(&golden_meta, "Overlap Analysis", dev)
             .unwrap_or(((info.pid << 10) | (29 << 5) | dev) as u64);
-        let mut golden_overlap: Vec<(String, u32, String, f64)> = array
+        let mut golden_overlap: Vec<(String, u32, compact_str::CompactString, f64)> = array
             .iter()
             .filter(|event| {
                 event.get("pid").and_then(|v| v.as_u64()) == Some(overlap_pid)
@@ -2919,29 +2934,29 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                         .unwrap_or("")
                         .to_string(),
                     event.get("tid").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                    event
-                        .get("ts")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
+                    compact_str::CompactString::from(
+                        event.get("ts").and_then(|v| v.as_str()).unwrap_or(""),
+                    ),
                     event.get("dur").and_then(|v| v.as_f64()).unwrap_or(0.0),
                 )
             })
             .collect();
         let produced_overlap = resolve::<OverlapRow>(&mut store, &ctx)?;
-        let mut produced_rows: Vec<(String, u32, String, f64)> = produced_overlap
-            .iter()
-            .map(|row| {
-                let (name, tid) = match row.kind {
-                    OverlapKind::Compute => ("Computing", 2),
-                    OverlapKind::Free => ("Free", 3),
-                };
-                (name.to_string(), tid, row.ts_us.clone(), row.dur_us)
-            })
-            .collect();
+        let mut produced_rows: Vec<(String, u32, compact_str::CompactString, f64)> =
+            produced_overlap
+                .iter()
+                .map(|row| {
+                    let (name, tid) = match row.kind {
+                        OverlapKind::Compute => ("Computing", 2),
+                        OverlapKind::Free => ("Free", 3),
+                    };
+                    (name.to_string(), tid, row.ts_us.clone(), row.dur_us)
+                })
+                .collect();
         overlap_golden += golden_overlap.len();
         overlap_produced += produced_rows.len();
-        let key = |r: &(String, u32, String, f64)| (r.0.clone(), r.1, r.2.clone());
+        let key =
+            |r: &(String, u32, compact_str::CompactString, f64)| (r.0.clone(), r.1, r.2.clone());
         golden_overlap.sort_by_key(key);
         produced_rows.sort_by_key(key);
         for (golden, produced) in golden_overlap.iter().zip(produced_rows.iter()) {
@@ -3777,7 +3792,7 @@ fn verify_npu_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> 
                 (row.ddr / 1024).to_string(),
                 (row.hbm / 1024).to_string(),
                 ((row.ddr + row.hbm) / 1024).to_string(),
-                fmt_us(row.ts_ns, false),
+                fmt_us(row.ts_ns, false).to_string(),
             ]);
         }
     }
@@ -3837,7 +3852,7 @@ fn verify_npu_module_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Resu
             produced.push(vec![
                 dev.to_string(),
                 tables::module_name(row.module_id).to_string(),
-                fmt_us(row.ts_ns, false),
+                fmt_us(row.ts_ns, false).to_string(),
                 (row.total_size / 1024).to_string(),
                 format!("NPU:{dev}"),
             ]);

@@ -6,7 +6,7 @@ use crate::time::{Clock, fmt_us};
 
 #[derive(Debug, Clone)]
 pub struct QosRow {
-    pub ts_us: String,
+    pub ts_us: compact_str::CompactString,
     pub values: [u32; 10],
 }
 

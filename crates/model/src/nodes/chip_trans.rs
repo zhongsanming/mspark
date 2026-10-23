@@ -19,7 +19,7 @@ pub enum ChipTransKind {
 
 #[derive(Debug, Clone)]
 pub struct ChipTransSample {
-    pub ts_us: String,
+    pub ts_us: compact_str::CompactString,
     pub kind: ChipTransKind,
     pub id: u32,
     /// PA: rx (`value1`), tx (`value2`). PCIe: write (`value1`), read (`value2`).
@@ -38,7 +38,8 @@ impl Node for ChipTransSample {
         let clock = ctx.require::<Clock>()?;
         let begin_ns = clock.begin_us as i128 * 1000;
         let mut out: Vec<ChipTransSample> = Vec::new();
-        let mut index: HashMap<(String, ChipTransKind, u32), usize> = HashMap::new();
+        let mut index: HashMap<(compact_str::CompactString, ChipTransKind, u32), usize> =
+            HashMap::new();
         for record in records.iter() {
             if let raw::SocProfileRaw::ChipTrans {
                 sys_cnt,

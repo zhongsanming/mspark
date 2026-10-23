@@ -20,6 +20,8 @@ serde_json = "1"
 rayon = "1"
 zerocopy = { version = "0.8", features = ["derive"] }
 palc = "0.0.2"
+smallvec = "1"
+compact_str = { version = "0.10", features = ["serde"] }
 
 # Internal crates: `path` for the workspace, `version` for publishing.
 mspark-df = { version = "0.1.0", path = "crates/df" }
@@ -46,6 +48,8 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rayon.workspace = true
+smallvec.workspace = true
+compact_str.workspace = true
 palc.workspace = true
 mspark-df.workspace = true
 mspark-model.workspace = true
