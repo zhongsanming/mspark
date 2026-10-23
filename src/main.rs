@@ -227,6 +227,28 @@ enum Command {
         #[arg(long)]
         golden: PathBuf,
     },
+    /// Compare the `nic` summary table against a golden CSV.
+    VerifyNicCsv {
+        /// A PROF_* directory.
+        prof: PathBuf,
+        /// Restrict to one device directory, e.g. `device_7`.
+        #[arg(long)]
+        device: Option<String>,
+        /// Golden `nic_*.csv`.
+        #[arg(long)]
+        golden: PathBuf,
+    },
+    /// Compare the `roce` summary table against a golden CSV.
+    VerifyRoceCsv {
+        /// A PROF_* directory.
+        prof: PathBuf,
+        /// Restrict to one device directory, e.g. `device_7`.
+        #[arg(long)]
+        device: Option<String>,
+        /// Golden `roce_*.csv`.
+        #[arg(long)]
+        golden: PathBuf,
+    },
     /// Compare the `pcie` summary table against a golden CSV.
     VerifyPcieCsv {
         /// A PROF_* directory.
@@ -426,6 +448,16 @@ fn main() -> Result<()> {
             device,
             golden,
         } => verify_llc_csv(&prof, device.as_deref(), &golden),
+        Command::VerifyNicCsv {
+            prof,
+            device,
+            golden,
+        } => verify_net_csv(&prof, device.as_deref(), &golden, false),
+        Command::VerifyRoceCsv {
+            prof,
+            device,
+            golden,
+        } => verify_net_csv(&prof, device.as_deref(), &golden, true),
         Command::VerifyPcieCsv {
             prof,
             device,
@@ -572,7 +604,9 @@ enum Artifact {
     Hccs,
     Hbm,
     Llc,
+    Nic,
     Pcie,
+    Roce,
     Summary,
     Timeline,
 }
@@ -593,7 +627,9 @@ impl Artifact {
             Artifact::Hccs => "hccs",
             Artifact::Hbm => "hbm",
             Artifact::Llc => "llc_read_write",
+            Artifact::Nic => "nic",
             Artifact::Pcie => "pcie",
+            Artifact::Roce => "roce",
             Artifact::Summary => "summary",
             Artifact::Timeline => "timeline",
         }
@@ -614,14 +650,16 @@ impl Artifact {
             Artifact::Hccs => "hccs.csv",
             Artifact::Hbm => "hbm.csv",
             Artifact::Llc => "llc_read_write.csv",
+            Artifact::Nic => "nic.csv",
             Artifact::Pcie => "pcie.csv",
+            Artifact::Roce => "roce.csv",
             Artifact::Summary => "summary.csv",
             Artifact::Timeline => "timeline.json",
         }
     }
 }
 
-const CSV_ARTIFACTS: [Artifact; 15] = [
+const CSV_ARTIFACTS: [Artifact; 17] = [
     Artifact::TaskTime,
     Artifact::OpSummary,
     Artifact::ApiStatistic,
@@ -635,11 +673,13 @@ const CSV_ARTIFACTS: [Artifact; 15] = [
     Artifact::Hccs,
     Artifact::Hbm,
     Artifact::Llc,
+    Artifact::Nic,
     Artifact::Pcie,
+    Artifact::Roce,
     Artifact::Summary,
 ];
 
-const ALL_ARTIFACTS: [Artifact; 16] = [
+const ALL_ARTIFACTS: [Artifact; 18] = [
     Artifact::TaskTime,
     Artifact::OpSummary,
     Artifact::ApiStatistic,
@@ -653,7 +693,9 @@ const ALL_ARTIFACTS: [Artifact; 16] = [
     Artifact::Hccs,
     Artifact::Hbm,
     Artifact::Llc,
+    Artifact::Nic,
     Artifact::Pcie,
+    Artifact::Roce,
     Artifact::Summary,
     Artifact::Timeline,
 ];
@@ -770,7 +812,9 @@ fn write_artifact(artifact: Artifact, prof: &Path, only: Option<&str>, dir: &Pat
         Artifact::Hccs => hccs_csv(prof, only, &out),
         Artifact::Hbm => hbm_csv(prof, only, &out),
         Artifact::Llc => llc_csv(prof, only, &out),
+        Artifact::Nic => nic_csv(prof, only, &out),
         Artifact::Pcie => pcie_csv(prof, only, &out),
+        Artifact::Roce => roce_csv(prof, only, &out),
         Artifact::Summary => summary(prof, only, &out),
         Artifact::Timeline => timeline(prof, only, &out),
     }
@@ -800,6 +844,172 @@ fn pcie_value(raw: u32, bandwidth: bool) -> f64 {
 }
 
 /// One LLC sample: `(bank, wall_ns, hit fraction, MiB/s)`.
+/// `start_info` fields needed by the NIC/RoCE summary.
+fn start_info_times(device: &Path) -> Result<(i128, i128)> {
+    let text = std::fs::read_to_string(find_start_info(device)?)?;
+    let root: serde_json::Value = serde_json::from_str(&text)?;
+    let get = |key: &str| -> Result<i128> {
+        root.get(key)
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i128>().ok())
+            .ok_or_else(|| anyhow::anyhow!("start_info has no {key}"))
+    };
+    Ok((get("collectionTimeBegin")?, get("clockMonotonicRaw")?))
+}
+
+fn find_start_info(device: &Path) -> Result<std::path::PathBuf> {
+    for entry in std::fs::read_dir(device)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("start_info")
+        {
+            return Ok(entry.path());
+        }
+    }
+    bail!("no start_info in {}", device.display())
+}
+
+/// `format_high_precision_for_csv(trans_into_local_time(duration_ns))`.
+///
+/// msprof computes `duration/1000 + local_time_offset` in `Decimal`, where the
+/// offset is the *shortest decimal repr* of an `f64` (≈0.1 µs resolution at this
+/// magnitude). `duration` is a nanosecond count, so the sum is done in
+/// milli-microseconds; the offset is rounded to that 0.1 µs grid with
+/// ties-to-even to match the repr.
+fn nic_timestamp_column(begin_us: i128, cmr_ns: i128, duration_ns: u64) -> String {
+    let offset_milli = begin_us * 1000 - cmr_ns;
+    let q = offset_milli.div_euclid(100);
+    let r = offset_milli.rem_euclid(100);
+    let rounded = match r.cmp(&50) {
+        std::cmp::Ordering::Greater => q + 1,
+        std::cmp::Ordering::Less => q,
+        std::cmp::Ordering::Equal if q % 2 == 0 => q,
+        std::cmp::Ordering::Equal => q + 1,
+    };
+    let milli = rounded * 100 + duration_ns as i128;
+    format!("{}.{:03}\t", milli / 1000, milli % 1000)
+}
+
+fn net_summary_rows(samples: &[NetSample], device: &Path) -> Result<Vec<[String; 10]>> {
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ts: Vec<i128> = samples.iter().map(|s| s.ts_ns).collect();
+    let duration_ns = (*ts.iter().max().unwrap() - *ts.iter().min().unwrap()) as u64;
+    let (begin_us, cmr_ns) = start_info_times(device)?;
+    let stamp = nic_timestamp_column(begin_us, cmr_ns, duration_ns);
+    let last = samples.last().unwrap();
+    let bandwidth = last.bandwidth;
+    let efficiency = |byte_rate: u64| {
+        if bandwidth > 0 {
+            round3(byte_rate as f64 * 8.0 / (bandwidth as f64 * 1024.0 * 1024.0))
+        } else {
+            0.0
+        }
+    };
+    Ok(vec![[
+        stamp,
+        py_round3(bandwidth as f64),
+        py_round3(efficiency(last.rx[1])),
+        py_round3(last.rx[0] as f64),
+        "0.0".to_string(),
+        "0.0".to_string(),
+        py_round3(efficiency(last.tx[1])),
+        py_round3(last.tx[0] as f64),
+        "0.0".to_string(),
+        "0.0".to_string(),
+    ]])
+}
+
+fn net_csv(prof: &Path, only: Option<&str>, out: &Path, roce: bool) -> Result<()> {
+    let mut body = String::from(
+        "Device_id,Timestamp(us),Bandwidth(MB/s),Rx Bandwidth efficiency(%),rxPacket/s,\
+         rxError rate(%),rxDropped rate(%),Tx Bandwidth efficiency(%),txPacket/s,\
+         txError rate(%),txDropped rate(%),funcId\n",
+    );
+    let mut total = 0usize;
+    for device in devices(prof, only)? {
+        let (ctx, info) = build_ctx(prof, &device)?;
+        let dev = info.device_id.unwrap_or(0);
+        let mut store = Store::new();
+        let samples: Vec<NetSample> = if roce {
+            resolve::<RoceRow>(&mut store, &ctx)?
+                .iter()
+                .map(|r| r.0)
+                .collect()
+        } else {
+            resolve::<NicRow>(&mut store, &ctx)?
+                .iter()
+                .map(|r| r.0)
+                .collect()
+        };
+        for row in net_summary_rows(&samples, &device)? {
+            body.push_str(&format!("{dev},{},0\n", row.join(",")));
+            total += 1;
+        }
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, body)?;
+    println!("wrote {total} rows to {}", out.display());
+    Ok(())
+}
+
+fn verify_net_csv(prof: &Path, only: Option<&str>, golden: &Path, roce: bool) -> Result<()> {
+    let mut produced: Vec<Vec<String>> = Vec::new();
+    for device in devices(prof, only)? {
+        let (ctx, info) = build_ctx(prof, &device)?;
+        let dev = info.device_id.unwrap_or(0).to_string();
+        let mut store = Store::new();
+        let samples: Vec<NetSample> = if roce {
+            resolve::<RoceRow>(&mut store, &ctx)?
+                .iter()
+                .map(|r| r.0)
+                .collect()
+        } else {
+            resolve::<NicRow>(&mut store, &ctx)?
+                .iter()
+                .map(|r| r.0)
+                .collect()
+        };
+        for row in net_summary_rows(&samples, &device)? {
+            let mut cells = vec![dev.clone()];
+            cells.extend(row.iter().cloned());
+            cells.push("0".to_string());
+            produced.push(cells);
+        }
+    }
+    compare_table(
+        golden,
+        &[
+            "Device_id",
+            "Timestamp(us)",
+            "Bandwidth(MB/s)",
+            "Rx Bandwidth efficiency(%)",
+            "rxPacket/s",
+            "rxError rate(%)",
+            "rxDropped rate(%)",
+            "Tx Bandwidth efficiency(%)",
+            "txPacket/s",
+            "txError rate(%)",
+            "txDropped rate(%)",
+            "funcId",
+        ],
+        &produced,
+    )
+}
+
+fn nic_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
+    net_csv(prof, only, out, false)
+}
+
+fn roce_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
+    net_csv(prof, only, out, true)
+}
+
 fn net_rows(samples: &[NetSample], ty: &str) -> Vec<CounterRow> {
     let mut out = Vec::with_capacity(samples.len() * 2);
     for sample in samples {

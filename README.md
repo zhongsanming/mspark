@@ -129,6 +129,7 @@ Verified against a fresh V4 (910B) capture with the current `msprof`:
 | `npu_module_mem.csv` | 31 416/31 416 rows, all columns |
 | `pcie.csv` | 7/7 rows, all columns |
 | `hccs.csv` | 2/2 rows, all columns |
+| `nic.csv` / `roce.csv` | 1/1 row, all 12 columns |
 | `llc_read_write.csv` | 3/3 rows, all columns |
 | timeline: QoS, HCCS, HBM, LLC, PCIe, NIC, RoCE | 1 660–81 476 events each, all matched |
 | timeline: SIO, Acc PMU, Stars Soc Info, Stars Chip Trans, NPU MEM (values) | all matched |
@@ -186,6 +187,13 @@ msprof's `VersionedStructParser`:
 
 Collection version 1.x is what both of our captures use, so the 2.x layouts are
 implemented but likewise **unverified**.
+
+> **`nic.csv` / `roce.csv` `Timestamp(us)` quirk:** msprof's
+> `peripheral_report.format_nic_summary` writes the *sample duration*
+> (`max(timestamp) − min(timestamp)`) through
+> `trans_into_local_time`, i.e. `duration/1000 + local_time_offset`, into the
+> column labelled `Timestamp(us)`. We reproduce that verbatim, including the
+> Decimal-over-f64-repr rounding, because the goal is to match msprof's output.
 
 Still V4-shaped and needing per-chip work when data becomes available: the V6 QoS
 variant (die-indexed series that msprof reads from `stars_soc_profile`, item type
