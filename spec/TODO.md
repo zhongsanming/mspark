@@ -308,6 +308,15 @@ the host side, and once over `DeviceTask`s against the same flip stamps for the
 device side. Keying one side by its raw high-16 field while the other uses a
 computed batch is what broke the attempt.
 
+**Third idea (time proximity) tried and reverted.** Rather than the batch, match
+each device task to the host row whose timestamp is nearest, consuming rows so two
+tasks sharing a key take the two in order. Measured `kernel_name` 46 223/85 241 —
+worse than the current 55 580, because host and device row counts per key do not
+line up exactly and consumption strips names that later tasks still need.
+
+Current best remains the plain `(stream, task)` map, last-write-wins, at
+55 580/85 241 with 26 359 names attached to the wrong duplicate.
+
 **Diagnostics (what the data says):**
 
 - 8 `FLIP_TASK` markers exist; walking them gives batch 0 → 68 189 rows,
