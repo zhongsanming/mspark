@@ -242,17 +242,35 @@ fn as_u64(v: &Value, key: &str) -> Option<u64> {
 ///
 /// `high = true` appends a tab (absolute-time columns, so Excel keeps text).
 pub fn fmt_us(ns: u64, high: bool) -> String {
-    let s = ns.to_string();
-    let (int, frac) = if s.len() <= 3 {
-        ("0".to_string(), format!("{s:0>3}"))
+    // Written by hand: the previous `to_string` + slicing + `format!` version
+    // allocated three times per event, and this runs once per timeline event.
+    let mut s = String::with_capacity(if high { 23 } else { 22 });
+    let int = ns / 1000;
+    let frac = ns % 1000;
+    if int == 0 {
+        s.push('0');
     } else {
-        (s[..s.len() - 3].to_string(), s[s.len() - 3..].to_string())
-    };
-    if high {
-        format!("{int}.{frac}\t")
-    } else {
-        format!("{int}.{frac}")
+        let mut digits = [0u8; 20];
+        let mut n = int;
+        let mut count = 0;
+        while n > 0 {
+            digits[count] = b'0' + (n % 10) as u8;
+            n /= 10;
+            count += 1;
+        }
+        while count > 0 {
+            count -= 1;
+            s.push(digits[count] as char);
+        }
     }
+    s.push('.');
+    s.push((b'0' + (frac / 100) as u8) as char);
+    s.push((b'0' + ((frac / 10) % 10) as u8) as char);
+    s.push((b'0' + (frac % 10) as u8) as char);
+    if high {
+        s.push('\t');
+    }
+    s
 }
 
 /// Clock for the device streams that record **monotonic ns** (`hbm`, `hccs`,

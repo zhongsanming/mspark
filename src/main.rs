@@ -1071,18 +1071,35 @@ fn net_rows(samples: &[NetSample], ty: &str) -> Vec<CounterRow> {
             } else {
                 0.0
             };
+            let (eff_key, pkt_key, err_key, drop_key): (
+                &'static str,
+                &'static str,
+                &'static str,
+                &'static str,
+            ) = if dir == "Rx" {
+                (
+                    "Rx Bandwidth Efficiency",
+                    "Rx Packets",
+                    "Rx Error Rate",
+                    "Rx Dropped Rate",
+                )
+            } else {
+                (
+                    "Tx Bandwidth Efficiency",
+                    "Tx Packets",
+                    "Tx Error Rate",
+                    "Tx Dropped Rate",
+                )
+            };
             out.push(CounterRow {
                 name: format!("Port 0/{dir}"),
                 tid: 0,
                 ts: ts.clone(),
                 args: vec![
-                    (
-                        format!("{dir} Bandwidth Efficiency"),
-                        Num::Float(efficiency),
-                    ),
-                    (format!("{dir} Packets"), Num::Float(counters[0] as f64)),
-                    (format!("{dir} Error Rate"), Num::Float(0.0)),
-                    (format!("{dir} Dropped Rate"), Num::Float(0.0)),
+                    (eff_key, Num::Float(efficiency)),
+                    (pkt_key, Num::Float(counters[0] as f64)),
+                    (err_key, Num::Float(0.0)),
+                    (drop_key, Num::Float(0.0)),
                 ],
             });
         }
@@ -1119,7 +1136,7 @@ fn host_cpu_rows(samples: &[HostCpuUsageRow], offset_milli: i128) -> Vec<Counter
             name: format!("CPU {}", sample.cpu_no),
             tid: 0,
             ts: host_ts_us(sample.start_ns, offset_milli),
-            args: vec![("Usage(%)".to_string(), Num::Float(sample.usage))],
+            args: vec![("Usage(%)", Num::Float(sample.usage))],
         })
         .collect()
 }
@@ -1334,13 +1351,13 @@ fn llc_track_rows(rows: &[LlcRecord], clock: &mspark_model::SamplingClock) -> Ve
             name: format!("LLC {bank} Read/Hit Rate"),
             tid: 0,
             ts: ts.clone(),
-            args: vec![("Hit Rate(%)".to_string(), Num::Float(hit))],
+            args: vec![("Hit Rate(%)", Num::Float(hit))],
         });
         out.push(CounterRow {
             name: format!("LLC {bank} Read/Throughput"),
             tid: 0,
             ts,
-            args: vec![("Throughput(MB/s)".to_string(), Num::Float(tp))],
+            args: vec![("Throughput(MB/s)", Num::Float(tp))],
         });
     }
     out
@@ -1454,10 +1471,7 @@ fn pcie_track_rows(rows: &[PcieRecord]) -> Vec<CounterRow> {
                 name: name.to_string(),
                 tid: 0,
                 ts: ts.clone(),
-                args: vec![
-                    ("Rx".to_string(), Num::Float(rx_value)),
-                    ("Tx".to_string(), Num::Float(value(tx))),
-                ],
+                args: vec![("Rx", Num::Float(rx_value)), ("Tx", Num::Float(value(tx)))],
             });
         }
     }
@@ -1944,7 +1958,7 @@ impl Serialize for Num {
 }
 
 /// Ordered argument map (insertion order is part of the output contract).
-struct Args(Vec<(String, Num)>);
+struct Args(Vec<(&'static str, Num)>);
 
 impl Serialize for Args {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -1956,13 +1970,10 @@ impl Serialize for Args {
     }
 }
 
-fn args(items: Vec<(&str, Num)>) -> Args {
-    Args(
-        items
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value))
-            .collect(),
-    )
+/// Argument list with static keys: the keys are literals, so this avoids a
+/// `String` allocation per argument per event.
+fn args(items: Vec<(&'static str, Num)>) -> Args {
+    Args(items)
 }
 
 /// One Chrome-trace event. Field order here is the serialized key order.
@@ -2021,7 +2032,7 @@ struct CounterRow {
     name: String,
     tid: u32,
     ts: String,
-    args: Vec<(String, Num)>,
+    args: Vec<(&'static str, Num)>,
 }
 
 const SIO_COUNTERS: [&str; 8] = [
@@ -2047,7 +2058,14 @@ fn sio_rows(samples: &[SioSample]) -> Vec<CounterRow> {
             ts,
             args: dies
                 .into_iter()
-                .map(|(die, value)| (format!("die {die}"), Num::Float(value as f64)))
+                .map(|(die, value)| {
+                    let key: &'static str = match die {
+                        0 => "die 0",
+                        1 => "die 1",
+                        _ => "die other",
+                    };
+                    (key, Num::Float(value as f64))
+                })
                 .collect(),
         })
         .collect()
@@ -2061,7 +2079,7 @@ fn acc_pmu_rows(samples: &[AccPmuSample]) -> Vec<CounterRow> {
                 name: (*name).to_string(),
                 tid: 0,
                 ts: sample.ts_us.clone(),
-                args: vec![("value".to_string(), Num::Int(sample.values[i]))],
+                args: vec![("value", Num::Int(sample.values[i]))],
             });
         }
     }
@@ -2076,7 +2094,7 @@ fn inter_soc_rows(samples: &[InterSocSample]) -> Vec<CounterRow> {
             tid: 0,
             ts: sample.ts_us.clone(),
             args: vec![(
-                "L2 Buffer Bw Level".to_string(),
+                "L2 Buffer Bw Level",
                 Num::Int(sample.l2_buffer_bw_level as u64),
             )],
         });
@@ -2084,10 +2102,7 @@ fn inter_soc_rows(samples: &[InterSocSample]) -> Vec<CounterRow> {
             name: "Mata Bw Level".to_string(),
             tid: 0,
             ts: sample.ts_us.clone(),
-            args: vec![(
-                "Mata Bw Level".to_string(),
-                Num::Int(sample.mata_bw_level as u64),
-            )],
+            args: vec![("Mata Bw Level", Num::Int(sample.mata_bw_level as u64))],
         });
     }
     rows
@@ -2120,8 +2135,8 @@ fn chip_trans_rows(samples: &[ChipTransSample]) -> Vec<CounterRow> {
                 tid,
                 ts: sample.ts_us.clone(),
                 args: vec![
-                    (name.to_string(), Num::Int(value)),
-                    (id_key.to_string(), Num::Int(sample.id as u64)),
+                    (name, Num::Int(value)),
+                    (id_key, Num::Int(sample.id as u64)),
                 ],
             });
         }
@@ -2157,7 +2172,7 @@ fn produced_signatures(rows: &[CounterRow]) -> Vec<String> {
             let args: Vec<(String, f64)> = row
                 .args
                 .iter()
-                .map(|(key, value)| (key.clone(), value.as_f64()))
+                .map(|(key, value)| ((*key).to_string(), value.as_f64()))
                 .collect();
             signature(&row.name, row.tid, &row.ts, &args)
         })
@@ -2269,7 +2284,7 @@ fn qos_rows(samples: &[QosRow], events: &[String]) -> Vec<CounterRow> {
                 name: format!("QoS {event}"),
                 tid: 0,
                 ts: sample.ts_us.clone(),
-                args: vec![("value".to_string(), Num::Int(sample.values[i] as u64))],
+                args: vec![("value", Num::Int(sample.values[i] as u64))],
             });
         }
     }
@@ -2288,13 +2303,13 @@ fn hccs_rows(samples: &[HccsRateRow]) -> Vec<CounterRow> {
             name: "Tx".to_string(),
             tid: 0,
             ts: ts.clone(),
-            args: vec![("Tx(MB/s)".to_string(), Num::Float(round3(sample.tx)))],
+            args: vec![("Tx(MB/s)", Num::Float(round3(sample.tx)))],
         });
         rows.push(CounterRow {
             name: "Rx".to_string(),
             tid: 0,
             ts,
-            args: vec![("Rx(MB/s)".to_string(), Num::Float(round3(sample.rx)))],
+            args: vec![("Rx(MB/s)", Num::Float(round3(sample.rx)))],
         });
     }
     rows
@@ -2314,7 +2329,7 @@ fn npu_mem_rows(samples: &[NpuMemRow]) -> Vec<CounterRow> {
                 name: format!("{owner}/{metric}"),
                 tid: 0,
                 ts: ts.clone(),
-                args: vec![("KB".to_string(), Num::Float(value as f64 / 1024.0))],
+                args: vec![("KB", Num::Float(value as f64 / 1024.0))],
             });
         }
     }
@@ -2328,18 +2343,24 @@ fn timeline(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         .map(|device| device_timeline(device))
         .collect::<Result<Vec<_>>>()?;
 
-    let mut events: Vec<TraceEvent> = Vec::new();
+    // Reserve up front: appending 7 device chunks otherwise reallocates and
+    // memmoves the whole event vector several times.
+    let capacity: usize = chunks.iter().map(|(chunk, _)| chunk.len()).sum();
+    let mut events: Vec<TraceEvent> = Vec::with_capacity(capacity);
     let mut total = 0usize;
     for (mut chunk, count) in chunks {
         events.append(&mut chunk);
         total += count;
     }
-    let body = serde_json::to_string(&events)?;
-
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(out, body)?;
+    // Stream straight to the file: building a ~100 MB `String` first costs a large
+    // allocation and a full memmove of the payload.
+    let file = std::fs::File::create(out)?;
+    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+    serde_json::to_writer(&mut writer, &events)?;
+    std::io::Write::flush(&mut writer)?;
     println!("wrote {total} timeline events to {}", out.display());
     Ok(())
 }
@@ -3593,7 +3614,7 @@ fn hbm_track_rows(rows: &[HbmRecord]) -> Vec<CounterRow> {
                 Some(dt) if dt > 0.0 => count as f64 * SCALE / dt * 1e9,
                 _ => 0.0,
             };
-            let (kind, key) = if event == 0 {
+            let (kind, key): (&str, &'static str) = if event == 0 {
                 ("Read", "Read(MB/s)")
             } else {
                 ("Write", "Write(MB/s)")
@@ -3602,7 +3623,7 @@ fn hbm_track_rows(rows: &[HbmRecord]) -> Vec<CounterRow> {
                 name: format!("HBM {hbm_id}/{kind}"),
                 tid: 0,
                 ts: fmt_us(ts_ns as u64, false),
-                args: vec![(key.to_string(), Num::Float(value))],
+                args: vec![(key, Num::Float(value))],
             });
         }
         prev = Some(ts_ns);
