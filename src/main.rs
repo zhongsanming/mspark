@@ -1093,7 +1093,7 @@ fn net_rows(samples: &[NetSample], ty: &str) -> Vec<CounterRow> {
                 )
             };
             out.push(CounterRow {
-                name: format!("Port 0/{dir}"),
+                name: compact_str::format_compact!("Port 0/{dir}"),
                 tid: 0,
                 ts: ts.clone(),
                 args: vec![
@@ -1134,7 +1134,7 @@ fn host_cpu_rows(samples: &[HostCpuUsageRow], offset_milli: i128) -> Vec<Counter
     samples
         .iter()
         .map(|sample| CounterRow {
-            name: format!("CPU {}", sample.cpu_no),
+            name: compact_str::format_compact!("CPU {}", sample.cpu_no),
             tid: 0,
             ts: host_ts_us(sample.start_ns, offset_milli),
             args: vec![("Usage(%)", Num::Float(sample.usage))],
@@ -1349,13 +1349,13 @@ fn llc_track_rows(rows: &[LlcRecord], clock: &mspark_model::SamplingClock) -> Ve
     for (bank, ts_ns, hit, tp) in llc_samples(rows, clock) {
         let ts = fmt_us(ts_ns as u64, false);
         out.push(CounterRow {
-            name: format!("LLC {bank} Read/Hit Rate"),
+            name: compact_str::format_compact!("LLC {bank} Read/Hit Rate"),
             tid: 0,
             ts: ts.clone(),
             args: vec![("Hit Rate(%)", Num::Float(hit))],
         });
         out.push(CounterRow {
-            name: format!("LLC {bank} Read/Throughput"),
+            name: compact_str::format_compact!("LLC {bank} Read/Throughput"),
             tid: 0,
             ts,
             args: vec![("Throughput(MB/s)", Num::Float(tp))],
@@ -1469,7 +1469,7 @@ fn pcie_track_rows(rows: &[PcieRecord]) -> Vec<CounterRow> {
             };
             let rx_value = if latency { 0.0 } else { value(rx) };
             out.push(CounterRow {
-                name: name.to_string(),
+                name: compact_str::CompactString::from(name),
                 tid: 0,
                 ts: ts.clone(),
                 args: vec![("Rx", Num::Float(rx_value)), ("Tx", Num::Float(value(tx)))],
@@ -1981,7 +1981,7 @@ fn args(items: Vec<(&'static str, Num)>) -> Args {
 /// One Chrome-trace event. Field order here is the serialized key order.
 #[derive(Serialize)]
 struct TraceEvent {
-    name: String,
+    name: compact_str::CompactString,
     pid: u32,
     tid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1995,7 +1995,7 @@ struct TraceEvent {
 impl TraceEvent {
     fn meta(name: &str, pid: u32, tid: u32, args: Args) -> Self {
         Self {
-            name: name.to_string(),
+            name: compact_str::CompactString::from(name),
             pid,
             tid,
             ts: None,
@@ -2006,7 +2006,7 @@ impl TraceEvent {
     }
 
     fn complete(
-        name: String,
+        name: compact_str::CompactString,
         pid: u32,
         tid: u32,
         ts: compact_str::CompactString,
@@ -2025,7 +2025,7 @@ impl TraceEvent {
     }
 
     fn counter(
-        name: String,
+        name: compact_str::CompactString,
         pid: u32,
         tid: u32,
         ts: compact_str::CompactString,
@@ -2044,7 +2044,7 @@ impl TraceEvent {
 }
 
 struct CounterRow {
-    name: String,
+    name: compact_str::CompactString,
     tid: u32,
     ts: compact_str::CompactString,
     args: Vec<(&'static str, Num)>,
@@ -2069,7 +2069,7 @@ fn sio_rows(samples: &[SioSample]) -> Vec<CounterRow> {
     grouped
         .into_iter()
         .map(|((ts, i), dies)| CounterRow {
-            name: SIO_COUNTERS[i].to_string(),
+            name: compact_str::CompactString::from(SIO_COUNTERS[i]),
             tid: 0,
             ts,
             args: dies
@@ -2092,7 +2092,7 @@ fn acc_pmu_rows(samples: &[AccPmuSample]) -> Vec<CounterRow> {
     for sample in samples {
         for (i, name) in ACC_PMU_COUNTERS.iter().enumerate() {
             rows.push(CounterRow {
-                name: (*name).to_string(),
+                name: compact_str::CompactString::from(*name),
                 tid: 0,
                 ts: sample.ts_us.clone(),
                 args: vec![("value", Num::Int(sample.values[i]))],
@@ -2106,7 +2106,7 @@ fn inter_soc_rows(samples: &[InterSocSample]) -> Vec<CounterRow> {
     let mut rows = Vec::with_capacity(samples.len() * 2);
     for sample in samples {
         rows.push(CounterRow {
-            name: "L2 Buffer Bw Level".to_string(),
+            name: compact_str::CompactString::from("L2 Buffer Bw Level"),
             tid: 0,
             ts: sample.ts_us.clone(),
             args: vec![(
@@ -2115,7 +2115,7 @@ fn inter_soc_rows(samples: &[InterSocSample]) -> Vec<CounterRow> {
             )],
         });
         rows.push(CounterRow {
-            name: "Mata Bw Level".to_string(),
+            name: compact_str::CompactString::from("Mata Bw Level"),
             tid: 0,
             ts: sample.ts_us.clone(),
             args: vec![("Mata Bw Level", Num::Int(sample.mata_bw_level as u64))],
@@ -2147,7 +2147,7 @@ fn chip_trans_rows(samples: &[ChipTransSample]) -> Vec<CounterRow> {
         };
         for (name, value) in counters {
             rows.push(CounterRow {
-                name: name.to_string(),
+                name: compact_str::CompactString::from(name),
                 tid,
                 ts: sample.ts_us.clone(),
                 args: vec![
@@ -2297,7 +2297,7 @@ fn qos_rows(samples: &[QosRow], events: &[String]) -> Vec<CounterRow> {
     for sample in samples {
         for (i, event) in events.iter().enumerate().take(10) {
             rows.push(CounterRow {
-                name: format!("QoS {event}"),
+                name: compact_str::format_compact!("QoS {event}"),
                 tid: 0,
                 ts: sample.ts_us.clone(),
                 args: vec![("value", Num::Int(sample.values[i] as u64))],
@@ -2316,13 +2316,13 @@ fn hccs_rows(samples: &[HccsRateRow]) -> Vec<CounterRow> {
     for sample in samples {
         let ts = fmt_us(sample.ts_ns as u64, false);
         rows.push(CounterRow {
-            name: "Tx".to_string(),
+            name: compact_str::CompactString::from("Tx"),
             tid: 0,
             ts: ts.clone(),
             args: vec![("Tx(MB/s)", Num::Float(round3(sample.tx)))],
         });
         rows.push(CounterRow {
-            name: "Rx".to_string(),
+            name: compact_str::CompactString::from("Rx"),
             tid: 0,
             ts,
             args: vec![("Rx(MB/s)", Num::Float(round3(sample.rx)))],
@@ -2342,7 +2342,7 @@ fn npu_mem_rows(samples: &[NpuMemRow]) -> Vec<CounterRow> {
             ("Memory", sample.ddr + sample.hbm),
         ] {
             rows.push(CounterRow {
-                name: format!("{owner}/{metric}"),
+                name: compact_str::format_compact!("{owner}/{metric}"),
                 tid: 0,
                 ts: ts.clone(),
                 args: vec![("KB", Num::Float(value as f64 / 1024.0))],
@@ -2404,7 +2404,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
 
         for ts in [clock.begin_us, clock.end_us] {
             events.push(TraceEvent::counter(
-                "AI Core Freq".to_string(),
+                compact_str::CompactString::from("AI Core Freq"),
                 freq_pid,
                 0,
                 fmt_us(ts * 1000, false),
@@ -2429,7 +2429,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
 
         for task in tasks.iter() {
             events.push(TraceEvent::complete(
-                task.name.clone(),
+                compact_str::CompactString::from(task.name.as_str()),
                 hw_pid,
                 task.tid,
                 task.ts_us.clone(),
@@ -2475,7 +2475,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
             let ts = fmt_us(host_clock.to_ns(event.begin), false);
             let dur = host_clock.duration_us_f64(event.begin, event.end);
             events.push(TraceEvent::complete(
-                trace,
+                compact_str::CompactString::from(trace.as_str()),
                 cann_pid,
                 event.thread_id,
                 ts,
@@ -2540,7 +2540,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
                 OverlapKind::Free => ("Free", 3),
             };
             events.push(TraceEvent::complete(
-                name.to_string(),
+                compact_str::CompactString::from(name),
                 overlap_pid,
                 tid,
                 row.ts_us.clone(),
@@ -3641,7 +3641,7 @@ fn hbm_track_rows(rows: &[HbmRecord]) -> Vec<CounterRow> {
                 ("Write", "Write(MB/s)")
             };
             out.push(CounterRow {
-                name: format!("HBM {hbm_id}/{kind}"),
+                name: compact_str::format_compact!("HBM {hbm_id}/{kind}"),
                 tid: 0,
                 ts: fmt_us(ts_ns as u64, false),
                 args: vec![(key, Num::Float(value))],
