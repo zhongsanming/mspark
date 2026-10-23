@@ -147,6 +147,37 @@ Values exact (816/816), timestamps differ in the sub-µs digits
 
 ## Not started
 
+### T22. `Communication` track + `communication_statistic.csv`
+The multi-device capture adds both. Shapes, from the golden and from
+`prof_struct.h`:
+
+**Track** — process `Communication`, label `NPU <dev>`, sort **16**,
+pid `(host_pid << 10) | (16 << 5) | dev`. 41 562 events for device 5:
+40 736 `ph: X` plus 826 `ph: f` flow events. Threads are named per group
+(`Group <group> Communication`, tid 0) and per plane (`Plane <n>`, tids 1..4).
+X-event `args`: `notify_id, duration estimated(us), stream id, task id,
+context id, task type, src rank, dst rank, transport type, size(Byte),
+data type, link type, bandwidth(GB/s), model id`.
+
+**CSV** — `Device_id, OP Type, Count, Total/Min/Avg/Max Time(us), Ratio(%)`,
+grouped by op type (`hcom_broadcast_`, `hcom_allReduce_`, …).
+
+**Raw sources** (both are host streams, both already in the capture):
+- `aging.compact.hccl_op_info` — 64-byte compact records;
+  `MsprofHcclOPInfo` at data offset 24: `relay:1|retry:1` (byte 6),
+  `dataType` (byte 7), `algType` (u64), `count` (u64), `groupName` (u64).
+  Python: `msparser/compact_info/hccl_op_info_bean.py`.
+- `unaging.additional.hccl_info` — 256-byte additional records;
+  `MsprofHcclInfo`: `itemId, cclTag, groupName, localRank, remoteRank,
+  rankSize, workflowMode, planeID, ctxID, notifyID, stage, role,
+  durationEstimated(double), srcAddr, dstAddr, dataSize, opType, dataType,
+  linkType`.
+
+Not started: needs the op-info → task-info join (`opId`/`notifyId`) to place
+tasks under groups/planes, the flow-event generation, and the CSV aggregation.
+`COMMUNICATION_OP` / `COMMUNICATION_TASK_INFO` in the reference DB show the
+expected joins and are usable as ground truth without being consumed.
+
 ### T21. `host_cpu_usage.csv` + `CPU Usage` track — algorithm found
 `host_cpu.data` is **text**: repeated dumps of `/proc/<pid>/stat` with an
 `uptime` line. msprof parses it in
