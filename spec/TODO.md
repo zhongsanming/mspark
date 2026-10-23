@@ -200,8 +200,37 @@ window    = [min, max] over compute ∪ comm sections
 free      = difference(window, union(compute, comm))
 ```
 
-**Blocker:** `comm` needs `op.timestamp` *and* `op.end`, and the end exists only in
-the host-produced `HCCLOpSingleDevice` table (T22). The raw op record carries a
+**Where the op window actually comes from (found):**
+`analysis/mscalculate/hccl/hccl_calculator.py` writes `hccl_single_device.db`
+(`HCCLOpSingleDevice`), so it is *derived*, not collected. `_merge_hccl_ops_and_tasks`
+builds each op's window from its tasks:
+
+```
+group by (thread_id, op_id); keep the master tasks only
+start = min(master.timestamp)
+end   = max(master.timestamp + master.duration)
+rank_size = last master's rank_size
+iter_id += 1 when a task tuple (stream, task, context, batch) repeats
+```
+
+It reads `hccl.db`'s `HcclTask`/`HcclOp` tables, whose columns are
+`timestamp, duration, op_id, is_master, plane_id, stream_id, task_id,
+context_id, batch_id, size, local/remote rank, rank_size, transport/data/link
+type, rdma_type`.
+
+So the window is recoverable **in principle** from the HCCL task stream — it is an
+aggregation of master-task windows, not a stored field.
+
+**What we still cannot read from the raw record:** our 120-byte
+`unaging.additional.hccl_info` payload maps `itemId, cclTag, groupName, ranks,
+rankSize, planeID, ctxID, notifyID, stage, role, durationEstimated, src/dst addr,
+dataSize, opType, dataType, linkType` — the tail (bytes 96..120) holds only
+`opType/dataType/linkType` and zeros, so `duration`, `op_id` and `is_master` are
+not in it. `duration` is also demonstrably not `durationEstimated`
+(0.92 us vs 0.60 us in the golden track).
+
+Next step: find the stream that feeds `hccl.db`'s `HcclTask` (the host profiler's
+HCCL collector) and read those three fields; then this and T22 unblock together. The raw op record carries a
 single stamp and all tasks of an op share it, so the interval cannot be
 reconstructed — the same ceiling as `communication_statistic`'s time columns.
 
