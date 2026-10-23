@@ -190,7 +190,23 @@ emit two:
 So `matched = 0`: our `Computing` currently includes the HCCL tasks, whereas
 msprof classifies them separately and derives the not-overlapped portion.
 
-The fix is a classification step in `OverlapRow`:
+**Algorithm (now transcribed from `overlap_analysis_processor.cpp`):**
+
+```
+compute   = union(compute-task intervals)        # named tasks, minus MC2 / AICPU / AIV kernels
+comm      = union(comm-op intervals)             # op.timestamp .. op.end
+comm_not  = difference(comm, compute)
+window    = [min, max] over compute ∪ comm sections
+free      = difference(window, union(compute, comm))
+```
+
+**Blocker:** `comm` needs `op.timestamp` *and* `op.end`, and the end exists only in
+the host-produced `HCCLOpSingleDevice` table (T22). The raw op record carries a
+single stamp and all tasks of an op share it, so the interval cannot be
+reconstructed — the same ceiling as `communication_statistic`'s time columns.
+
+Everything else is available today, so the remaining classification is a
+mechanical port once the op window exists:
 - **communication** tasks (HCCL: `task_type` 9 / 256) → `Communication` intervals;
 - `Communication(Not Overlapped)` = communication minus computing;
 - **Computing** = union of *non-communication* task intervals;
