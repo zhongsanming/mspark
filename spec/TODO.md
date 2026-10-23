@@ -257,8 +257,22 @@ Calibration already done:
   `hccl_single_device.db:HCCLOpSingleDevice` (host-profiler output), i.e. they
   are **not recoverable from the raw streams**.
 
-- Therefore `communication_statistic.csv` is blocked on a missing raw field (same
-  class as `host_cpu.data`'s producer). The `Communication` **track** is still
+- **Op-type names do resolve.** The `cclTag` hashes are in the host dictionary
+  with a `_<group>` suffix, which is exactly the CSV's `OP Type`:
+
+  ```
+  16260104095319113122 -> Broadcast_group_name_0   -> hcom_broadcast_   (415 ops)
+  9965001205355668516  -> AllReduce_group_name_0   -> hcom_allReduce_   (410 ops)
+  2170289098787283519  -> AllGather_group_name_0   -> hcom_allGather_   (1 op)
+  ```
+
+  (lowercase the first letter after `hcom_`, keep the rest). So `OP Type` and
+  `Count` in `communication_statistic.csv` are exact; only the time columns are
+  not — every task of an op shares the op's stamp, so `span` is 0 and
+  `Σ durationEstimated` is 1-2 orders of magnitude short of the golden totals.
+
+- Therefore the CSV can be shipped with **exact** `OP Type`/`Count` and
+  **approximate** time columns. The `Communication` **track** is still
   implementable approximately from the task records (args + plane/group
   threading), with `dur` from `durationEstimated` — documented as an
   approximation.
