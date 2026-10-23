@@ -155,6 +155,18 @@ Verified against a fresh V4 (910B) capture with the current `msprof`:
 dead ends — several were investigated to the point of proving they are *not* the
 cause, which is usually the expensive part.
 
+## Fidelity policy
+
+The target is to **stay aligned with msprof's artifacts** — same files, same
+columns, same rows, same semantics. Byte-exactness is *not* required: where a
+value lands on a rounding boundary (f64 vs msprof's `Decimal`), being within a
+handful of ULPs is acceptable, and such cases are noted in `spec/TODO.md` rather
+than chased.
+
+What *is* required is that nothing is silently invented: when we synthesise or
+approximate something (a join we cannot reproduce, a rounding difference, a
+format we reverse-engineered), it is written down here or in `spec/TODO.md`.
+
 ## Chip support
 
 Chip detection uses `platform_version` from `info.json`, mapping to the same

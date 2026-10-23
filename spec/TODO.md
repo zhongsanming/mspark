@@ -180,10 +180,14 @@ Calibration already done:
 - Record prefix is `magic 0x5a5a, level 10000, type 10, thread, data_len 26,
   timestamp`; the hashes resolve through `unaging.additional.hash_dic`:
   `5862276093215481612 -> group_name_0`, `8452606241940441763 -> MESH-RING-NHR`.
-- The naive packed-struct offsets are **wrong**: reading `<BBIQQQ` at data+0
-  gives `count = 64` where `COMMUNICATION_OP` says `3847744`. `HcclOpInfoBean`
-  indexes `data[6..10]`, i.e. **8-byte words of the whole record**, not bytes of
-  the payload — that indexing is what still needs pinning down.
+- Layout **confirmed** by locating the dictionary hashes inside the record:
+  `byte 24 = flags (relay|retry)`, `byte 25 = dataType`, `byte 26 = algType (u64)`,
+  `byte 34 = count (u64)`, `byte 42 = groupName (u64)`. A record with
+  `(dtype 4, alg MESH-RING-NHR, count 3847744, grp group_name_0)` matches the
+  `COMMUNICATION_OP` row exactly. (The earlier "count = 64" came from comparing
+  *different* ops — records are not in DB order.)
+- `opName`, `opType`, `startNs`/`endNs`, `connectionId`, `opId` and `rankSize`
+  are **not** in this stream; they must come from the task-info join.
 - `COMMUNICATION_TASK_INFO` has **39 910 rows** vs 40 736 `ph: X` events, so the
   task table is the track's source.
 
