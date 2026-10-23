@@ -579,7 +579,29 @@ fn devices(prof: &Path, only: Option<&str>) -> Result<Vec<PathBuf>> {
 }
 
 /// Build the immutable context: device info + syscnt conversion clock.
-fn build_ctx(prof: &Path, device: &Path) -> Result<(Ctx, DeviceInfo)> {
+/// One [`Ctx`] per device, built once.
+///
+/// Building a context parses `info.json`, the start logs and the host
+/// dictionaries, so doing it per artifact (35 call sites) is pure waste. Like
+/// [`store_for`], the cache is keyed by the device directory.
+type CtxCache = HashMap<std::path::PathBuf, (Arc<Ctx>, DeviceInfo)>;
+
+fn ctx_for(device: &Path) -> Result<(Arc<Ctx>, DeviceInfo)> {
+    static CTXS: OnceLock<Mutex<CtxCache>> = OnceLock::new();
+    let registry = CTXS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(entry) = registry.lock().expect("ctx registry").get(device) {
+        return Ok(entry.clone());
+    }
+    let (ctx, info) = build_ctx(device)?;
+    let entry = (Arc::new(ctx), info);
+    registry
+        .lock()
+        .expect("ctx registry")
+        .insert(device.to_path_buf(), entry.clone());
+    Ok(entry)
+}
+
+fn build_ctx(device: &Path) -> Result<(Ctx, DeviceInfo)> {
     let info = load_device_info(device)
         .with_context(|| format!("loading context for {}", device.display()))?;
     let clock = load_clock(device, info.host_freq_mhz, info.hwts_freq_mhz)
@@ -591,7 +613,7 @@ fn build_ctx(prof: &Path, device: &Path) -> Result<(Ctx, DeviceInfo)> {
     ctx.insert(info.clone());
     ctx.insert(clock);
     // Host id→text dictionaries are loaded before any node runs.
-    let (hash, types) = load_dictionaries(&prof.join("host").join("data"));
+    let (hash, types) = load_dictionaries(&root.join("host").join("data"));
     ctx.insert(hash);
     ctx.insert(types);
     Ok((ctx, info))
@@ -957,7 +979,7 @@ fn net_csv(prof: &Path, only: Option<&str>, out: &Path, roce: bool) -> Result<()
     );
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -988,7 +1010,7 @@ fn net_csv(prof: &Path, only: Option<&str>, out: &Path, roce: bool) -> Result<()
 fn verify_net_csv(prof: &Path, only: Option<&str>, golden: &Path, roce: bool) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -1117,7 +1139,7 @@ fn host_mem_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Total Memory,Peak Used Memory,Recommend Memory\n");
     let mut rows = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, _info) = build_ctx(prof, &device)?;
+        let (ctx, _info) = ctx_for(&device)?;
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
         let samples = resolve::<HostMemUsageRow>(&mut store, &ctx)?;
@@ -1149,7 +1171,7 @@ fn communication_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> 
     let mut body = String::from("Device_id,OP Type,Count\n");
     let mut rows = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -1217,7 +1239,7 @@ fn host_cpu_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         String::from("Device_id,Total Cpu Numbers,Occupied Cpu Numbers,Recommend Cpu Numbers\n");
     let mut total_rows = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, _info) = build_ctx(prof, &device)?;
+        let (ctx, _info) = ctx_for(&device)?;
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
         let samples = resolve::<HostCpuUsageRow>(&mut store, &ctx)?;
@@ -1360,7 +1382,7 @@ fn llc_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Mode,Task,Hit Rate(%),Throughput(MB/s)\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -1382,7 +1404,7 @@ fn llc_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_llc_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -1466,7 +1488,7 @@ fn pcie_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Mode,Min,Max,Avg\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -1486,7 +1508,7 @@ fn pcie_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_pcie_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -1506,7 +1528,7 @@ fn summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let (mut tasks_total, mut ops_total, mut events_total) = (0u64, 0u64, 0u64);
     let mut peak_max = 0u64;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let shared_store = store_for(ctx.device_dir()?);
         // The guard must not outlive the calls below: `device_timeline` locks the
@@ -1519,7 +1541,7 @@ fn summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
             let mut store = shared_store.lock().expect("store lock");
             resolve::<OpSummaryRow>(&mut store, &ctx)?.len() as u64
         };
-        let (_, events) = device_timeline(prof, &device)?;
+        let (_, events) = device_timeline(&device)?;
         let peak = {
             let mut store = shared_store.lock().expect("store lock");
             resolve::<NpuMemRow>(&mut store, &ctx)?
@@ -1603,7 +1625,7 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
     }
 
     for device in &devices {
-        let (ctx, info) = build_ctx(prof, device)?;
+        let (ctx, info) = ctx_for(device)?;
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
         let soc = resolve::<StarsSocEntry>(&mut store, &ctx)?;
@@ -1670,7 +1692,7 @@ where
     let chunks: Vec<R> = devices
         .par_iter()
         .map(|device| {
-            let (ctx, info) = build_ctx(prof, device)?;
+            let (ctx, info) = ctx_for(device)?;
             f(&ctx, &info)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1717,7 +1739,7 @@ fn verify(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
 
     let mut produced: HashMap<(u32, u32), Vec<TaskTimeRow>> = HashMap::new();
     for device in devices(prof, only)? {
-        let (ctx, _) = build_ctx(prof, &device)?;
+        let (ctx, _) = ctx_for(&device)?;
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<TaskTimeRow>(&mut store, &ctx)?.iter() {
@@ -1856,7 +1878,7 @@ fn verify_op_summary(prof: &Path, only: Option<&str>, golden: &Path) -> Result<(
 
     let mut produced = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, _) = build_ctx(prof, &device)?;
+        let (ctx, _) = ctx_for(&device)?;
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
         produced.extend(resolve::<OpSummaryRow>(&mut store, &ctx)?.iter().cloned());
@@ -2303,7 +2325,7 @@ fn timeline(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let devices = devices(prof, only)?;
     let chunks: Vec<(Vec<TraceEvent>, usize)> = devices
         .par_iter()
-        .map(|device| device_timeline(prof, device))
+        .map(|device| device_timeline(device))
         .collect::<Result<Vec<_>>>()?;
 
     let mut events: Vec<TraceEvent> = Vec::new();
@@ -2324,8 +2346,8 @@ fn timeline(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 
 /// Build one device's timeline events. Devices are independent, so this runs
 /// in parallel; the caller concatenates chunks in device order.
-fn device_timeline(prof: &Path, device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
-    let (ctx, info) = build_ctx(prof, device)?;
+fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
+    let (ctx, info) = ctx_for(device)?;
     let mut events: Vec<TraceEvent> = Vec::new();
     let mut total = 0usize;
     {
@@ -2667,7 +2689,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
     let mut overlap_max_dur = 0.0f64;
 
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let hw_pid = ((info.pid << 10) | (13 << 5) | dev) as u64;
         let expected: Vec<&serde_json::Value> = array
@@ -2965,7 +2987,7 @@ fn ts_cpu_event_ids(device: &Path) -> Result<Vec<u64>> {
 fn ts_cpu_pmu_events(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Event,Name,Count\n");
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -3001,7 +3023,7 @@ fn ts_cpu_pmu_events(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> 
 fn verify_ts_cpu_pmu_events(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -3034,7 +3056,7 @@ fn verify_ts_cpu_pmu_events(prof: &Path, only: Option<&str>, golden: &Path) -> R
 fn ts_cpu_top_function(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Function,Cycles,Cycles(%)\n");
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -3078,7 +3100,7 @@ fn ts_cpu_top_function(prof: &Path, only: Option<&str>, out: &Path) -> Result<()
 fn verify_ts_cpu_top_function(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -3127,7 +3149,7 @@ fn api_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body =
         String::from("Device_id,Level,API Name,Time(us),Count,Avg(us),Min(us),Max(us),Variance\n");
     if let Some(device) = devices(prof, only)?.first() {
-        let (ctx, _) = build_ctx(prof, device)?;
+        let (ctx, _) = ctx_for(device)?;
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<ApiStatisticRow>(&mut store, &ctx)?.iter() {
@@ -3155,7 +3177,7 @@ fn api_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_api_statistic(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     if let Some(device) = devices(prof, only)?.first() {
-        let (ctx, _) = build_ctx(prof, device)?;
+        let (ctx, _) = ctx_for(device)?;
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<ApiStatisticRow>(&mut store, &ctx)?.iter() {
@@ -3194,7 +3216,7 @@ fn op_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         "Device_id,OP Type,Core Type,Count,Total Time(us),Min Time(us),Avg Time(us),Max Time(us),Ratio(%)\n",
     );
     for device in devices(prof, only)? {
-        let (ctx, _) = build_ctx(prof, &device)?;
+        let (ctx, _) = ctx_for(&device)?;
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<OpStatisticRow>(&mut store, &ctx)?.iter() {
@@ -3223,7 +3245,7 @@ fn op_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_op_statistic(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, _) = build_ctx(prof, &device)?;
+        let (ctx, _) = ctx_for(&device)?;
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<OpStatisticRow>(&mut store, &ctx)?.iter() {
@@ -3372,7 +3394,7 @@ fn l2_cache(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_l2_cache(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -3417,7 +3439,7 @@ fn dvpp(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     );
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -3445,7 +3467,7 @@ fn dvpp(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_dvpp(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -3514,7 +3536,7 @@ fn hccs_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Mode,Max,Min,Average\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -3535,7 +3557,7 @@ fn hccs_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_hccs_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -3651,7 +3673,7 @@ fn hbm_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Metric,Read(MB/s),Write(MB/s)\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -3671,7 +3693,7 @@ fn hbm_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_hbm_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -3690,7 +3712,7 @@ fn npu_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,event,ddr(KB),hbm(KB),memory(KB),timestamp(us)\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -3717,7 +3739,7 @@ fn npu_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_npu_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
@@ -3780,7 +3802,7 @@ fn npu_module_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_npu_module_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let shared_store = store_for(ctx.device_dir()?);
         let mut store = shared_store.lock().expect("store lock");
