@@ -117,7 +117,17 @@ Remaining suspects for the 0.56 vs 3.941 µs gap: `TASK` may be built from the
 AIV/`ts_track` records rather than ACSQ for vector-core ops, or `contextId`
 (which our `Acsq` record does not carry) participates in the key.
 
-### T1i. `kernel_type` — distribution fixed, rows permuted
+### T1i. `kernel_type` — distribution fixed, rows permuted (experiments so far)
+Tried and rejected: sorting `node_basic_info` by its own compact-header timestamp
+before pairing. On the multi-device capture the result is bit-identical to
+file-order pairing (38 340/85 241 either way), so the stream is already emitted in
+time order — the drift comes from elsewhere.
+
+Note also that this capture is much larger than the one used for the earlier
+54 981-row measurements (85 241 tasks), so cross-capture percentages are not
+comparable; always re-measure on the capture being discussed.
+
+### T1i (original analysis)
 The `mix` flag must **not** override the core type: golden takes it from
 `node_basic_info.task_type` (0 → AI_CORE, 2 → AI_VECTOR_CORE, 5 → MIX_AIV).
 With the override removed our histogram matches golden exactly
