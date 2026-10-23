@@ -289,11 +289,32 @@ on **both** sides — `TaskTrackParser.format_task_track_data` calls
 when the chip is all-data-export, exactly as `AscendTaskGenerator` does for device
 tasks.
 
-Remaining work, in order:
-1. convert flip and task timestamps into one clock domain (they arrive from
-   different streams — this is what the attempt got wrong);
-2. run the same flip walk over `task_track` rows *and* `DeviceTask`s;
-3. then split the id field and key by `(stream, task, batch)` on both sides.
+**Clock domains — settled from code.** Every host stream timestamp goes through
+`Utils::GetLocalTime` (`infrastructure/utils/time_utils.cpp`):
+
+```
+GetLocalTime(timestamp, record) = timestamp + (record.startTimeNs - record.baseTimeNs)
+```
+
+i.e. `raw + (host start_info.wall_ns − host start_info.clockMonotonicRaw)` — which
+is exactly the offset our `MonoClock` computes. Device tasks use
+`GetTimeFromSyscnt` (hwts-frequency conversion) instead. So the domains were never
+the problem: flips are MonoClock, device tasks are Clock, and both already land in
+wall ns.
+
+**The real requirement** is therefore only this: `compute_batch_id` must run
+**twice** — once over `task_track` rows (with `FLIP_TASK` rows as the flips) for
+the host side, and once over `DeviceTask`s against the same flip stamps for the
+device side. Keying one side by its raw high-16 field while the other uses a
+computed batch is what broke the attempt.
+
+Revised remaining work:
+1. mark `FLIP_TASK` rows in `task_track` (task type via `type_info_dic`) and keep
+   their compact-header timestamp;
+2. walk `task_track` rows against those flips → computed batch per row;
+3. walk `DeviceTask`s against the same flips (MonoClock-converted) → computed
+   batch per task;
+4. split the id field and key by `(stream, task, batch)` on both sides.
 
 Concrete next steps:
 1. find `batch_id` in the `stars_soc`/ACSQ record so `DeviceTask` can be keyed by
