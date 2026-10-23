@@ -11,7 +11,7 @@ use super::sources::SocProfileRecord;
 /// One per-die SIO bandwidth sample (bytes are converted to MB/s from deltas).
 #[derive(Debug, Clone)]
 pub struct SioSample {
-    pub ts_us: String,
+    pub ts_us: compact_str::CompactString,
     pub die: u16,
     pub bandwidth: [u32; 8],
 }

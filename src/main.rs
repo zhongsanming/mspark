@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, bail};
 use mspark_df::{Ctx, Store, resolve};
@@ -43,6 +45,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print the node dependency graph (generated from the `graph!` table).
+    Graph {
+        /// Output format: `dot` (default) or `mermaid`.
+        #[arg(long, default_value = "dot")]
+        format: String,
+    },
     /// Decode the raw device streams and report per-stream statistics.
     Stats {
         /// A PROF_* directory.
@@ -398,6 +406,7 @@ fn main() -> Result<()> {
         );
     };
     match command {
+        Command::Graph { format } => graph(&format),
         Command::Stats { prof, device } => stats(&prof, device.as_deref()),
         Command::TaskTime { prof, device, out } => task_time(&prof, device.as_deref(), &out),
         Command::Verify {
@@ -571,7 +580,29 @@ fn devices(prof: &Path, only: Option<&str>) -> Result<Vec<PathBuf>> {
 }
 
 /// Build the immutable context: device info + syscnt conversion clock.
-fn build_ctx(prof: &Path, device: &Path) -> Result<(Ctx, DeviceInfo)> {
+/// One [`Ctx`] per device, built once.
+///
+/// Building a context parses `info.json`, the start logs and the host
+/// dictionaries, so doing it per artifact (35 call sites) is pure waste. Like
+/// [`store_for`], the cache is keyed by the device directory.
+type CtxCache = HashMap<std::path::PathBuf, (Arc<Ctx>, DeviceInfo)>;
+
+fn ctx_for(device: &Path) -> Result<(Arc<Ctx>, DeviceInfo)> {
+    static CTXS: OnceLock<Mutex<CtxCache>> = OnceLock::new();
+    let registry = CTXS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(entry) = registry.lock().expect("ctx registry").get(device) {
+        return Ok(entry.clone());
+    }
+    let (ctx, info) = build_ctx(device)?;
+    let entry = (Arc::new(ctx), info);
+    registry
+        .lock()
+        .expect("ctx registry")
+        .insert(device.to_path_buf(), entry.clone());
+    Ok(entry)
+}
+
+fn build_ctx(device: &Path) -> Result<(Ctx, DeviceInfo)> {
     let info = load_device_info(device)
         .with_context(|| format!("loading context for {}", device.display()))?;
     let clock = load_clock(device, info.host_freq_mhz, info.hwts_freq_mhz)
@@ -583,7 +614,7 @@ fn build_ctx(prof: &Path, device: &Path) -> Result<(Ctx, DeviceInfo)> {
     ctx.insert(info.clone());
     ctx.insert(clock);
     // Host id→text dictionaries are loaded before any node runs.
-    let (hash, types) = load_dictionaries(&prof.join("host").join("data"));
+    let (hash, types) = load_dictionaries(&root.join("host").join("data"));
     ctx.insert(hash);
     ctx.insert(types);
     Ok((ctx, info))
@@ -949,9 +980,10 @@ fn net_csv(prof: &Path, only: Option<&str>, out: &Path, roce: bool) -> Result<()
     );
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let samples: Vec<NetSample> = if roce {
             resolve::<RoceRow>(&mut store, &ctx)?
                 .iter()
@@ -979,9 +1011,10 @@ fn net_csv(prof: &Path, only: Option<&str>, out: &Path, roce: bool) -> Result<()
 fn verify_net_csv(prof: &Path, only: Option<&str>, golden: &Path, roce: bool) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let samples: Vec<NetSample> = if roce {
             resolve::<RoceRow>(&mut store, &ctx)?
                 .iter()
@@ -1039,18 +1072,35 @@ fn net_rows(samples: &[NetSample], ty: &str) -> Vec<CounterRow> {
             } else {
                 0.0
             };
+            let (eff_key, pkt_key, err_key, drop_key): (
+                &'static str,
+                &'static str,
+                &'static str,
+                &'static str,
+            ) = if dir == "Rx" {
+                (
+                    "Rx Bandwidth Efficiency",
+                    "Rx Packets",
+                    "Rx Error Rate",
+                    "Rx Dropped Rate",
+                )
+            } else {
+                (
+                    "Tx Bandwidth Efficiency",
+                    "Tx Packets",
+                    "Tx Error Rate",
+                    "Tx Dropped Rate",
+                )
+            };
             out.push(CounterRow {
                 name: format!("Port 0/{dir}"),
                 tid: 0,
                 ts: ts.clone(),
                 args: vec![
-                    (
-                        format!("{dir} Bandwidth Efficiency"),
-                        Num::Float(efficiency),
-                    ),
-                    (format!("{dir} Packets"), Num::Float(counters[0] as f64)),
-                    (format!("{dir} Error Rate"), Num::Float(0.0)),
-                    (format!("{dir} Dropped Rate"), Num::Float(0.0)),
+                    (eff_key, Num::Float(efficiency)),
+                    (pkt_key, Num::Float(counters[0] as f64)),
+                    (err_key, Num::Float(0.0)),
+                    (drop_key, Num::Float(0.0)),
                 ],
             });
         }
@@ -1075,9 +1125,9 @@ fn host_local_offset_milli(prof_root: &Path) -> Result<i128> {
     Ok(get("collectionTimeBegin")? * 1000 - get("clockMonotonicRaw")?)
 }
 
-fn host_ts_us(start_ns: u64, offset_milli: i128) -> String {
+fn host_ts_us(start_ns: u64, offset_milli: i128) -> compact_str::CompactString {
     let milli = start_ns as i128 + offset_milli;
-    format!("{}.{:03}", milli / 1000, milli % 1000)
+    compact_str::format_compact!("{}.{:03}", milli / 1000, milli % 1000)
 }
 
 fn host_cpu_rows(samples: &[HostCpuUsageRow], offset_milli: i128) -> Vec<CounterRow> {
@@ -1087,7 +1137,7 @@ fn host_cpu_rows(samples: &[HostCpuUsageRow], offset_milli: i128) -> Vec<Counter
             name: format!("CPU {}", sample.cpu_no),
             tid: 0,
             ts: host_ts_us(sample.start_ns, offset_milli),
-            args: vec![("Usage(%)".to_string(), Num::Float(sample.usage))],
+            args: vec![("Usage(%)", Num::Float(sample.usage))],
         })
         .collect()
 }
@@ -1107,8 +1157,9 @@ fn host_mem_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Total Memory,Peak Used Memory,Recommend Memory\n");
     let mut rows = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, _info) = build_ctx(prof, &device)?;
-        let mut store = Store::new();
+        let (ctx, _info) = ctx_for(&device)?;
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let samples = resolve::<HostMemUsageRow>(&mut store, &ctx)?;
         let total_kb = std::fs::read_to_string(ctx.root().join("host").join("info.json"))
             .ok()
@@ -1138,9 +1189,10 @@ fn communication_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> 
     let mut body = String::from("Device_id,OP Type,Count\n");
     let mut rows = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let ops = resolve::<HcclOpRow>(&mut store, &ctx)?;
         let tasks = resolve::<HcclInfoRow>(&mut store, &ctx)?;
         let dic = ctx.require::<mspark_model::HashDic>()?;
@@ -1205,8 +1257,9 @@ fn host_cpu_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         String::from("Device_id,Total Cpu Numbers,Occupied Cpu Numbers,Recommend Cpu Numbers\n");
     let mut total_rows = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, _info) = build_ctx(prof, &device)?;
-        let mut store = Store::new();
+        let (ctx, _info) = ctx_for(&device)?;
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let samples = resolve::<HostCpuUsageRow>(&mut store, &ctx)?;
         use std::collections::BTreeMap;
         let mut peak: BTreeMap<u64, f64> = BTreeMap::new();
@@ -1299,13 +1352,13 @@ fn llc_track_rows(rows: &[LlcRecord], clock: &mspark_model::SamplingClock) -> Ve
             name: format!("LLC {bank} Read/Hit Rate"),
             tid: 0,
             ts: ts.clone(),
-            args: vec![("Hit Rate(%)".to_string(), Num::Float(hit))],
+            args: vec![("Hit Rate(%)", Num::Float(hit))],
         });
         out.push(CounterRow {
             name: format!("LLC {bank} Read/Throughput"),
             tid: 0,
             ts,
-            args: vec![("Throughput(MB/s)".to_string(), Num::Float(tp))],
+            args: vec![("Throughput(MB/s)", Num::Float(tp))],
         });
     }
     out
@@ -1347,9 +1400,10 @@ fn llc_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Mode,Task,Hit Rate(%),Throughput(MB/s)\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let rows = resolve::<LlcRecord>(&mut store, &ctx)?;
         let clock = mspark_model::load_sampling_clock(ctx.device_dir()?)?;
         for [task, hit, tp] in llc_csv_table(&rows, &clock) {
@@ -1368,9 +1422,10 @@ fn llc_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_llc_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let rows = resolve::<LlcRecord>(&mut store, &ctx)?;
         let clock = mspark_model::load_sampling_clock(ctx.device_dir()?)?;
         for [task, hit, tp] in llc_csv_table(&rows, &clock) {
@@ -1417,10 +1472,7 @@ fn pcie_track_rows(rows: &[PcieRecord]) -> Vec<CounterRow> {
                 name: name.to_string(),
                 tid: 0,
                 ts: ts.clone(),
-                args: vec![
-                    ("Rx".to_string(), Num::Float(rx_value)),
-                    ("Tx".to_string(), Num::Float(value(tx))),
-                ],
+                args: vec![("Rx", Num::Float(rx_value)), ("Tx", Num::Float(value(tx)))],
             });
         }
     }
@@ -1451,9 +1503,10 @@ fn pcie_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Mode,Min,Max,Avg\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for [mode, min, max, avg] in pcie_table(&resolve::<PcieRecord>(&mut store, &ctx)?) {
             body.push_str(&format!("{dev},{mode},{min},{max},{avg}\n"));
             total += 1;
@@ -1470,9 +1523,10 @@ fn pcie_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_pcie_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for [mode, min, max, avg] in pcie_table(&resolve::<PcieRecord>(&mut store, &ctx)?) {
             produced.push(vec![dev.clone(), mode, min, max, avg]);
         }
@@ -1489,17 +1543,28 @@ fn summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let (mut tasks_total, mut ops_total, mut events_total) = (0u64, 0u64, 0u64);
     let mut peak_max = 0u64;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
-        let tasks = resolve::<TaskTimeRow>(&mut store, &ctx)?.len() as u64;
-        let ops = resolve::<OpSummaryRow>(&mut store, &ctx)?.len() as u64;
-        let (_, events) = device_timeline(prof, &device)?;
-        let peak = resolve::<NpuMemRow>(&mut store, &ctx)?
-            .iter()
-            .map(|row| (row.ddr + row.hbm) / 1024)
-            .max()
-            .unwrap_or(0);
+        let shared_store = store_for(ctx.device_dir()?);
+        // The guard must not outlive the calls below: `device_timeline` locks the
+        // same per-device store and would deadlock.
+        let tasks = {
+            let mut store = shared_store.lock().expect("store lock");
+            resolve::<TaskTimeRow>(&mut store, &ctx)?.len() as u64
+        };
+        let ops = {
+            let mut store = shared_store.lock().expect("store lock");
+            resolve::<OpSummaryRow>(&mut store, &ctx)?.len() as u64
+        };
+        let (_, events) = device_timeline(&device)?;
+        let peak = {
+            let mut store = shared_store.lock().expect("store lock");
+            resolve::<NpuMemRow>(&mut store, &ctx)?
+                .iter()
+                .map(|row| (row.ddr + row.hbm) / 1024)
+                .max()
+                .unwrap_or(0)
+        };
         body.push_str(&format!("{dev},{tasks},{ops},{events},{peak}\n"));
         tasks_total += tasks;
         ops_total += ops;
@@ -1517,6 +1582,55 @@ fn summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Print the node graph (`mspark_df::graph!` holds every edge at compile time).
+fn graph(format: &str) -> Result<()> {
+    let nodes = mspark_model::NODE_GRAPH;
+    match format {
+        "mermaid" => {
+            println!("graph TD");
+            for (name, deps) in nodes {
+                if deps.is_empty() {
+                    println!("  {name}[(\"{name}\")]");
+                }
+                for dep in *deps {
+                    println!("  {dep} --> {name}");
+                }
+            }
+        }
+        "dot" => {
+            println!("digraph mspark {{");
+            println!("  rankdir=LR;");
+            println!("  node [shape=box, fontsize=10];");
+            for (name, deps) in nodes {
+                if deps.is_empty() {
+                    println!("  \"{name}\";");
+                }
+                for dep in *deps {
+                    println!("  \"{dep}\" -> \"{name}\";");
+                }
+            }
+            println!("}}");
+        }
+        other => bail!("unknown graph format `{other}`; valid: dot, mermaid"),
+    }
+    Ok(())
+}
+
+/// One memoised [`Store`] per device directory, shared by every artifact.
+///
+/// `resolve` already memoises within a store, so a single store per device makes
+/// the whole export share one `DeviceTask` / `stars_soc` decode instead of
+/// rebuilding it once per artifact.
+fn store_for(device: &Path) -> Arc<Mutex<Store>> {
+    static STORES: OnceLock<Mutex<HashMap<std::path::PathBuf, Arc<Mutex<Store>>>>> =
+        OnceLock::new();
+    let registry = STORES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = registry.lock().expect("store registry");
+    map.entry(device.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(Store::new())))
+        .clone()
+}
+
 fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
     let devices = devices(prof, only)?;
     println!("profile: {}", prof.display());
@@ -1526,8 +1640,9 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
     }
 
     for device in &devices {
-        let (ctx, info) = build_ctx(prof, device)?;
-        let mut store = Store::new();
+        let (ctx, info) = ctx_for(device)?;
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let soc = resolve::<StarsSocEntry>(&mut store, &ctx)?;
         let pmu = resolve::<PmuData>(&mut store, &ctx)?;
         let track = resolve::<TrackFlip>(&mut store, &ctx)?;
@@ -1592,7 +1707,7 @@ where
     let chunks: Vec<R> = devices
         .par_iter()
         .map(|device| {
-            let (ctx, info) = build_ctx(prof, device)?;
+            let (ctx, info) = ctx_for(device)?;
             f(&ctx, &info)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1601,7 +1716,8 @@ where
 
 fn task_time(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let chunks = per_device(prof, only, |ctx, _info| {
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let mut body = String::new();
         for row in resolve::<TaskTimeRow>(&mut store, ctx)?.iter() {
             body.push_str(&row.to_csv());
@@ -1638,8 +1754,9 @@ fn verify(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
 
     let mut produced: HashMap<(u32, u32), Vec<TaskTimeRow>> = HashMap::new();
     for device in devices(prof, only)? {
-        let (ctx, _) = build_ctx(prof, &device)?;
-        let mut store = Store::new();
+        let (ctx, _) = ctx_for(&device)?;
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<TaskTimeRow>(&mut store, &ctx)?.iter() {
             produced
                 .entry((row.stream_id, row.task_id))
@@ -1734,7 +1851,8 @@ fn parse_us_to_ns(s: &str) -> Result<i128> {
 
 fn op_summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let chunks = per_device(prof, only, |ctx, _info| {
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let mut body = String::new();
         for row in resolve::<OpSummaryRow>(&mut store, ctx)?.iter() {
             body.push_str(&row.to_csv());
@@ -1775,8 +1893,9 @@ fn verify_op_summary(prof: &Path, only: Option<&str>, golden: &Path) -> Result<(
 
     let mut produced = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, _) = build_ctx(prof, &device)?;
-        let mut store = Store::new();
+        let (ctx, _) = ctx_for(&device)?;
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         produced.extend(resolve::<OpSummaryRow>(&mut store, &ctx)?.iter().cloned());
     }
 
@@ -1840,7 +1959,8 @@ impl Serialize for Num {
 }
 
 /// Ordered argument map (insertion order is part of the output contract).
-struct Args(Vec<(String, Num)>);
+/// Argument list with static keys, inline for the common 1-4 arguments.
+struct Args(smallvec::SmallVec<[(&'static str, Num); 4]>);
 
 impl Serialize for Args {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -1852,13 +1972,10 @@ impl Serialize for Args {
     }
 }
 
-fn args(items: Vec<(&str, Num)>) -> Args {
-    Args(
-        items
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value))
-            .collect(),
-    )
+/// Argument list with static keys: the keys are literals, so this avoids a
+/// `String` allocation per argument per event.
+fn args(items: Vec<(&'static str, Num)>) -> Args {
+    Args(smallvec::SmallVec::from_vec(items))
 }
 
 /// One Chrome-trace event. Field order here is the serialized key order.
@@ -1868,7 +1985,7 @@ struct TraceEvent {
     pid: u32,
     tid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ts: Option<String>,
+    ts: Option<compact_str::CompactString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dur: Option<f64>,
     ph: &'static str,
@@ -1888,7 +2005,14 @@ impl TraceEvent {
         }
     }
 
-    fn complete(name: String, pid: u32, tid: u32, ts: String, dur: f64, args: Args) -> Self {
+    fn complete(
+        name: String,
+        pid: u32,
+        tid: u32,
+        ts: compact_str::CompactString,
+        dur: f64,
+        args: Args,
+    ) -> Self {
         Self {
             name,
             pid,
@@ -1900,7 +2024,13 @@ impl TraceEvent {
         }
     }
 
-    fn counter(name: String, pid: u32, tid: u32, ts: String, args: Args) -> Self {
+    fn counter(
+        name: String,
+        pid: u32,
+        tid: u32,
+        ts: compact_str::CompactString,
+        args: Args,
+    ) -> Self {
         Self {
             name,
             pid,
@@ -1916,8 +2046,8 @@ impl TraceEvent {
 struct CounterRow {
     name: String,
     tid: u32,
-    ts: String,
-    args: Vec<(String, Num)>,
+    ts: compact_str::CompactString,
+    args: Vec<(&'static str, Num)>,
 }
 
 const SIO_COUNTERS: [&str; 8] = [
@@ -1926,7 +2056,8 @@ const SIO_COUNTERS: [&str; 8] = [
 const ACC_PMU_COUNTERS: [&str; 4] = ["read_bandwidth", "read_ost", "write_bandwidth", "write_ost"];
 
 fn sio_rows(samples: &[SioSample]) -> Vec<CounterRow> {
-    let mut grouped: BTreeMap<(String, usize), BTreeMap<u16, u32>> = BTreeMap::new();
+    let mut grouped: BTreeMap<(compact_str::CompactString, usize), BTreeMap<u16, u32>> =
+        BTreeMap::new();
     for sample in samples {
         for (i, value) in sample.bandwidth.iter().enumerate() {
             grouped
@@ -1943,7 +2074,14 @@ fn sio_rows(samples: &[SioSample]) -> Vec<CounterRow> {
             ts,
             args: dies
                 .into_iter()
-                .map(|(die, value)| (format!("die {die}"), Num::Float(value as f64)))
+                .map(|(die, value)| {
+                    let key: &'static str = match die {
+                        0 => "die 0",
+                        1 => "die 1",
+                        _ => "die other",
+                    };
+                    (key, Num::Float(value as f64))
+                })
                 .collect(),
         })
         .collect()
@@ -1957,7 +2095,7 @@ fn acc_pmu_rows(samples: &[AccPmuSample]) -> Vec<CounterRow> {
                 name: (*name).to_string(),
                 tid: 0,
                 ts: sample.ts_us.clone(),
-                args: vec![("value".to_string(), Num::Int(sample.values[i]))],
+                args: vec![("value", Num::Int(sample.values[i]))],
             });
         }
     }
@@ -1972,7 +2110,7 @@ fn inter_soc_rows(samples: &[InterSocSample]) -> Vec<CounterRow> {
             tid: 0,
             ts: sample.ts_us.clone(),
             args: vec![(
-                "L2 Buffer Bw Level".to_string(),
+                "L2 Buffer Bw Level",
                 Num::Int(sample.l2_buffer_bw_level as u64),
             )],
         });
@@ -1980,10 +2118,7 @@ fn inter_soc_rows(samples: &[InterSocSample]) -> Vec<CounterRow> {
             name: "Mata Bw Level".to_string(),
             tid: 0,
             ts: sample.ts_us.clone(),
-            args: vec![(
-                "Mata Bw Level".to_string(),
-                Num::Int(sample.mata_bw_level as u64),
-            )],
+            args: vec![("Mata Bw Level", Num::Int(sample.mata_bw_level as u64))],
         });
     }
     rows
@@ -2016,8 +2151,8 @@ fn chip_trans_rows(samples: &[ChipTransSample]) -> Vec<CounterRow> {
                 tid,
                 ts: sample.ts_us.clone(),
                 args: vec![
-                    (name.to_string(), Num::Int(value)),
-                    (id_key.to_string(), Num::Int(sample.id as u64)),
+                    (name, Num::Int(value)),
+                    (id_key, Num::Int(sample.id as u64)),
                 ],
             });
         }
@@ -2031,7 +2166,7 @@ fn write_counter(events: &mut Vec<TraceEvent>, pid: u32, row: &CounterRow) {
         pid,
         row.tid,
         row.ts.clone(),
-        Args(row.args.clone()),
+        Args(smallvec::SmallVec::from_vec(row.args.clone())),
     ));
 }
 
@@ -2053,7 +2188,7 @@ fn produced_signatures(rows: &[CounterRow]) -> Vec<String> {
             let args: Vec<(String, f64)> = row
                 .args
                 .iter()
-                .map(|(key, value)| (key.clone(), value.as_f64()))
+                .map(|(key, value)| ((*key).to_string(), value.as_f64()))
                 .collect();
             signature(&row.name, row.tid, &row.ts, &args)
         })
@@ -2165,7 +2300,7 @@ fn qos_rows(samples: &[QosRow], events: &[String]) -> Vec<CounterRow> {
                 name: format!("QoS {event}"),
                 tid: 0,
                 ts: sample.ts_us.clone(),
-                args: vec![("value".to_string(), Num::Int(sample.values[i] as u64))],
+                args: vec![("value", Num::Int(sample.values[i] as u64))],
             });
         }
     }
@@ -2184,13 +2319,13 @@ fn hccs_rows(samples: &[HccsRateRow]) -> Vec<CounterRow> {
             name: "Tx".to_string(),
             tid: 0,
             ts: ts.clone(),
-            args: vec![("Tx(MB/s)".to_string(), Num::Float(round3(sample.tx)))],
+            args: vec![("Tx(MB/s)", Num::Float(round3(sample.tx)))],
         });
         rows.push(CounterRow {
             name: "Rx".to_string(),
             tid: 0,
             ts,
-            args: vec![("Rx(MB/s)".to_string(), Num::Float(round3(sample.rx)))],
+            args: vec![("Rx(MB/s)", Num::Float(round3(sample.rx)))],
         });
     }
     rows
@@ -2210,7 +2345,7 @@ fn npu_mem_rows(samples: &[NpuMemRow]) -> Vec<CounterRow> {
                 name: format!("{owner}/{metric}"),
                 tid: 0,
                 ts: ts.clone(),
-                args: vec![("KB".to_string(), Num::Float(value as f64 / 1024.0))],
+                args: vec![("KB", Num::Float(value as f64 / 1024.0))],
             });
         }
     }
@@ -2221,34 +2356,46 @@ fn timeline(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let devices = devices(prof, only)?;
     let chunks: Vec<(Vec<TraceEvent>, usize)> = devices
         .par_iter()
-        .map(|device| device_timeline(prof, device))
+        .map(|device| device_timeline(device))
         .collect::<Result<Vec<_>>>()?;
-
-    let mut events: Vec<TraceEvent> = Vec::new();
-    let mut total = 0usize;
-    for (mut chunk, count) in chunks {
-        events.append(&mut chunk);
-        total += count;
-    }
-    let body = serde_json::to_string(&events)?;
 
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(out, body)?;
+    // Stream device chunks straight into the JSON array: the merged vector used to
+    // be built (and then dropped) in full, which costs a large allocation, a copy
+    // of every event and the peak memory of all devices at once.
+    let file = std::fs::File::create(out)?;
+    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+    writer.write_all(b"[")?;
+    let mut first = true;
+    let mut total = 0usize;
+    for (chunk, count) in chunks {
+        for event in &chunk {
+            if !first {
+                writer.write_all(b",")?;
+            }
+            first = false;
+            serde_json::to_writer(&mut writer, event)?;
+        }
+        total += count;
+    }
+    writer.write_all(b"]")?;
+    writer.flush()?;
     println!("wrote {total} timeline events to {}", out.display());
     Ok(())
 }
 
 /// Build one device's timeline events. Devices are independent, so this runs
 /// in parallel; the caller concatenates chunks in device order.
-fn device_timeline(prof: &Path, device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
-    let (ctx, info) = build_ctx(prof, device)?;
+fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
+    let (ctx, info) = ctx_for(device)?;
     let mut events: Vec<TraceEvent> = Vec::new();
     let mut total = 0usize;
     {
         let clock = ctx.require::<Clock>()?;
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let tasks = resolve::<TimelineTask>(&mut store, &ctx)?;
 
         let dev = info.device_id.unwrap_or(0);
@@ -2398,7 +2545,7 @@ fn device_timeline(prof: &Path, device: &Path) -> Result<(Vec<TraceEvent>, usize
                 tid,
                 row.ts_us.clone(),
                 row.dur_us,
-                Args(Vec::new()),
+                Args(smallvec::SmallVec::new()),
             ));
             total += 1;
         }
@@ -2584,7 +2731,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
     let mut overlap_max_dur = 0.0f64;
 
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
         let hw_pid = ((info.pid << 10) | (13 << 5) | dev) as u64;
         let expected: Vec<&serde_json::Value> = array
@@ -2594,7 +2741,8 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                     && event.get("ph").and_then(|p| p.as_str()) == Some("X")
             })
             .collect();
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let produced = resolve::<TimelineTask>(&mut store, &ctx)?;
 
         golden_rows += expected.len();
@@ -2772,7 +2920,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
         // Overlap Analysis
         let overlap_pid = golden_pid_for(&golden_meta, "Overlap Analysis", dev)
             .unwrap_or(((info.pid << 10) | (29 << 5) | dev) as u64);
-        let mut golden_overlap: Vec<(String, u32, String, f64)> = array
+        let mut golden_overlap: Vec<(String, u32, compact_str::CompactString, f64)> = array
             .iter()
             .filter(|event| {
                 event.get("pid").and_then(|v| v.as_u64()) == Some(overlap_pid)
@@ -2786,29 +2934,29 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                         .unwrap_or("")
                         .to_string(),
                     event.get("tid").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                    event
-                        .get("ts")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
+                    compact_str::CompactString::from(
+                        event.get("ts").and_then(|v| v.as_str()).unwrap_or(""),
+                    ),
                     event.get("dur").and_then(|v| v.as_f64()).unwrap_or(0.0),
                 )
             })
             .collect();
         let produced_overlap = resolve::<OverlapRow>(&mut store, &ctx)?;
-        let mut produced_rows: Vec<(String, u32, String, f64)> = produced_overlap
-            .iter()
-            .map(|row| {
-                let (name, tid) = match row.kind {
-                    OverlapKind::Compute => ("Computing", 2),
-                    OverlapKind::Free => ("Free", 3),
-                };
-                (name.to_string(), tid, row.ts_us.clone(), row.dur_us)
-            })
-            .collect();
+        let mut produced_rows: Vec<(String, u32, compact_str::CompactString, f64)> =
+            produced_overlap
+                .iter()
+                .map(|row| {
+                    let (name, tid) = match row.kind {
+                        OverlapKind::Compute => ("Computing", 2),
+                        OverlapKind::Free => ("Free", 3),
+                    };
+                    (name.to_string(), tid, row.ts_us.clone(), row.dur_us)
+                })
+                .collect();
         overlap_golden += golden_overlap.len();
         overlap_produced += produced_rows.len();
-        let key = |r: &(String, u32, String, f64)| (r.0.clone(), r.1, r.2.clone());
+        let key =
+            |r: &(String, u32, compact_str::CompactString, f64)| (r.0.clone(), r.1, r.2.clone());
         golden_overlap.sort_by_key(key);
         produced_rows.sort_by_key(key);
         for (golden, produced) in golden_overlap.iter().zip(produced_rows.iter()) {
@@ -2881,9 +3029,10 @@ fn ts_cpu_event_ids(device: &Path) -> Result<Vec<u64>> {
 fn ts_cpu_pmu_events(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Event,Name,Count\n");
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let records = resolve::<TscpuRecord>(&mut store, &ctx)?;
         let mut rows: Vec<(u64, u64)> = ts_cpu_event_ids(&device)?
             .into_iter()
@@ -2916,9 +3065,10 @@ fn ts_cpu_pmu_events(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> 
 fn verify_ts_cpu_pmu_events(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let records = resolve::<TscpuRecord>(&mut store, &ctx)?;
         let mut rows: Vec<(u64, u64)> = ts_cpu_event_ids(&device)?
             .into_iter()
@@ -2948,9 +3098,10 @@ fn verify_ts_cpu_pmu_events(prof: &Path, only: Option<&str>, golden: &Path) -> R
 fn ts_cpu_top_function(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Function,Cycles,Cycles(%)\n");
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let records = resolve::<TscpuRecord>(&mut store, &ctx)?;
         let mut counts: Vec<(u64, u64)> = Vec::new();
         let mut index: HashMap<u64, usize> = HashMap::new();
@@ -2991,9 +3142,10 @@ fn ts_cpu_top_function(prof: &Path, only: Option<&str>, out: &Path) -> Result<()
 fn verify_ts_cpu_top_function(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let records = resolve::<TscpuRecord>(&mut store, &ctx)?;
         let mut counts: Vec<(u64, u64)> = Vec::new();
         let mut index: HashMap<u64, usize> = HashMap::new();
@@ -3039,8 +3191,9 @@ fn api_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body =
         String::from("Device_id,Level,API Name,Time(us),Count,Avg(us),Min(us),Max(us),Variance\n");
     if let Some(device) = devices(prof, only)?.first() {
-        let (ctx, _) = build_ctx(prof, device)?;
-        let mut store = Store::new();
+        let (ctx, _) = ctx_for(device)?;
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<ApiStatisticRow>(&mut store, &ctx)?.iter() {
             body.push_str(&format!(
                 "host,{},{},{},{},{},{},{},{}\n",
@@ -3066,8 +3219,9 @@ fn api_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_api_statistic(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     if let Some(device) = devices(prof, only)?.first() {
-        let (ctx, _) = build_ctx(prof, device)?;
-        let mut store = Store::new();
+        let (ctx, _) = ctx_for(device)?;
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<ApiStatisticRow>(&mut store, &ctx)?.iter() {
             produced.push(vec![
                 "host".to_string(),
@@ -3104,8 +3258,9 @@ fn op_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         "Device_id,OP Type,Core Type,Count,Total Time(us),Min Time(us),Avg Time(us),Max Time(us),Ratio(%)\n",
     );
     for device in devices(prof, only)? {
-        let (ctx, _) = build_ctx(prof, &device)?;
-        let mut store = Store::new();
+        let (ctx, _) = ctx_for(&device)?;
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<OpStatisticRow>(&mut store, &ctx)?.iter() {
             body.push_str(&format!(
                 "{},{},{},{},{},{},{},{},{}\n",
@@ -3132,8 +3287,9 @@ fn op_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_op_statistic(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, _) = build_ctx(prof, &device)?;
-        let mut store = Store::new();
+        let (ctx, _) = ctx_for(&device)?;
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<OpStatisticRow>(&mut store, &ctx)?.iter() {
             produced.push(vec![
                 row.device_id.to_string(),
@@ -3238,7 +3394,8 @@ fn py_float(value: f64) -> String {
 fn l2_cache(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let chunks = per_device(prof, only, |ctx, info| {
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let rows = resolve::<L2CacheRow>(&mut store, ctx)?;
         let tasks = resolve::<TimelineTask>(&mut store, ctx)?;
         let op_map: HashMap<(u32, u32), String> = tasks
@@ -3279,9 +3436,10 @@ fn l2_cache(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_l2_cache(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let rows = resolve::<L2CacheRow>(&mut store, &ctx)?;
         let tasks = resolve::<TimelineTask>(&mut store, &ctx)?;
         let op_map: HashMap<(u32, u32), String> = tasks
@@ -3323,9 +3481,10 @@ fn dvpp(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     );
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<DvppRow>(&mut store, &ctx)?.iter() {
             body.push_str(&format!(
                 "{dev},{},{},{},{:?},{:?},{}\n",
@@ -3350,9 +3509,10 @@ fn dvpp(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_dvpp(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<DvppRow>(&mut store, &ctx)?.iter() {
             produced.push(vec![
                 dev.clone(),
@@ -3418,9 +3578,10 @@ fn hccs_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Mode,Max,Min,Average\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let rows = resolve::<HccsRateRow>(&mut store, &ctx)?;
         for [mode, max, min, avg] in hccs_table(&rows) {
             body.push_str(&format!("{dev},{mode},{max},{min},{avg}\n"));
@@ -3438,9 +3599,10 @@ fn hccs_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_hccs_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for [mode, max, min, avg] in hccs_table(&resolve::<HccsRateRow>(&mut store, &ctx)?) {
             produced.push(vec![dev.clone(), mode, max, min, avg]);
         }
@@ -3473,7 +3635,7 @@ fn hbm_track_rows(rows: &[HbmRecord]) -> Vec<CounterRow> {
                 Some(dt) if dt > 0.0 => count as f64 * SCALE / dt * 1e9,
                 _ => 0.0,
             };
-            let (kind, key) = if event == 0 {
+            let (kind, key): (&str, &'static str) = if event == 0 {
                 ("Read", "Read(MB/s)")
             } else {
                 ("Write", "Write(MB/s)")
@@ -3482,7 +3644,7 @@ fn hbm_track_rows(rows: &[HbmRecord]) -> Vec<CounterRow> {
                 name: format!("HBM {hbm_id}/{kind}"),
                 tid: 0,
                 ts: fmt_us(ts_ns as u64, false),
-                args: vec![(key.to_string(), Num::Float(value))],
+                args: vec![(key, Num::Float(value))],
             });
         }
         prev = Some(ts_ns);
@@ -3553,9 +3715,10 @@ fn hbm_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Metric,Read(MB/s),Write(MB/s)\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for [metric, read, write] in hbm_table(&resolve::<HbmRecord>(&mut store, &ctx)?) {
             body.push_str(&format!("{dev},{metric},{read},{write}\n"));
             total += 1;
@@ -3572,9 +3735,10 @@ fn hbm_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_hbm_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for [metric, read, write] in hbm_table(&resolve::<HbmRecord>(&mut store, &ctx)?) {
             produced.push(vec![dev.clone(), metric, read, write]);
         }
@@ -3590,9 +3754,10 @@ fn npu_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,event,ddr(KB),hbm(KB),memory(KB),timestamp(us)\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<NpuMemRow>(&mut store, &ctx)?.iter() {
             body.push_str(&format!(
                 "{dev},{},{},{},{},{}\n",
@@ -3616,9 +3781,10 @@ fn npu_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_npu_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0).to_string();
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<NpuMemRow>(&mut store, &ctx)?.iter() {
             produced.push(vec![
                 dev.clone(),
@@ -3626,7 +3792,7 @@ fn verify_npu_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> 
                 (row.ddr / 1024).to_string(),
                 (row.hbm / 1024).to_string(),
                 ((row.ddr + row.hbm) / 1024).to_string(),
-                fmt_us(row.ts_ns, false),
+                fmt_us(row.ts_ns, false).to_string(),
             ]);
         }
     }
@@ -3647,7 +3813,8 @@ fn verify_npu_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> 
 fn npu_module_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let chunks = per_device(prof, only, |ctx, info| {
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         let mut body = String::new();
         for row in resolve::<NpuModuleMemRow>(&mut store, ctx)?.iter() {
             body.push_str(&format!(
@@ -3677,14 +3844,15 @@ fn npu_module_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 fn verify_npu_module_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     let mut produced: Vec<Vec<String>> = Vec::new();
     for device in devices(prof, only)? {
-        let (ctx, info) = build_ctx(prof, &device)?;
+        let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
-        let mut store = Store::new();
+        let shared_store = store_for(ctx.device_dir()?);
+        let mut store = shared_store.lock().expect("store lock");
         for row in resolve::<NpuModuleMemRow>(&mut store, &ctx)?.iter() {
             produced.push(vec![
                 dev.to_string(),
                 tables::module_name(row.module_id).to_string(),
-                fmt_us(row.ts_ns, false),
+                fmt_us(row.ts_ns, false).to_string(),
                 (row.total_size / 1024).to_string(),
                 format!("NPU:{dev}"),
             ]);

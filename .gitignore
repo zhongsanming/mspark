@@ -8,8 +8,12 @@
 __pycache__/
 
 # Local profiling captures and exported artifacts
+/artifacts
 /mspark_*/
 /prof_*
 /PROF_*
 /*.tar.xz
 /*.html
+
+# Local captures and exported artifacts under artifacts/
+/artifacts/

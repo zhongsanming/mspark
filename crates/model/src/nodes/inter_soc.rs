@@ -10,7 +10,7 @@ use super::sources::SocProfileRecord;
 
 #[derive(Debug, Clone)]
 pub struct InterSocSample {
-    pub ts_us: String,
+    pub ts_us: compact_str::CompactString,
     pub l2_buffer_bw_level: u32,
     pub mata_bw_level: u32,
 }
@@ -26,7 +26,7 @@ impl Node for InterSocSample {
         let clock = ctx.require::<Clock>()?;
         let begin_ns = clock.begin_us as i128 * 1000;
         let mut out: Vec<InterSocSample> = Vec::new();
-        let mut index: HashMap<String, usize> = HashMap::new();
+        let mut index: HashMap<compact_str::CompactString, usize> = HashMap::new();
         for record in records.iter() {
             if let raw::SocProfileRaw::InterSoc {
                 sys_cnt,

@@ -162,8 +162,8 @@ impl Node for OpSummaryRow {
             cols.push(nbi.op_type.clone());
             cols.push("dynamic".to_string());
             cols.push(ge_task_type(nbi.task_type).to_string());
-            cols.push(fmt_us(start_ns, true));
-            cols.push(fmt_us(dur_ns, false));
+            cols.push(fmt_us(start_ns, true).to_string());
+            cols.push(fmt_us(dur_ns, false).to_string());
             cols.push("0".to_string()); // wait, filled after sorting
             cols.push(blk.to_string());
             cols.push("0".to_string()); // Mix Block Dim

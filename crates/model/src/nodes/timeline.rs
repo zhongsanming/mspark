@@ -13,7 +13,7 @@ use super::sources::{NodeBasicInfoRow, TaskTrackRow};
 pub struct TimelineTask {
     pub name: String,
     pub tid: u32,
-    pub ts_us: String,
+    pub ts_us: compact_str::CompactString,
     pub dur_us: f64,
     pub task_type: String,
     pub stream_id: u32,

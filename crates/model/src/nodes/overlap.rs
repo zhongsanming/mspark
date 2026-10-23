@@ -14,7 +14,7 @@ pub enum OverlapKind {
 #[derive(Debug, Clone)]
 pub struct OverlapRow {
     pub kind: OverlapKind,
-    pub ts_us: String,
+    pub ts_us: compact_str::CompactString,
     pub dur_us: f64,
 }
 

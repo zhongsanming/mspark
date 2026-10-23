@@ -175,6 +175,210 @@ Values exact (816/816), timestamps differ in the sub-µs digits
 
 ## Not started
 
+### T26. Overlap Analysis on multi-device captures — only 2 of 4 kinds
+On the multi-device capture the golden Overlap track has **four** threads while we
+emit two:
+
+| thread | golden | ours |
+|---|---|---|
+| `Computing` (tid 2) | 65 629 | 66 066 |
+| `Free` (tid 3) | 38 179 | 66 067 |
+| `Communication` (tid 0) | 826 | — |
+| `Communication(Not Overlapped)` (tid 1) | 28 907 | — |
+| total | 133 541 | 132 133 |
+
+So `matched = 0`: our `Computing` currently includes the HCCL tasks, whereas
+msprof classifies them separately and derives the not-overlapped portion.
+
+**Algorithm (now transcribed from `overlap_analysis_processor.cpp`):**
+
+```
+compute   = union(compute-task intervals)        # named tasks, minus MC2 / AICPU / AIV kernels
+comm      = union(comm-op intervals)             # op.timestamp .. op.end
+comm_not  = difference(comm, compute)
+window    = [min, max] over compute ∪ comm sections
+free      = difference(window, union(compute, comm))
+```
+
+**Where the op window actually comes from (found):**
+`analysis/mscalculate/hccl/hccl_calculator.py` writes `hccl_single_device.db`
+(`HCCLOpSingleDevice`), so it is *derived*, not collected. `_merge_hccl_ops_and_tasks`
+builds each op's window from its tasks:
+
+```
+group by (thread_id, op_id); keep the master tasks only
+start = min(master.timestamp)
+end   = max(master.timestamp + master.duration)
+rank_size = last master's rank_size
+iter_id += 1 when a task tuple (stream, task, context, batch) repeats
+```
+
+It reads `hccl.db`'s `HcclTask`/`HcclOp` tables, whose columns are
+`timestamp, duration, op_id, is_master, plane_id, stream_id, task_id,
+context_id, batch_id, size, local/remote rank, rank_size, transport/data/link
+type, rdma_type`.
+
+So the window is recoverable **in principle** from the HCCL task stream — it is an
+aggregation of master-task windows, not a stored field.
+
+**What we still cannot read from the raw record:** our 120-byte
+`unaging.additional.hccl_info` payload maps `itemId, cclTag, groupName, ranks,
+rankSize, planeID, ctxID, notifyID, stage, role, durationEstimated, src/dst addr,
+dataSize, opType, dataType, linkType` — the tail (bytes 96..120) holds only
+`opType/dataType/linkType` and zeros, so `duration`, `op_id` and `is_master` are
+not in it. `duration` is also demonstrably not `durationEstimated`
+(0.92 us vs 0.60 us in the golden track).
+
+**Source found — it is msprof itself, not the host profiler.**
+`mscalculate/cann/cann_analysis_gear.py::add_hccl_task` builds every `HCCLTask`
+row from streams we already read:
+
+| column | source |
+|---|---|
+| `timestamp`, `duration` (and stream/task/batch/thread ids) | **`aging.compact.task_track`** — the same stream our `TaskTrackRow` decodes |
+| `is_master` | `1 if hccl_event.struct_type == 'master'` — the HCCL **api_event** in the call stack |
+| `op_id` | `node_dto.connection_id` — the **node-level api_event** |
+| `op_name`, `group_name`, `plane_id`, `local/remote rank`, `rank_size`, `size`, `data_type`, `link_type`, `notify_id`, `rdma_type` | `unaging.additional.hccl_info` (already decoded) |
+
+So the op window is reachable: group `HCCLTask` rows by `(thread_id, op_id)`, keep
+`is_master`, and take `[min(timestamp), max(timestamp + duration)]`.
+
+**Correction — where `duration` really comes from.** `HCCLTask` in `hccl.db` has
+**no** duration column (`HCCLTaskMap`: model_id, index_id, name, group_name,
+plane_id, timestamp, stream_id, task_id, context_id, batch_id, device_id,
+is_master, local/remote rank, transport_type, size, …). `hccl_model.get_hccl_task_data`
+inner-joins it with the **`ASCEND_TASK`** table on
+`(stream_id, task_id, batch_id, context_id, device_id)` and selects
+`b.start_time as timestamp, b.duration as duration`.
+
+So the task window is the generic device task window — the one we already compute
+as `DeviceTask` from `stars_soc` ACSQ pairs. We do not need a `duration` field in
+the task_track record at all; we need to **join `hccl_info` attributes to our
+`DeviceTask`s** on `(stream, task, batch, context)`.
+
+**Batch field (measured, reverted):** `TASK_TRACK_FMT = "HHIIIQHHHHQQ"` splits the
+32-bit task field into `task_id` (low 16) and `batch_id` (high 16). On a device
+capture **16 388 of 85 241 records carry batch = 1** — exactly the number of
+duplicated `(stream, task)` keys seen earlier.
+
+Splitting the field and keying on `(stream, task_id)` was tried and **made things
+worse**: `kernel_name` dropped from 55 580 to 46 223 of 85 241, because batch 0
+and batch 1 then collide on one key and the map keeps only one name.
+Disambiguating needs `batch_id` on the *device* side too — and the source is
+**code, not a raw field**: `FlipCalculator.compute_batch_id` derives it.
+
+- `task_track` rows whose task type resolves to `FLIP_TASK` carry the iteration
+  marker; `format_task_track_data` sets `flip_num = data.batch_id` on them.
+- `AscendTaskGenerator` groups by `(device, stream)`, sorts tasks and flips by
+  timestamp, and walks them together: each time a task's timestamp reaches the
+  next flip, the batch id advances (`get_next_batch_id`, with
+  `calibrate_when_flip_task_id_not_zero` handling the first task of a round).
+  `AscendTaskGenerator._sep_task_by_stream_task_ctx_batch` then keys everything by
+  `(stream, task, context, batch)`.
+
+So the port is: read `FLIP_TASK` rows from `task_track`, walk them against
+`DeviceTask`s per `(device, stream)`, assign batch ids, and only then split the
+task_track field and key by `(stream, task, batch)`. No reverse engineering
+required, and no unknown fields.
+
+**Attempted and reverted.** Assigning computed batches to `DeviceTask` while
+keying `task_track` by its *raw* high-16 field mixes two different batch spaces:
+`kernel_name` collapsed from 55 580 to 4 368 of 85 241. msprof computes the batch
+on **both** sides — `TaskTrackParser.format_task_track_data` calls
+`FlipCalculator.compute_batch_id(self._task_track_data, self._task_flip_data)`
+when the chip is all-data-export, exactly as `AscendTaskGenerator` does for device
+tasks.
+
+**Clock domains — settled from code.** Every host stream timestamp goes through
+`Utils::GetLocalTime` (`infrastructure/utils/time_utils.cpp`):
+
+```
+GetLocalTime(timestamp, record) = timestamp + (record.startTimeNs - record.baseTimeNs)
+```
+
+i.e. `raw + (host start_info.wall_ns − host start_info.clockMonotonicRaw)` — which
+is exactly the offset our `MonoClock` computes. Device tasks use
+`GetTimeFromSyscnt` (hwts-frequency conversion) instead. So the domains were never
+the problem: flips are MonoClock, device tasks are Clock, and both already land in
+wall ns.
+
+**The real requirement** is therefore only this: `compute_batch_id` must run
+**twice** — once over `task_track` rows (with `FLIP_TASK` rows as the flips) for
+the host side, and once over `DeviceTask`s against the same flip stamps for the
+device side. Keying one side by its raw high-16 field while the other uses a
+computed batch is what broke the attempt.
+
+**Third idea (time proximity) tried and reverted.** Rather than the batch, match
+each device task to the host row whose timestamp is nearest, consuming rows so two
+tasks sharing a key take the two in order. Measured `kernel_name` 46 223/85 241 —
+worse than the current 55 580, because host and device row counts per key do not
+line up exactly and consumption strips names that later tasks still need.
+
+Current best remains the plain `(stream, task)` map, last-write-wins, at
+55 580/85 241 with 26 359 names attached to the wrong duplicate.
+
+**Diagnostics (what the data says):**
+
+- 8 `FLIP_TASK` markers exist; walking them gives batch 0 → 68 189 rows,
+  batch 1 → 17 047 — matching the raw high-16 field (68 853 / 16 388). So
+  `compute_batch_id` is reproduced correctly *offline*.
+- Current (unbatched) output: 68 853 distinct `(stream, task)` keys over 85 241
+  rows, **26 359 names differ** from golden, ours 18 727 `N/A` vs golden 16 268.
+  So names are not missing — they are attached to the wrong duplicate.
+- Three different port variants (asymmetric, symmetric, host-clock) all land on
+  **exactly 4 368/85 241**, which proves the failure is *not* the clock domain
+  and not the walk: it is the keying model for the join.
+
+Verifying further needs the intermediate tables (`AscendTask` / `HCCLTask`), which
+this capture does not contain — it is operator-scene, so `AscendTask` is never
+generated. A graph-scene capture (or one where `AscendTask` exists) would give the
+per-task batch to compare against.
+
+**Second attempt (symmetric walk) also reverted.** Running `compute_batch_id` on
+both sides — host rows against their own flips, device tasks against the same
+MonoClock-converted stamps — still gives `kernel_name` 4 368/85 241, so the two
+walks do not agree on this capture. Since both attempts land on the same wrong
+number, the disagreement is systematic (either flip detection yields no markers,
+making every batch 0 and the split harmful, or the two walks order rows
+differently).
+
+Before a third attempt, build the expectation from the reference DB instead of
+guessing: pick ~10 tasks, read their `batch_id` from `AscendTask`, and reproduce
+exactly those assignments. Only then wire the key.
+
+Revised remaining work:
+1. mark `FLIP_TASK` rows in `task_track` (task type via `type_info_dic`) and keep
+   their compact-header timestamp;
+2. walk `task_track` rows against those flips → computed batch per row;
+3. walk `DeviceTask`s against the same flips (MonoClock-converted) → computed
+   batch per task;
+4. split the id field and key by `(stream, task, batch)` on both sides.
+
+Concrete next steps:
+1. find `batch_id` in the `stars_soc`/ACSQ record so `DeviceTask` can be keyed by
+   `(stream, task, batch)`; only then does splitting the task_track field pay off;
+2. read `connection_id` and `struct_type` from the api_event stream (we parse
+   api_event already for `api_statistic`);
+3. then implement T22's CSV times, the Communication track `dur`, and T26's two
+   communication overlap threads — all from data we have. The raw op record carries a
+single stamp and all tasks of an op share it, so the interval cannot be
+reconstructed — the same ceiling as `communication_statistic`'s time columns.
+
+Everything else is available today, so the remaining classification is a
+mechanical port once the op window exists:
+- **communication** tasks (HCCL: `task_type` 9 / 256) → `Communication` intervals;
+- `Communication(Not Overlapped)` = communication minus computing;
+- **Computing** = union of *non-communication* task intervals;
+- **Free** = window minus (computing ∪ communication).
+
+`Communication` = 826 matches the op count, consistent with the op/task analysis
+in T22. Note the window also changes: the golden `Computing` starts at
+`1792632288550840` while ours starts at `1792632297012977` (the first task in our
+set is a communication task).
+
+Single-device captures have no communication tasks, which is why this went
+unnoticed — the earlier 54 946/109 892 result came from one.
+
 ### T25. Host-usage family — code-derived, unverified
 `host_mem_usage` is implemented (node + CSV) straight from
 `HostMemUsagePresenter._parse_mem_data`:
