@@ -308,6 +308,18 @@ the host side, and once over `DeviceTask`s against the same flip stamps for the
 device side. Keying one side by its raw high-16 field while the other uses a
 computed batch is what broke the attempt.
 
+**Second attempt (symmetric walk) also reverted.** Running `compute_batch_id` on
+both sides — host rows against their own flips, device tasks against the same
+MonoClock-converted stamps — still gives `kernel_name` 4 368/85 241, so the two
+walks do not agree on this capture. Since both attempts land on the same wrong
+number, the disagreement is systematic (either flip detection yields no markers,
+making every batch 0 and the split harmful, or the two walks order rows
+differently).
+
+Before a third attempt, build the expectation from the reference DB instead of
+guessing: pick ~10 tasks, read their `batch_id` from `AscendTask`, and reproduce
+exactly those assignments. Only then wire the key.
+
 Revised remaining work:
 1. mark `FLIP_TASK` rows in `task_track` (task type via `type_info_dic`) and keep
    their compact-header timestamp;
