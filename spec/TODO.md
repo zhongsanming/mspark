@@ -308,6 +308,23 @@ the host side, and once over `DeviceTask`s against the same flip stamps for the
 device side. Keying one side by its raw high-16 field while the other uses a
 computed batch is what broke the attempt.
 
+**Diagnostics (what the data says):**
+
+- 8 `FLIP_TASK` markers exist; walking them gives batch 0 → 68 189 rows,
+  batch 1 → 17 047 — matching the raw high-16 field (68 853 / 16 388). So
+  `compute_batch_id` is reproduced correctly *offline*.
+- Current (unbatched) output: 68 853 distinct `(stream, task)` keys over 85 241
+  rows, **26 359 names differ** from golden, ours 18 727 `N/A` vs golden 16 268.
+  So names are not missing — they are attached to the wrong duplicate.
+- Three different port variants (asymmetric, symmetric, host-clock) all land on
+  **exactly 4 368/85 241**, which proves the failure is *not* the clock domain
+  and not the walk: it is the keying model for the join.
+
+Verifying further needs the intermediate tables (`AscendTask` / `HCCLTask`), which
+this capture does not contain — it is operator-scene, so `AscendTask` is never
+generated. A graph-scene capture (or one where `AscendTask` exists) would give the
+per-task batch to compare against.
+
 **Second attempt (symmetric walk) also reverted.** Running `compute_batch_id` on
 both sides — host rows against their own flips, device tasks against the same
 MonoClock-converted stamps — still gives `kernel_name` 4 368/85 241, so the two
