@@ -129,6 +129,9 @@ Verified against a fresh V4 (910B) capture with the current `msprof`:
 | `npu_module_mem.csv` | 31 416/31 416 rows, all columns |
 | `pcie.csv` | 7/7 rows, all columns |
 | `hccs.csv` | 2/2 rows, all columns |
+| `nic.csv` / `roce.csv` | 1/1 row, all 12 columns |
+| `communication_statistic.csv` | OP Type / Count exact; time columns omitted (see TODO) |
+| `host_cpu_usage.csv` | all 4 columns |
 | `llc_read_write.csv` | 3/3 rows, all columns |
 | timeline: QoS, HCCS, HBM, LLC, PCIe, NIC, RoCE | 1 660–81 476 events each, all matched |
 | timeline: SIO, Acc PMU, Stars Soc Info, Stars Chip Trans, NPU MEM (values) | all matched |
@@ -153,6 +156,33 @@ Verified against a fresh V4 (910B) capture with the current `msprof`:
 `spec/TODO.md` tracks each of these with the evidence gathered, including the
 dead ends — several were investigated to the point of proving they are *not* the
 cause, which is usually the expensive part.
+
+## Fidelity policy
+
+The target is to **stay aligned with msprof's artifacts** — same files, same
+columns, same rows, same semantics. Byte-exactness is *not* required: where a
+value lands on a rounding boundary (f64 vs msprof's `Decimal`), being within a
+handful of ULPs is acceptable, and such cases are noted in `spec/TODO.md` rather
+than chased.
+
+What *is* required is that nothing is silently invented: when we synthesise or
+approximate something (a join we cannot reproduce, a rounding difference, a
+format we reverse-engineered), it is written down here or in `spec/TODO.md`.
+
+## Code-derived, unverified
+
+A few artifacts are transcribed from msprof's implementation but have never been
+exercised against real output, because our captures do not enable the relevant
+collection flags:
+
+| artifact | needs |
+|---|---|
+| `host_mem_usage` (shipped), `host_disk_usage`, `host_network_usage`, `os_runtime_statistic`, `cpu_usage` | `--host-sys=mem/disk/network/osrt` |
+| `msproftx` | `--msproftx=on` |
+| `step_trace` | iteration markers |
+
+They are implemented only when the algorithm is unambiguous in the source. Treat
+their output as untrusted until verified, exactly like the non-V4 chip rows.
 
 ## Chip support
 
@@ -186,6 +216,13 @@ msprof's `VersionedStructParser`:
 
 Collection version 1.x is what both of our captures use, so the 2.x layouts are
 implemented but likewise **unverified**.
+
+> **`nic.csv` / `roce.csv` `Timestamp(us)` quirk:** msprof's
+> `peripheral_report.format_nic_summary` writes the *sample duration*
+> (`max(timestamp) − min(timestamp)`) through
+> `trans_into_local_time`, i.e. `duration/1000 + local_time_offset`, into the
+> column labelled `Timestamp(us)`. We reproduce that verbatim, including the
+> Decimal-over-f64-repr rounding, because the goal is to match msprof's output.
 
 Still V4-shaped and needing per-chip work when data becomes available: the V6 QoS
 variant (die-indexed series that msprof reads from `stars_soc_profile`, item type

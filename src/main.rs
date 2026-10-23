@@ -8,11 +8,11 @@ use mspark_model::raw;
 use mspark_model::tables;
 use mspark_model::{
     AccPmuSample, ApiEventRow, ApiStatisticRow, ChipTransKind, ChipTransSample, Clock, DeviceInfo,
-    DvppRow, HbmRecord, HccsRateRow, InterSocSample, L2CacheRow, LlcRecord, LpmInfo, NicRow,
-    NpuMemRow, NpuModuleMemRow, OpStatisticRow, OpSummaryRow, OverlapKind, OverlapRow, PcieRecord,
-    PmuData, QosRow, RoceRow, SioSample, StarsSocEntry, TaskTimeRow, TimelineTask, TrackFlip,
-    TscpuRecord, fmt_us, load_clock, load_device_info, load_dictionaries, load_host_clock,
-    load_sample_string,
+    DvppRow, HbmRecord, HcclInfoRow, HcclOpRow, HccsRateRow, HostCpuUsageRow, HostMemUsageRow,
+    InterSocSample, L2CacheRow, LlcRecord, LpmInfo, NicRow, NpuMemRow, NpuModuleMemRow,
+    OpStatisticRow, OpSummaryRow, OverlapKind, OverlapRow, PcieRecord, PmuData, QosRow, RoceRow,
+    SioSample, StarsSocEntry, TaskTimeRow, TimelineTask, TrackFlip, TscpuRecord, fmt_us,
+    load_clock, load_device_info, load_dictionaries, load_host_clock, load_sample_string,
 };
 use palc::{Parser, Subcommand};
 use rayon::prelude::*;
@@ -227,6 +227,28 @@ enum Command {
         #[arg(long)]
         golden: PathBuf,
     },
+    /// Compare the `nic` summary table against a golden CSV.
+    VerifyNicCsv {
+        /// A PROF_* directory.
+        prof: PathBuf,
+        /// Restrict to one device directory, e.g. `device_7`.
+        #[arg(long)]
+        device: Option<String>,
+        /// Golden `nic_*.csv`.
+        #[arg(long)]
+        golden: PathBuf,
+    },
+    /// Compare the `roce` summary table against a golden CSV.
+    VerifyRoceCsv {
+        /// A PROF_* directory.
+        prof: PathBuf,
+        /// Restrict to one device directory, e.g. `device_7`.
+        #[arg(long)]
+        device: Option<String>,
+        /// Golden `roce_*.csv`.
+        #[arg(long)]
+        golden: PathBuf,
+    },
     /// Compare the `pcie` summary table against a golden CSV.
     VerifyPcieCsv {
         /// A PROF_* directory.
@@ -426,6 +448,16 @@ fn main() -> Result<()> {
             device,
             golden,
         } => verify_llc_csv(&prof, device.as_deref(), &golden),
+        Command::VerifyNicCsv {
+            prof,
+            device,
+            golden,
+        } => verify_net_csv(&prof, device.as_deref(), &golden, false),
+        Command::VerifyRoceCsv {
+            prof,
+            device,
+            golden,
+        } => verify_net_csv(&prof, device.as_deref(), &golden, true),
         Command::VerifyPcieCsv {
             prof,
             device,
@@ -571,8 +603,13 @@ enum Artifact {
     TsCpuTopFunction,
     Hccs,
     Hbm,
+    Communication,
+    HostCpuUsage,
+    HostMemUsage,
     Llc,
+    Nic,
     Pcie,
+    Roce,
     Summary,
     Timeline,
 }
@@ -592,8 +629,13 @@ impl Artifact {
             Artifact::TsCpuTopFunction => "ts_cpu_top_function",
             Artifact::Hccs => "hccs",
             Artifact::Hbm => "hbm",
+            Artifact::Communication => "communication_statistic",
+            Artifact::HostCpuUsage => "host_cpu_usage",
+            Artifact::HostMemUsage => "host_mem_usage",
             Artifact::Llc => "llc_read_write",
+            Artifact::Nic => "nic",
             Artifact::Pcie => "pcie",
+            Artifact::Roce => "roce",
             Artifact::Summary => "summary",
             Artifact::Timeline => "timeline",
         }
@@ -613,15 +655,20 @@ impl Artifact {
             Artifact::TsCpuTopFunction => "ts_cpu_top_function.csv",
             Artifact::Hccs => "hccs.csv",
             Artifact::Hbm => "hbm.csv",
+            Artifact::Communication => "communication_statistic.csv",
+            Artifact::HostCpuUsage => "host_cpu_usage.csv",
+            Artifact::HostMemUsage => "host_mem_usage.csv",
             Artifact::Llc => "llc_read_write.csv",
+            Artifact::Nic => "nic.csv",
             Artifact::Pcie => "pcie.csv",
+            Artifact::Roce => "roce.csv",
             Artifact::Summary => "summary.csv",
             Artifact::Timeline => "timeline.json",
         }
     }
 }
 
-const CSV_ARTIFACTS: [Artifact; 15] = [
+const CSV_ARTIFACTS: [Artifact; 20] = [
     Artifact::TaskTime,
     Artifact::OpSummary,
     Artifact::ApiStatistic,
@@ -634,12 +681,17 @@ const CSV_ARTIFACTS: [Artifact; 15] = [
     Artifact::TsCpuTopFunction,
     Artifact::Hccs,
     Artifact::Hbm,
+    Artifact::Communication,
+    Artifact::HostCpuUsage,
+    Artifact::HostMemUsage,
     Artifact::Llc,
+    Artifact::Nic,
     Artifact::Pcie,
+    Artifact::Roce,
     Artifact::Summary,
 ];
 
-const ALL_ARTIFACTS: [Artifact; 16] = [
+const ALL_ARTIFACTS: [Artifact; 21] = [
     Artifact::TaskTime,
     Artifact::OpSummary,
     Artifact::ApiStatistic,
@@ -652,8 +704,13 @@ const ALL_ARTIFACTS: [Artifact; 16] = [
     Artifact::TsCpuTopFunction,
     Artifact::Hccs,
     Artifact::Hbm,
+    Artifact::Communication,
+    Artifact::HostCpuUsage,
+    Artifact::HostMemUsage,
     Artifact::Llc,
+    Artifact::Nic,
     Artifact::Pcie,
+    Artifact::Roce,
     Artifact::Summary,
     Artifact::Timeline,
 ];
@@ -769,8 +826,13 @@ fn write_artifact(artifact: Artifact, prof: &Path, only: Option<&str>, dir: &Pat
         Artifact::TsCpuTopFunction => ts_cpu_top_function(prof, only, &out),
         Artifact::Hccs => hccs_csv(prof, only, &out),
         Artifact::Hbm => hbm_csv(prof, only, &out),
+        Artifact::Communication => communication_csv(prof, only, &out),
+        Artifact::HostCpuUsage => host_cpu_csv(prof, only, &out),
+        Artifact::HostMemUsage => host_mem_csv(prof, only, &out),
         Artifact::Llc => llc_csv(prof, only, &out),
+        Artifact::Nic => nic_csv(prof, only, &out),
         Artifact::Pcie => pcie_csv(prof, only, &out),
+        Artifact::Roce => roce_csv(prof, only, &out),
         Artifact::Summary => summary(prof, only, &out),
         Artifact::Timeline => timeline(prof, only, &out),
     }
@@ -800,6 +862,172 @@ fn pcie_value(raw: u32, bandwidth: bool) -> f64 {
 }
 
 /// One LLC sample: `(bank, wall_ns, hit fraction, MiB/s)`.
+/// `start_info` fields needed by the NIC/RoCE summary.
+fn start_info_times(device: &Path) -> Result<(i128, i128)> {
+    let text = std::fs::read_to_string(find_start_info(device)?)?;
+    let root: serde_json::Value = serde_json::from_str(&text)?;
+    let get = |key: &str| -> Result<i128> {
+        root.get(key)
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i128>().ok())
+            .ok_or_else(|| anyhow::anyhow!("start_info has no {key}"))
+    };
+    Ok((get("collectionTimeBegin")?, get("clockMonotonicRaw")?))
+}
+
+fn find_start_info(device: &Path) -> Result<std::path::PathBuf> {
+    for entry in std::fs::read_dir(device)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("start_info")
+        {
+            return Ok(entry.path());
+        }
+    }
+    bail!("no start_info in {}", device.display())
+}
+
+/// `format_high_precision_for_csv(trans_into_local_time(duration_ns))`.
+///
+/// msprof computes `duration/1000 + local_time_offset` in `Decimal`, where the
+/// offset is the *shortest decimal repr* of an `f64` (≈0.1 µs resolution at this
+/// magnitude). `duration` is a nanosecond count, so the sum is done in
+/// milli-microseconds; the offset is rounded to that 0.1 µs grid with
+/// ties-to-even to match the repr.
+fn nic_timestamp_column(begin_us: i128, cmr_ns: i128, duration_ns: u64) -> String {
+    let offset_milli = begin_us * 1000 - cmr_ns;
+    let q = offset_milli.div_euclid(100);
+    let r = offset_milli.rem_euclid(100);
+    let rounded = match r.cmp(&50) {
+        std::cmp::Ordering::Greater => q + 1,
+        std::cmp::Ordering::Less => q,
+        std::cmp::Ordering::Equal if q % 2 == 0 => q,
+        std::cmp::Ordering::Equal => q + 1,
+    };
+    let milli = rounded * 100 + duration_ns as i128;
+    format!("{}.{:03}\t", milli / 1000, milli % 1000)
+}
+
+fn net_summary_rows(samples: &[NetSample], device: &Path) -> Result<Vec<[String; 10]>> {
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ts: Vec<i128> = samples.iter().map(|s| s.ts_ns).collect();
+    let duration_ns = (*ts.iter().max().unwrap() - *ts.iter().min().unwrap()) as u64;
+    let (begin_us, cmr_ns) = start_info_times(device)?;
+    let stamp = nic_timestamp_column(begin_us, cmr_ns, duration_ns);
+    let last = samples.last().unwrap();
+    let bandwidth = last.bandwidth;
+    let efficiency = |byte_rate: u64| {
+        if bandwidth > 0 {
+            round3(byte_rate as f64 * 8.0 / (bandwidth as f64 * 1024.0 * 1024.0))
+        } else {
+            0.0
+        }
+    };
+    Ok(vec![[
+        stamp,
+        py_round3(bandwidth as f64),
+        py_round3(efficiency(last.rx[1])),
+        py_round3(last.rx[0] as f64),
+        "0.0".to_string(),
+        "0.0".to_string(),
+        py_round3(efficiency(last.tx[1])),
+        py_round3(last.tx[0] as f64),
+        "0.0".to_string(),
+        "0.0".to_string(),
+    ]])
+}
+
+fn net_csv(prof: &Path, only: Option<&str>, out: &Path, roce: bool) -> Result<()> {
+    let mut body = String::from(
+        "Device_id,Timestamp(us),Bandwidth(MB/s),Rx Bandwidth efficiency(%),rxPacket/s,\
+         rxError rate(%),rxDropped rate(%),Tx Bandwidth efficiency(%),txPacket/s,\
+         txError rate(%),txDropped rate(%),funcId\n",
+    );
+    let mut total = 0usize;
+    for device in devices(prof, only)? {
+        let (ctx, info) = build_ctx(prof, &device)?;
+        let dev = info.device_id.unwrap_or(0);
+        let mut store = Store::new();
+        let samples: Vec<NetSample> = if roce {
+            resolve::<RoceRow>(&mut store, &ctx)?
+                .iter()
+                .map(|r| r.0)
+                .collect()
+        } else {
+            resolve::<NicRow>(&mut store, &ctx)?
+                .iter()
+                .map(|r| r.0)
+                .collect()
+        };
+        for row in net_summary_rows(&samples, &device)? {
+            body.push_str(&format!("{dev},{},0\n", row.join(",")));
+            total += 1;
+        }
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, body)?;
+    println!("wrote {total} rows to {}", out.display());
+    Ok(())
+}
+
+fn verify_net_csv(prof: &Path, only: Option<&str>, golden: &Path, roce: bool) -> Result<()> {
+    let mut produced: Vec<Vec<String>> = Vec::new();
+    for device in devices(prof, only)? {
+        let (ctx, info) = build_ctx(prof, &device)?;
+        let dev = info.device_id.unwrap_or(0).to_string();
+        let mut store = Store::new();
+        let samples: Vec<NetSample> = if roce {
+            resolve::<RoceRow>(&mut store, &ctx)?
+                .iter()
+                .map(|r| r.0)
+                .collect()
+        } else {
+            resolve::<NicRow>(&mut store, &ctx)?
+                .iter()
+                .map(|r| r.0)
+                .collect()
+        };
+        for row in net_summary_rows(&samples, &device)? {
+            let mut cells = vec![dev.clone()];
+            cells.extend(row.iter().cloned());
+            cells.push("0".to_string());
+            produced.push(cells);
+        }
+    }
+    compare_table(
+        golden,
+        &[
+            "Device_id",
+            "Timestamp(us)",
+            "Bandwidth(MB/s)",
+            "Rx Bandwidth efficiency(%)",
+            "rxPacket/s",
+            "rxError rate(%)",
+            "rxDropped rate(%)",
+            "Tx Bandwidth efficiency(%)",
+            "txPacket/s",
+            "txError rate(%)",
+            "txDropped rate(%)",
+            "funcId",
+        ],
+        &produced,
+    )
+}
+
+fn nic_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
+    net_csv(prof, only, out, false)
+}
+
+fn roce_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
+    net_csv(prof, only, out, true)
+}
+
 fn net_rows(samples: &[NetSample], ty: &str) -> Vec<CounterRow> {
     let mut out = Vec::with_capacity(samples.len() * 2);
     for sample in samples {
@@ -829,6 +1057,189 @@ fn net_rows(samples: &[NetSample], ty: &str) -> Vec<CounterRow> {
         let _ = ty;
     }
     out
+}
+
+/// `local_time_offset` for the *host* domain, in milli-microseconds.
+///
+/// Host tracks use `host/start_info` (the host process's own report), which is a
+/// few microseconds away from the device one.
+fn host_local_offset_milli(prof_root: &Path) -> Result<i128> {
+    let text = std::fs::read_to_string(prof_root.join("host").join("start_info"))?;
+    let root: serde_json::Value = serde_json::from_str(&text)?;
+    let get = |key: &str| -> Result<i128> {
+        root.get(key)
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i128>().ok())
+            .ok_or_else(|| anyhow::anyhow!("host/start_info has no {key}"))
+    };
+    Ok(get("collectionTimeBegin")? * 1000 - get("clockMonotonicRaw")?)
+}
+
+fn host_ts_us(start_ns: u64, offset_milli: i128) -> String {
+    let milli = start_ns as i128 + offset_milli;
+    format!("{}.{:03}", milli / 1000, milli % 1000)
+}
+
+fn host_cpu_rows(samples: &[HostCpuUsageRow], offset_milli: i128) -> Vec<CounterRow> {
+    samples
+        .iter()
+        .map(|sample| CounterRow {
+            name: format!("CPU {}", sample.cpu_no),
+            tid: 0,
+            ts: host_ts_us(sample.start_ns, offset_milli),
+            args: vec![("Usage(%)".to_string(), Num::Float(sample.usage))],
+        })
+        .collect()
+}
+
+/// `communication_statistic.csv`: op types and counts only.
+///
+/// The time columns are deliberately **not** emitted: msprof's per-op
+/// `start`/`end` come from the host-produced `HCCLOpSingleDevice` table, and the
+/// raw streams carry no op window (every task of an op shares the op stamp).
+/// See spec/TODO.md (T22).
+/// `host_mem_usage.csv` — `Total Memory`, `Peak Used Memory`, `Recommend
+/// Memory` in KB.
+///
+/// Code-derived and **unverified**: no capture with `--host-sys=mem` has been
+/// available, so this has never produced a row (see spec/TODO.md, T25).
+fn host_mem_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
+    let mut body = String::from("Device_id,Total Memory,Peak Used Memory,Recommend Memory\n");
+    let mut rows = 0usize;
+    for device in devices(prof, only)? {
+        let (ctx, _info) = build_ctx(prof, &device)?;
+        let mut store = Store::new();
+        let samples = resolve::<HostMemUsageRow>(&mut store, &ctx)?;
+        let total_kb = std::fs::read_to_string(ctx.root().join("host").join("info.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|root| root.get("memoryTotal").and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+        let peak = samples
+            .iter()
+            .map(|sample| sample.usage)
+            .fold(0.0f64, f64::max);
+        if let Some(last) = samples.last() {
+            let used_kb = (peak * total_kb as f64 / 100.0).round() as u64;
+            body.push_str(&format!("host,{total_kb},{used_kb},{used_kb}\n"));
+            let _ = last;
+            rows += 1;
+        }
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, body)?;
+    println!("wrote {rows} rows to {}", out.display());
+    Ok(())
+}
+
+fn communication_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
+    let mut body = String::from("Device_id,OP Type,Count\n");
+    let mut rows = 0usize;
+    for device in devices(prof, only)? {
+        let (ctx, info) = build_ctx(prof, &device)?;
+        let dev = info.device_id.unwrap_or(0);
+        let mut store = Store::new();
+        let ops = resolve::<HcclOpRow>(&mut store, &ctx)?;
+        let tasks = resolve::<HcclInfoRow>(&mut store, &ctx)?;
+        let dic = ctx.require::<mspark_model::HashDic>()?;
+
+        // Tasks belong to the last op that started before them (validated: this
+        // reproduces msprof's per-type op counts exactly).
+        let mut stamps: Vec<u64> = ops.iter().map(|op| op.ts_ns).collect();
+        stamps.sort_unstable();
+        let mut per_op: Vec<Vec<u64>> = vec![Vec::new(); ops.len()];
+        for task in tasks.iter() {
+            let idx = stamps.partition_point(|stamp| *stamp <= task.ts_ns);
+            if idx == 0 {
+                continue;
+            }
+            // Map the sorted position back to the original op index.
+            let stamp = stamps[idx - 1];
+            if let Some(pos) = ops.iter().position(|op| op.ts_ns == stamp) {
+                per_op[pos].push(task.ccl_tag);
+            }
+        }
+
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for (idx, _op) in ops.iter().enumerate() {
+            // An op with no tasks cannot be attributed to a type; skip it rather
+            // than guess (recorded in spec/TODO.md).
+            if per_op[idx].is_empty() {
+                continue;
+            }
+            let mut tally: HashMap<u64, usize> = HashMap::new();
+            for tag in per_op[idx].iter() {
+                *tally.entry(*tag).or_insert(0) += 1;
+            }
+            let Some((tag, _)) = tally.into_iter().max_by_key(|(_, n)| *n) else {
+                continue;
+            };
+            let name = dic.get(tag).unwrap_or("N/A");
+            // `Broadcast_group_name_0` -> `hcom_broadcast_`
+            let kind = name.split('_').next().unwrap_or("N/A");
+            let mut chars = kind.chars();
+            let op_type = match chars.next() {
+                Some(first) => format!("hcom_{}{}_", first.to_lowercase(), chars.as_str()),
+                None => "hcom_unknown_".to_string(),
+            };
+            *counts.entry(op_type).or_insert(0) += 1;
+        }
+        for (op_type, count) in counts {
+            body.push_str(&format!("{dev},{op_type},{count}\n"));
+            rows += 1;
+        }
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, body)?;
+    println!("wrote {rows} rows to {}", out.display());
+    Ok(())
+}
+
+fn host_cpu_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
+    let mut body =
+        String::from("Device_id,Total Cpu Numbers,Occupied Cpu Numbers,Recommend Cpu Numbers\n");
+    let mut total_rows = 0usize;
+    for device in devices(prof, only)? {
+        let (ctx, _info) = build_ctx(prof, &device)?;
+        let mut store = Store::new();
+        let samples = resolve::<HostCpuUsageRow>(&mut store, &ctx)?;
+        use std::collections::BTreeMap;
+        let mut peak: BTreeMap<u64, f64> = BTreeMap::new();
+        let mut total = 0u64;
+        for sample in samples.iter() {
+            if sample.cpu_no == "Avg" {
+                continue;
+            }
+            if let Ok(cpu) = sample.cpu_no.parse::<u64>() {
+                total = total.max(cpu + 1);
+                let entry = peak.entry(cpu).or_insert(0.0);
+                *entry = entry.max(sample.usage);
+            }
+        }
+        // `Total` is the machine's logical CPU count from `host/info.json`
+        // (`cpuNums`), not the highest CPU id that happened to be sampled.
+        let info_cpus = std::fs::read_to_string(ctx.root().join("host").join("info.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|root| root.get("cpuNums").and_then(|v| v.as_u64()))
+            .unwrap_or(total);
+        let total = info_cpus.max(total);
+        let occupied = peak.len();
+        let recommend = peak.values().filter(|usage| **usage > 0.0).count();
+        body.push_str(&format!("host,{total},{occupied},{recommend}\n"));
+        total_rows += 1;
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, body)?;
+    println!("wrote {total_rows} rows to {}", out.display());
+    Ok(())
 }
 
 fn llc_samples(
@@ -2005,6 +2416,33 @@ fn device_timeline(prof: &Path, device: &Path) -> Result<(Vec<TraceEvent>, usize
         // --- NPU MEM ---
         let npu_mem = resolve::<NpuMemRow>(&mut store, &ctx)?;
         let npu_mem_pid = track_pid(16);
+        // --- CPU Usage (host track) ---
+        let cpu_usage = resolve::<HostCpuUsageRow>(&mut store, &ctx)?;
+        let cpu_pid = (info.pid << 10) | (9 << 5) | 31;
+        events.push(TraceEvent::meta(
+            "process_name",
+            cpu_pid,
+            0,
+            args(vec![("name", Num::Str("CPU Usage".to_string()))]),
+        ));
+        events.push(TraceEvent::meta(
+            "process_labels",
+            cpu_pid,
+            0,
+            args(vec![("labels", Num::Str("CPU".to_string()))]),
+        ));
+        events.push(TraceEvent::meta(
+            "process_sort_index",
+            cpu_pid,
+            0,
+            args(vec![("sort_index", Num::Int(9))]),
+        ));
+        let cpu_offset = host_local_offset_milli(ctx.root())?;
+        for row in host_cpu_rows(&cpu_usage, cpu_offset) {
+            write_counter(&mut events, cpu_pid, &row);
+            total += 1;
+        }
+
         // --- HCCS ---
         let hccs = resolve::<HccsRateRow>(&mut store, &ctx)?;
         let hccs_pid = track_pid(19);
@@ -2101,8 +2539,11 @@ fn golden_process_meta(array: &[serde_json::Value]) -> HashMap<u64, (String, Str
 
 fn golden_pid_for(meta: &HashMap<u64, (String, String)>, name: &str, dev: u32) -> Option<u64> {
     let label = format!("NPU {dev}");
+    // Device tracks carry `NPU <dev>`; host tracks (`CPU Usage`, `CANN`) carry
+    // their own label, so fall back to a name-only match.
     meta.iter()
         .find(|(_, (track, lbl))| track == name && (lbl.is_empty() || *lbl == label))
+        .or_else(|| meta.iter().find(|(_, (track, _))| track == name))
         .map(|(pid, _)| *pid)
 }
 
@@ -2271,6 +2712,14 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
             (28u32, "QoS", qos_rows_v),
             (16u32, "NPU MEM", npu_mem_rows_v),
             (19u32, "HCCS", hccs_rows_v),
+            (
+                9u32,
+                "CPU Usage",
+                host_cpu_rows(
+                    &resolve::<HostCpuUsageRow>(&mut store, &ctx)?,
+                    host_local_offset_milli(ctx.root())?,
+                ),
+            ),
             (
                 20u32,
                 "NIC",
