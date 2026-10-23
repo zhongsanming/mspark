@@ -8,11 +8,11 @@ use mspark_model::raw;
 use mspark_model::tables;
 use mspark_model::{
     AccPmuSample, ApiEventRow, ApiStatisticRow, ChipTransKind, ChipTransSample, Clock, DeviceInfo,
-    DvppRow, HbmRecord, HcclInfoRow, HcclOpRow, HccsRateRow, HostCpuUsageRow, InterSocSample,
-    L2CacheRow, LlcRecord, LpmInfo, NicRow, NpuMemRow, NpuModuleMemRow, OpStatisticRow,
-    OpSummaryRow, OverlapKind, OverlapRow, PcieRecord, PmuData, QosRow, RoceRow, SioSample,
-    StarsSocEntry, TaskTimeRow, TimelineTask, TrackFlip, TscpuRecord, fmt_us, load_clock,
-    load_device_info, load_dictionaries, load_host_clock, load_sample_string,
+    DvppRow, HbmRecord, HcclInfoRow, HcclOpRow, HccsRateRow, HostCpuUsageRow, HostMemUsageRow,
+    InterSocSample, L2CacheRow, LlcRecord, LpmInfo, NicRow, NpuMemRow, NpuModuleMemRow,
+    OpStatisticRow, OpSummaryRow, OverlapKind, OverlapRow, PcieRecord, PmuData, QosRow, RoceRow,
+    SioSample, StarsSocEntry, TaskTimeRow, TimelineTask, TrackFlip, TscpuRecord, fmt_us,
+    load_clock, load_device_info, load_dictionaries, load_host_clock, load_sample_string,
 };
 use palc::{Parser, Subcommand};
 use rayon::prelude::*;
@@ -605,6 +605,7 @@ enum Artifact {
     Hbm,
     Communication,
     HostCpuUsage,
+    HostMemUsage,
     Llc,
     Nic,
     Pcie,
@@ -630,6 +631,7 @@ impl Artifact {
             Artifact::Hbm => "hbm",
             Artifact::Communication => "communication_statistic",
             Artifact::HostCpuUsage => "host_cpu_usage",
+            Artifact::HostMemUsage => "host_mem_usage",
             Artifact::Llc => "llc_read_write",
             Artifact::Nic => "nic",
             Artifact::Pcie => "pcie",
@@ -655,6 +657,7 @@ impl Artifact {
             Artifact::Hbm => "hbm.csv",
             Artifact::Communication => "communication_statistic.csv",
             Artifact::HostCpuUsage => "host_cpu_usage.csv",
+            Artifact::HostMemUsage => "host_mem_usage.csv",
             Artifact::Llc => "llc_read_write.csv",
             Artifact::Nic => "nic.csv",
             Artifact::Pcie => "pcie.csv",
@@ -665,7 +668,7 @@ impl Artifact {
     }
 }
 
-const CSV_ARTIFACTS: [Artifact; 19] = [
+const CSV_ARTIFACTS: [Artifact; 20] = [
     Artifact::TaskTime,
     Artifact::OpSummary,
     Artifact::ApiStatistic,
@@ -680,6 +683,7 @@ const CSV_ARTIFACTS: [Artifact; 19] = [
     Artifact::Hbm,
     Artifact::Communication,
     Artifact::HostCpuUsage,
+    Artifact::HostMemUsage,
     Artifact::Llc,
     Artifact::Nic,
     Artifact::Pcie,
@@ -687,7 +691,7 @@ const CSV_ARTIFACTS: [Artifact; 19] = [
     Artifact::Summary,
 ];
 
-const ALL_ARTIFACTS: [Artifact; 20] = [
+const ALL_ARTIFACTS: [Artifact; 21] = [
     Artifact::TaskTime,
     Artifact::OpSummary,
     Artifact::ApiStatistic,
@@ -702,6 +706,7 @@ const ALL_ARTIFACTS: [Artifact; 20] = [
     Artifact::Hbm,
     Artifact::Communication,
     Artifact::HostCpuUsage,
+    Artifact::HostMemUsage,
     Artifact::Llc,
     Artifact::Nic,
     Artifact::Pcie,
@@ -823,6 +828,7 @@ fn write_artifact(artifact: Artifact, prof: &Path, only: Option<&str>, dir: &Pat
         Artifact::Hbm => hbm_csv(prof, only, &out),
         Artifact::Communication => communication_csv(prof, only, &out),
         Artifact::HostCpuUsage => host_cpu_csv(prof, only, &out),
+        Artifact::HostMemUsage => host_mem_csv(prof, only, &out),
         Artifact::Llc => llc_csv(prof, only, &out),
         Artifact::Nic => nic_csv(prof, only, &out),
         Artifact::Pcie => pcie_csv(prof, only, &out),
@@ -1092,6 +1098,42 @@ fn host_cpu_rows(samples: &[HostCpuUsageRow], offset_milli: i128) -> Vec<Counter
 /// `start`/`end` come from the host-produced `HCCLOpSingleDevice` table, and the
 /// raw streams carry no op window (every task of an op shares the op stamp).
 /// See spec/TODO.md (T22).
+/// `host_mem_usage.csv` — `Total Memory`, `Peak Used Memory`, `Recommend
+/// Memory` in KB.
+///
+/// Code-derived and **unverified**: no capture with `--host-sys=mem` has been
+/// available, so this has never produced a row (see spec/TODO.md, T25).
+fn host_mem_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
+    let mut body = String::from("Device_id,Total Memory,Peak Used Memory,Recommend Memory\n");
+    let mut rows = 0usize;
+    for device in devices(prof, only)? {
+        let (ctx, _info) = build_ctx(prof, &device)?;
+        let mut store = Store::new();
+        let samples = resolve::<HostMemUsageRow>(&mut store, &ctx)?;
+        let total_kb = std::fs::read_to_string(ctx.root().join("host").join("info.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|root| root.get("memoryTotal").and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+        let peak = samples
+            .iter()
+            .map(|sample| sample.usage)
+            .fold(0.0f64, f64::max);
+        if let Some(last) = samples.last() {
+            let used_kb = (peak * total_kb as f64 / 100.0).round() as u64;
+            body.push_str(&format!("host,{total_kb},{used_kb},{used_kb}\n"));
+            let _ = last;
+            rows += 1;
+        }
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, body)?;
+    println!("wrote {rows} rows to {}", out.display());
+    Ok(())
+}
+
 fn communication_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,OP Type,Count\n");
     let mut rows = 0usize;

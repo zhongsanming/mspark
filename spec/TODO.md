@@ -147,6 +147,30 @@ Values exact (816/816), timestamps differ in the sub-µs digits
 
 ## Not started
 
+### T25. Host-usage family — code-derived, unverified
+`host_mem_usage` is implemented (node + CSV) straight from
+`HostMemUsagePresenter._parse_mem_data`:
+
+```
+usage = Decimal(field[2]) * 4 / mem_total * 100        (mem_total = info.json memoryTotal)
+row   = [prev_ts, cur_ts, usage]
+```
+
+It has never produced a row: no capture with `--host-sys=mem` exists here.
+
+The remaining three are the same shape and are **not** implemented yet, each with
+its own twist:
+
+| artifact | stream | notes |
+|---|---|---|
+| `host_disk_usage` | `host_disk.data` | converts to KB/s using `sample.json` disk freq; `interval = 1/freq * FREQ_TO_NS` |
+| `host_network_usage` | `host_network.data` | per-interface rates, same text pattern |
+| `os_runtime_statistic` | `SystemCpuUsage.data` / `host_sys_cpu.data` | different table shape |
+| `cpu_usage` | derived from the same streams | per-process, `--host-sys=cpu` |
+
+Fidelity: these are transcribed from the reference implementation and marked
+unverified in the README, the same treatment as non-V4 chips.
+
 ### T24. `step_trace` — needs iteration markers (none in our captures)
 Empirically blocked: this capture produces **no** `STEP_TRACE` table in the
 reference DB and **no** `step_trace` artifact, even though

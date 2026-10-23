@@ -130,6 +130,8 @@ Verified against a fresh V4 (910B) capture with the current `msprof`:
 | `pcie.csv` | 7/7 rows, all columns |
 | `hccs.csv` | 2/2 rows, all columns |
 | `nic.csv` / `roce.csv` | 1/1 row, all 12 columns |
+| `communication_statistic.csv` | OP Type / Count exact; time columns omitted (see TODO) |
+| `host_cpu_usage.csv` | all 4 columns |
 | `llc_read_write.csv` | 3/3 rows, all columns |
 | timeline: QoS, HCCS, HBM, LLC, PCIe, NIC, RoCE | 1 660–81 476 events each, all matched |
 | timeline: SIO, Acc PMU, Stars Soc Info, Stars Chip Trans, NPU MEM (values) | all matched |
@@ -166,6 +168,21 @@ than chased.
 What *is* required is that nothing is silently invented: when we synthesise or
 approximate something (a join we cannot reproduce, a rounding difference, a
 format we reverse-engineered), it is written down here or in `spec/TODO.md`.
+
+## Code-derived, unverified
+
+A few artifacts are transcribed from msprof's implementation but have never been
+exercised against real output, because our captures do not enable the relevant
+collection flags:
+
+| artifact | needs |
+|---|---|
+| `host_mem_usage` (shipped), `host_disk_usage`, `host_network_usage`, `os_runtime_statistic`, `cpu_usage` | `--host-sys=mem/disk/network/osrt` |
+| `msproftx` | `--msproftx=on` |
+| `step_trace` | iteration markers |
+
+They are implemented only when the algorithm is unambiguous in the source. Treat
+their output as untrusted until verified, exactly like the non-V4 chip rows.
 
 ## Chip support
 
