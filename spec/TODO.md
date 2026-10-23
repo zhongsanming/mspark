@@ -229,8 +229,27 @@ dataSize, opType, dataType, linkType` — the tail (bytes 96..120) holds only
 not in it. `duration` is also demonstrably not `durationEstimated`
 (0.92 us vs 0.60 us in the golden track).
 
-Next step: find the stream that feeds `hccl.db`'s `HcclTask` (the host profiler's
-HCCL collector) and read those three fields; then this and T22 unblock together. The raw op record carries a
+**Source found — it is msprof itself, not the host profiler.**
+`mscalculate/cann/cann_analysis_gear.py::add_hccl_task` builds every `HCCLTask`
+row from streams we already read:
+
+| column | source |
+|---|---|
+| `timestamp`, `duration` (and stream/task/batch/thread ids) | **`aging.compact.task_track`** — the same stream our `TaskTrackRow` decodes |
+| `is_master` | `1 if hccl_event.struct_type == 'master'` — the HCCL **api_event** in the call stack |
+| `op_id` | `node_dto.connection_id` — the **node-level api_event** |
+| `op_name`, `group_name`, `plane_id`, `local/remote rank`, `rank_size`, `size`, `data_type`, `link_type`, `notify_id`, `rdma_type` | `unaging.additional.hccl_info` (already decoded) |
+
+So the op window is reachable: group `HCCLTask` rows by `(thread_id, op_id)`, keep
+`is_master`, and take `[min(timestamp), max(timestamp + duration)]`.
+
+Concrete next steps:
+1. extend `TaskTrackRow` with `duration` (and batch/thread) from the compact
+   record — the same record that already gives us `kernel_name`;
+2. read `connection_id` and `struct_type` from the api_event stream (we parse
+   api_event already for `api_statistic`);
+3. then implement T22's CSV times, the Communication track `dur`, and T26's two
+   communication overlap threads — all from data we have. The raw op record carries a
 single stamp and all tasks of an op share it, so the interval cannot be
 reconstructed — the same ceiling as `communication_statistic`'s time columns.
 
