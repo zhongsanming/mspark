@@ -248,7 +248,8 @@ pub fn decode_hccl_info(bytes: &[u8]) -> Result<Vec<HcclInfoRaw>> {
         if head.magic.get() != COMPACT_MAGIC {
             continue;
         }
-        let data = HcclInfoData::ref_from_bytes(&head.data).map_err(cast)?;
+        // The union is 232 bytes; the HCCL struct occupies a 120-byte prefix.
+        let (data, _) = HcclInfoData::ref_from_prefix(&head.data).map_err(cast)?;
         out.push(HcclInfoRaw {
             timestamp: head.timestamp.get(),
             ccl_tag: data.ccl_tag.get(),

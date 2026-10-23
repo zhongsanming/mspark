@@ -271,8 +271,16 @@ Calibration already done:
   not — every task of an op shares the op's stamp, so `span` is 0 and
   `Σ durationEstimated` is 1-2 orders of magnitude short of the golden totals.
 
-- Therefore the CSV can be shipped with **exact** `OP Type`/`Count` and
-  **approximate** time columns. The `Communication` **track** is still
+- **Shipped** as `communication_statistic.csv` with `Device_id, OP Type, Count`
+  only. `Count` and `OP Type` are exact (410 `hcom_allReduce_`, 415
+  `hcom_broadcast_`); the time columns are omitted because per-op windows do not
+  exist in the raw streams, and `Ratio(%)` follows them.
+- One op carries no tasks and therefore cannot be attributed to a type; it is
+  skipped rather than guessed (golden has it as the single `hcom_allGather_`).
+- The **track** is not emitted: event names resolve (`itemId` is the `hcclName`
+  hash — `Notify_Record` / `Notify_Wait` / `Memcpy` / `Reduce_Inline`), but `dur`
+  does not (golden 0.92 us vs `durationEstimated` 0.60), and emitting an X event
+  with a wrong duration would be inventing data. The `Communication` **track** is still
   implementable approximately from the task records (args + plane/group
   threading), with `dur` from `durationEstimated` — documented as an
   approximation.

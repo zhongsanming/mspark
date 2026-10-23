@@ -8,11 +8,11 @@ use mspark_model::raw;
 use mspark_model::tables;
 use mspark_model::{
     AccPmuSample, ApiEventRow, ApiStatisticRow, ChipTransKind, ChipTransSample, Clock, DeviceInfo,
-    DvppRow, HbmRecord, HccsRateRow, HostCpuUsageRow, InterSocSample, L2CacheRow, LlcRecord,
-    LpmInfo, NicRow, NpuMemRow, NpuModuleMemRow, OpStatisticRow, OpSummaryRow, OverlapKind,
-    OverlapRow, PcieRecord, PmuData, QosRow, RoceRow, SioSample, StarsSocEntry, TaskTimeRow,
-    TimelineTask, TrackFlip, TscpuRecord, fmt_us, load_clock, load_device_info, load_dictionaries,
-    load_host_clock, load_sample_string,
+    DvppRow, HbmRecord, HcclInfoRow, HcclOpRow, HccsRateRow, HostCpuUsageRow, InterSocSample,
+    L2CacheRow, LlcRecord, LpmInfo, NicRow, NpuMemRow, NpuModuleMemRow, OpStatisticRow,
+    OpSummaryRow, OverlapKind, OverlapRow, PcieRecord, PmuData, QosRow, RoceRow, SioSample,
+    StarsSocEntry, TaskTimeRow, TimelineTask, TrackFlip, TscpuRecord, fmt_us, load_clock,
+    load_device_info, load_dictionaries, load_host_clock, load_sample_string,
 };
 use palc::{Parser, Subcommand};
 use rayon::prelude::*;
@@ -603,6 +603,7 @@ enum Artifact {
     TsCpuTopFunction,
     Hccs,
     Hbm,
+    Communication,
     HostCpuUsage,
     Llc,
     Nic,
@@ -627,6 +628,7 @@ impl Artifact {
             Artifact::TsCpuTopFunction => "ts_cpu_top_function",
             Artifact::Hccs => "hccs",
             Artifact::Hbm => "hbm",
+            Artifact::Communication => "communication_statistic",
             Artifact::HostCpuUsage => "host_cpu_usage",
             Artifact::Llc => "llc_read_write",
             Artifact::Nic => "nic",
@@ -651,6 +653,7 @@ impl Artifact {
             Artifact::TsCpuTopFunction => "ts_cpu_top_function.csv",
             Artifact::Hccs => "hccs.csv",
             Artifact::Hbm => "hbm.csv",
+            Artifact::Communication => "communication_statistic.csv",
             Artifact::HostCpuUsage => "host_cpu_usage.csv",
             Artifact::Llc => "llc_read_write.csv",
             Artifact::Nic => "nic.csv",
@@ -662,7 +665,7 @@ impl Artifact {
     }
 }
 
-const CSV_ARTIFACTS: [Artifact; 18] = [
+const CSV_ARTIFACTS: [Artifact; 19] = [
     Artifact::TaskTime,
     Artifact::OpSummary,
     Artifact::ApiStatistic,
@@ -675,6 +678,7 @@ const CSV_ARTIFACTS: [Artifact; 18] = [
     Artifact::TsCpuTopFunction,
     Artifact::Hccs,
     Artifact::Hbm,
+    Artifact::Communication,
     Artifact::HostCpuUsage,
     Artifact::Llc,
     Artifact::Nic,
@@ -683,7 +687,7 @@ const CSV_ARTIFACTS: [Artifact; 18] = [
     Artifact::Summary,
 ];
 
-const ALL_ARTIFACTS: [Artifact; 19] = [
+const ALL_ARTIFACTS: [Artifact; 20] = [
     Artifact::TaskTime,
     Artifact::OpSummary,
     Artifact::ApiStatistic,
@@ -696,6 +700,7 @@ const ALL_ARTIFACTS: [Artifact; 19] = [
     Artifact::TsCpuTopFunction,
     Artifact::Hccs,
     Artifact::Hbm,
+    Artifact::Communication,
     Artifact::HostCpuUsage,
     Artifact::Llc,
     Artifact::Nic,
@@ -816,6 +821,7 @@ fn write_artifact(artifact: Artifact, prof: &Path, only: Option<&str>, dir: &Pat
         Artifact::TsCpuTopFunction => ts_cpu_top_function(prof, only, &out),
         Artifact::Hccs => hccs_csv(prof, only, &out),
         Artifact::Hbm => hbm_csv(prof, only, &out),
+        Artifact::Communication => communication_csv(prof, only, &out),
         Artifact::HostCpuUsage => host_cpu_csv(prof, only, &out),
         Artifact::Llc => llc_csv(prof, only, &out),
         Artifact::Nic => nic_csv(prof, only, &out),
@@ -1078,6 +1084,78 @@ fn host_cpu_rows(samples: &[HostCpuUsageRow], offset_milli: i128) -> Vec<Counter
             args: vec![("Usage(%)".to_string(), Num::Float(sample.usage))],
         })
         .collect()
+}
+
+/// `communication_statistic.csv`: op types and counts only.
+///
+/// The time columns are deliberately **not** emitted: msprof's per-op
+/// `start`/`end` come from the host-produced `HCCLOpSingleDevice` table, and the
+/// raw streams carry no op window (every task of an op shares the op stamp).
+/// See spec/TODO.md (T22).
+fn communication_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
+    let mut body = String::from("Device_id,OP Type,Count\n");
+    let mut rows = 0usize;
+    for device in devices(prof, only)? {
+        let (ctx, info) = build_ctx(prof, &device)?;
+        let dev = info.device_id.unwrap_or(0);
+        let mut store = Store::new();
+        let ops = resolve::<HcclOpRow>(&mut store, &ctx)?;
+        let tasks = resolve::<HcclInfoRow>(&mut store, &ctx)?;
+        let dic = ctx.require::<mspark_model::HashDic>()?;
+
+        // Tasks belong to the last op that started before them (validated: this
+        // reproduces msprof's per-type op counts exactly).
+        let mut stamps: Vec<u64> = ops.iter().map(|op| op.ts_ns).collect();
+        stamps.sort_unstable();
+        let mut per_op: Vec<Vec<u64>> = vec![Vec::new(); ops.len()];
+        for task in tasks.iter() {
+            let idx = stamps.partition_point(|stamp| *stamp <= task.ts_ns);
+            if idx == 0 {
+                continue;
+            }
+            // Map the sorted position back to the original op index.
+            let stamp = stamps[idx - 1];
+            if let Some(pos) = ops.iter().position(|op| op.ts_ns == stamp) {
+                per_op[pos].push(task.ccl_tag);
+            }
+        }
+
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for (idx, _op) in ops.iter().enumerate() {
+            // An op with no tasks cannot be attributed to a type; skip it rather
+            // than guess (recorded in spec/TODO.md).
+            if per_op[idx].is_empty() {
+                continue;
+            }
+            let mut tally: HashMap<u64, usize> = HashMap::new();
+            for tag in per_op[idx].iter() {
+                *tally.entry(*tag).or_insert(0) += 1;
+            }
+            let Some((tag, _)) = tally.into_iter().max_by_key(|(_, n)| *n) else {
+                continue;
+            };
+            let name = dic.get(tag).unwrap_or("N/A");
+            // `Broadcast_group_name_0` -> `hcom_broadcast_`
+            let kind = name.split('_').next().unwrap_or("N/A");
+            let mut chars = kind.chars();
+            let op_type = match chars.next() {
+                Some(first) => format!("hcom_{}{}_", first.to_lowercase(), chars.as_str()),
+                None => "hcom_unknown_".to_string(),
+            };
+            *counts.entry(op_type).or_insert(0) += 1;
+        }
+        for (op_type, count) in counts {
+            body.push_str(&format!("{dev},{op_type},{count}\n"));
+            rows += 1;
+        }
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, body)?;
+    println!("wrote {rows} rows to {}", out.display());
+    Ok(())
 }
 
 fn host_cpu_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
