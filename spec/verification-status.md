@@ -26,10 +26,22 @@ its own `mindstudio_profiler_output` goldens. Tracks not listed match exactly.
 - **`Overlap`** matched 0 on all seven — the two-thread vs four-thread gap (T26).
 - **`SIO`, `Acc PMU`, `Stars Soc Info`, `Stars Chip Trans`, `QoS`** match exactly
   on devices 5, 3, 2 and 6, but only ~37 % on devices 1, 7 and 4. Counts are
-  identical there, so the *values* differ — these are the SOC-profile tracks fed
-  by `stars_soc_profile`. A plausible cause is die aggregation on those devices
-  (per-die rows vs merged), which needs checking against the capture. This is a
-  new item (T27) and the only device-dependent divergence seen so far.
+  identical there. **Diagnosed (T27): it is not a value difference and not die
+  aggregation.** For device_1's Acc PMU, the 4 468 golden and 4 468 produced
+  samples carry *identical* values wherever their timestamps coincide
+  (6 704 keys, 0 value differences), and the timestamp sets differ by exactly
+  one unit everywhere:
+
+  ```
+  |Δt| = 0.001 us  on 11 168 rows
+  |Δt| = 0.000 us  on  6 704 rows
+  ```
+
+  So this is the **1 ns `HPFloat` rounding** (T9), amplified because the SOC
+  profile emits ~4.5 k dense samples: on devices where the counter value lands on
+  a rounding boundary, every sample misses by 1 ns; on the others it happens to
+  agree. Same class as `task_time`'s 2 ns residual and `npu_mem`'s 25 ns — which
+  means T27 needs no separate fix, only the `HPFloat` port (T9).
 
 ## Caveat
 
