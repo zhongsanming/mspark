@@ -243,9 +243,23 @@ row from streams we already read:
 So the op window is reachable: group `HCCLTask` rows by `(thread_id, op_id)`, keep
 `is_master`, and take `[min(timestamp), max(timestamp + duration)]`.
 
+**Correction — where `duration` really comes from.** `HCCLTask` in `hccl.db` has
+**no** duration column (`HCCLTaskMap`: model_id, index_id, name, group_name,
+plane_id, timestamp, stream_id, task_id, context_id, batch_id, device_id,
+is_master, local/remote rank, transport_type, size, …). `hccl_model.get_hccl_task_data`
+inner-joins it with the **`ASCEND_TASK`** table on
+`(stream_id, task_id, batch_id, context_id, device_id)` and selects
+`b.start_time as timestamp, b.duration as duration`.
+
+So the task window is the generic device task window — the one we already compute
+as `DeviceTask` from `stars_soc` ACSQ pairs. We do not need a `duration` field in
+the task_track record at all; we need to **join `hccl_info` attributes to our
+`DeviceTask`s** on `(stream, task, batch, context)`.
+
 Concrete next steps:
-1. extend `TaskTrackRow` with `duration` (and batch/thread) from the compact
-   record — the same record that already gives us `kernel_name`;
+1. extend `TaskTrackRow` with `batch_id` (and thread/model) so the join key is
+   complete — `TASK_TRACK_FMT = "HHIIIQHHHHQQ"` gives device, stream, task,
+   batch, task_type, kernel_name, model_id;
 2. read `connection_id` and `struct_type` from the api_event stream (we parse
    api_event already for `api_statistic`);
 3. then implement T22's CSV times, the Communication track `dur`, and T26's two
