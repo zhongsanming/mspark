@@ -3,8 +3,6 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
-
 /// V4 L2-cache event selection (`msconfig/l2_cache_config.py`).
 const REQUEST_EVENTS: [&str; 2] = ["0xfb", "0xfc"];
 const VICTIM_EVENTS: [&str; 1] = ["0x9c"];
@@ -22,7 +20,7 @@ impl Node for L2CacheRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = raw::read_stream(ctx, "l2_cache.", raw::L2_CACHE_TRUNK)?;
+        let bytes = crate::stream::read_stream(ctx, "l2_cache.", super::l2_cache::L2_CACHE_TRUNK)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -31,7 +29,7 @@ impl Node for L2CacheRow {
         let request: Vec<usize> = REQUEST_EVENTS.iter().filter_map(|e| index(e)).collect();
         let victim: Vec<usize> = VICTIM_EVENTS.iter().filter_map(|e| index(e)).collect();
         let mut out = Vec::new();
-        for record in raw::decode_l2_cache(&bytes)? {
+        for record in super::l2_cache::decode_l2_cache(&bytes)? {
             let request_value: u64 = request
                 .iter()
                 .filter(|&&i| i < record.events.len())
@@ -77,3 +75,41 @@ fn load_l2_events(device_dir: &Path) -> Result<Vec<String>> {
         .filter(|event| !event.is_empty())
         .collect())
 }
+
+pub const L2_CACHE_TRUNK: usize = 72;
+
+#[derive(Debug, Clone, Copy)]
+pub struct L2CacheRaw {
+    pub stream_id: u16,
+    pub task_id: u16,
+    pub events: [u64; 8],
+}
+
+pub fn decode_l2_cache(bytes: &[u8]) -> Result<Vec<L2CacheRaw>> {
+    let mut out = Vec::new();
+    for chunk in bytes.as_chunks::<L2_CACHE_TRUNK>().0 {
+        let h = |o: usize| u16::from_le_bytes([chunk[o], chunk[o + 1]]);
+        let q = |o: usize| {
+            u64::from_le_bytes([
+                chunk[o],
+                chunk[o + 1],
+                chunk[o + 2],
+                chunk[o + 3],
+                chunk[o + 4],
+                chunk[o + 5],
+                chunk[o + 6],
+                chunk[o + 7],
+            ])
+        };
+        out.push(L2CacheRaw {
+            stream_id: h(2),
+            task_id: h(4),
+            events: core::array::from_fn(|i| q(8 + i * 8)),
+        });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// TS CPU perf records (`L L 20Q L L Q Q 14Q`, 304 bytes, header 0xabababab)
+// ---------------------------------------------------------------------------

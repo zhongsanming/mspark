@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
 use crate::time::{Clock, fmt_us};
 
 use super::sources::SocProfileRecord;
@@ -28,7 +27,7 @@ impl Node for InterSocSample {
         let mut out: Vec<InterSocSample> = Vec::new();
         let mut index: HashMap<compact_str::CompactString, usize> = HashMap::new();
         for record in records.iter() {
-            if let raw::SocProfileRaw::InterSoc {
+            if let super::sources::stars_soc_profile::SocProfileRaw::InterSoc {
                 sys_cnt,
                 l2_buffer_bw_level,
                 mata_bw_level,

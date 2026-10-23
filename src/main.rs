@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context as _, Result, bail};
 use mspark_df::{Ctx, Store, resolve};
 use mspark_model::NetSample;
-use mspark_model::raw;
 use mspark_model::tables;
 use mspark_model::{
     AccPmuSample, ApiEventRow, ApiStatisticRow, ChipTransKind, ChipTransSample, Clock, DeviceInfo,
@@ -1648,18 +1647,32 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
         let track = resolve::<TrackFlip>(&mut store, &ctx)?;
         let lpm = resolve::<LpmInfo>(&mut store, &ctx)?;
 
-        let soc_hist = raw::decode_stars_soc(
-            &raw::read_stream(&ctx, "stars_soc.", raw::STARS_SOC_TRUNK)?,
+        let soc_hist = mspark_model::nodes::sources::stars_soc::decode_stars_soc(
+            &mspark_model::stream::read_stream(
+                &ctx,
+                "stars_soc.",
+                mspark_model::nodes::sources::stars_soc::STARS_SOC_TRUNK,
+            )?,
             info.expand_status,
         )?
         .1;
-        let pmu_hist = raw::decode_ffts_profile(
-            &raw::read_stream(&ctx, "ffts_profile.", raw::FFTS_PROFILE_TRUNK)?,
+        let pmu_hist = mspark_model::nodes::sources::ffts_profile::decode_ffts_profile(
+            &mspark_model::stream::read_stream(
+                &ctx,
+                "ffts_profile.",
+                mspark_model::nodes::sources::ffts_profile::FFTS_PROFILE_TRUNK,
+            )?,
             info.expand_status,
         )?
         .1;
-        let track_hist =
-            raw::decode_ts_track(&raw::read_stream(&ctx, "ts_track.", raw::TS_TRACK_TRUNK)?)?.1;
+        let track_hist = mspark_model::nodes::sources::ts_track::decode_ts_track(
+            &mspark_model::stream::read_stream(
+                &ctx,
+                "ts_track.",
+                mspark_model::nodes::sources::ts_track::TS_TRACK_TRUNK,
+            )?,
+        )?
+        .1;
 
         println!(
             "\n== {} ==",

@@ -1,8 +1,6 @@
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
-
 /// One inter-sample HCCS bandwidth measurement.
 ///
 /// `hccs.data` is a text stream whose body is `time_stamp(s):time_stamp(ns)
@@ -25,7 +23,7 @@ impl Node for HccsRateRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = raw::read_stream(ctx, "hccs.", 1)?;
+        let bytes = crate::stream::read_stream(ctx, "hccs.", 1)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }

@@ -9,7 +9,7 @@ pub(crate) mod format;
 pub mod host;
 pub mod nodes;
 pub(crate) mod pmu;
-pub mod raw;
+pub mod stream;
 pub mod tables;
 pub mod time;
 
@@ -18,7 +18,10 @@ pub use host::{HashDic, TypeDic, ge_task_type, load_dictionaries};
 pub use nodes::sources::{LLC_READ_SLOTS, NetSample};
 pub use nodes::*;
 
-pub use raw::{Acsq, FftsPlus, LpmInfo, LpmSample, PmuData, StarsSocEntry, TrackFlip};
+pub use nodes::sources::ffts_profile::PmuData;
+pub use nodes::sources::lpm::{LpmInfo, LpmSample};
+pub use nodes::sources::stars_soc::{Acsq, FftsPlus, StarsSocEntry};
+pub use nodes::sources::ts_track::TrackFlip;
 pub use time::{
     Clock, MonoClock, SamplingClock, fmt_us, load_clock, load_host_clock, load_host_syscnt_clock,
     load_mono_clock, load_sampling_clock,

@@ -1,8 +1,11 @@
+use crate::stream::*;
 use anyhow::Result;
+use zerocopy::byteorder::little_endian::{U16, U32, U64};
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
+
 use mspark_df::{Ctx, Node};
 
 use crate::host::{HashDic, TypeDic};
-use crate::raw;
 
 #[derive(Debug, Clone)]
 pub struct ApiEventRow {
@@ -37,8 +40,12 @@ impl Node for ApiEventRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = raw::read_host_stream(ctx, "aging.api_event.data.", raw::API_EVENT_TRUNK)?;
-        let mut raws = raw::decode_api_event(&bytes)?;
+        let bytes = crate::stream::read_host_stream(
+            ctx,
+            "aging.api_event.data.",
+            super::api_event::API_EVENT_TRUNK,
+        )?;
+        let mut raws = super::api_event::decode_api_event(&bytes)?;
         // msprof emits the CANN track sorted by the API start timestamp.
         raws.sort_by_key(|r| r.begin);
         let types = ctx.require::<TypeDic>()?;
@@ -68,4 +75,48 @@ impl Node for ApiEventRow {
             })
             .collect())
     }
+}
+
+pub const API_EVENT_TRUNK: usize = 40;
+
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+#[repr(C, packed)]
+struct ApiEventData {
+    magic: U16,
+    level: U16,
+    ty: U32,
+    thread_id: U32,
+    _reserve: U32,
+    begin: U64,
+    end: U64,
+    item_id: U64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ApiEventRaw {
+    pub level: u16,
+    pub ty: u32,
+    pub thread_id: u32,
+    pub begin: u64,
+    pub end: u64,
+    pub item_id: u64,
+}
+
+pub fn decode_api_event(bytes: &[u8]) -> Result<Vec<ApiEventRaw>> {
+    let mut out = Vec::new();
+    for chunk in bytes.as_chunks::<API_EVENT_TRUNK>().0 {
+        let record = ApiEventData::ref_from_bytes(chunk).map_err(cast)?;
+        if record.magic.get() != COMPACT_MAGIC {
+            continue;
+        }
+        out.push(ApiEventRaw {
+            level: record.level.get(),
+            ty: record.ty.get(),
+            thread_id: record.thread_id.get(),
+            begin: record.begin.get(),
+            end: record.end.get(),
+            item_id: record.item_id.get(),
+        });
+    }
+    Ok(out)
 }

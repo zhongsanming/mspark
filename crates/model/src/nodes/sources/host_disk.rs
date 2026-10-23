@@ -1,8 +1,6 @@
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
-
 /// One host disk sample (`host_disk.data`, text).
 ///
 /// Mirrors `HostDiskUsagePresenter`: a `start_time <ts>` line seeds the clock,
@@ -38,7 +36,7 @@ impl Node for HostDiskUsageRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = raw::read_host_stream(ctx, "host_disk.data.", 1)?;
+        let bytes = crate::stream::read_host_stream(ctx, "host_disk.data.", 1)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }

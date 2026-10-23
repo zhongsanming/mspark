@@ -1,11 +1,13 @@
 //! PMU metric helpers: event tables and the per-chip formulas.
 
-use crate::raw;
-
 pub(crate) const AIC_EVENTS: [u32; 8] = [0x416, 0x417, 0x9, 0x302, 0xc, 0x303, 0x54, 0x55];
 pub(crate) const AIV_EVENTS: [u32; 8] = [0x8, 0xa, 0x9, 0xb, 0xc, 0xd, 0x54, 0x55];
 
-pub(crate) fn get_freq(samples: &[raw::LpmSample], base_hz: f64, end: u64) -> f64 {
+pub(crate) fn get_freq(
+    samples: &[crate::nodes::sources::lpm::LpmSample],
+    base_hz: f64,
+    end: u64,
+) -> f64 {
     if samples.iter().any(|s| s.value == 0) {
         return base_hz;
     }

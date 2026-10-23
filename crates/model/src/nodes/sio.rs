@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
 use crate::time::{Clock, fmt_us};
 
 use super::sources::SocProfileRecord;
@@ -27,7 +26,7 @@ impl Node for SioSample {
         let clock = ctx.require::<Clock>()?;
         let mut per_die: BTreeMap<u16, Vec<(u64, [u32; 8])>> = BTreeMap::new();
         for record in records.iter() {
-            if let raw::SocProfileRaw::Sio {
+            if let super::sources::stars_soc_profile::SocProfileRaw::Sio {
                 sys_cnt,
                 acc_id,
                 bandwidth,
