@@ -154,6 +154,44 @@ Verified against a fresh V4 (910B) capture with the current `msprof`:
 dead ends — several were investigated to the point of proving they are *not* the
 cause, which is usually the expensive part.
 
+## Chip support
+
+Chip detection uses `platform_version` from `info.json`, mapping to the same
+`ChipId` values as msprof's `chip_id.h`. An unknown value is a hard error rather
+than a guess.
+
+| chip | `platform_version` | status |
+|---|---|---|
+| `V4_1_0` (910B) | 5 | **verified** against two captures |
+| `V1_1_0` / `V1_1_1` / `V1_1_2` / `V1_1_3` | 0 / 7 / 8 / 11 | ported, **unverified** |
+| `V2_1_0` | 1 | ported, **unverified** |
+| `V3_1_0` / `V3_2_0` / `V3_3_0` | 2 / 3 / 4 | ported, **unverified** |
+| `V5_1_0` | 9 | ported, **unverified** |
+| `V6_1_0` / `V6_1_1` / `V6_2_0` | 15 / 19 / 16 | ported, **unverified** |
+
+> **These are not tested.** We only have access to V4 (910B) hardware, so every
+> non-V4 row is transcribed from the reference implementation and has never been
+> run against a real capture. Expect fixes to be needed; treat their output as
+> untrusted until verified. Correctness details in this project were repeatedly
+> decided by data (the `÷256` in LLC throughput, the AIV window for mix tasks,
+> three distinct clock domains), so unverified paths *will* hide similar issues.
+
+The stream layout version is selected from `info.json:version`, mirroring
+msprof's `VersionedStructParser`:
+
+| stream | 1.x | 2.x |
+|---|---|---|
+| `hbm` | `QQII` (24 B), µs stamp first | `IIIIQQ` (32 B), absolute-ns stamp last |
+| `llc` | `QQII` (24 B), µs stamp first | `IIIIQ` (24 B), absolute-ns stamp last |
+
+Collection version 1.x is what both of our captures use, so the 2.x layouts are
+implemented but likewise **unverified**.
+
+Still V4-shaped and needing per-chip work when data becomes available: the V6 QoS
+variant (die-indexed series that msprof reads from `stars_soc_profile`, item type
+`0x18`), SIO counter layouts, `l2_cache` event ids, the TSCPU 184-byte MDC
+layout, DVPP engine tables, and the per-chip `ENUM_*` dictionaries.
+
 ## Publishing
 
 Dependencies are hoisted into `[workspace.dependencies]` and the shared package

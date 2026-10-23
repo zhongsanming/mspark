@@ -770,3 +770,6 @@ pub const PCIE_TRUNK: usize = 96;
 // ---------------------------------------------------------------------------
 
 pub const LLC_TRUNK: usize = 24;
+
+// Collection-version 2.x layouts of the versioned streams.
+pub const HBM_TRUNK_V2: usize = 32;
