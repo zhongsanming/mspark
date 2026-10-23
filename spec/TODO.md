@@ -173,8 +173,22 @@ grouped by op type (`hcom_broadcast_`, `hcom_allReduce_`, …).
   durationEstimated(double), srcAddr, dstAddr, dataSize, opType, dataType,
   linkType`.
 
-Not started: needs the op-info → task-info join (`opId`/`notifyId`) to place
-tasks under groups/planes, the flow-event generation, and the CSV aggregation.
+Calibration already done:
+
+- `aging.compact.hccl_op_info` has **826 records**, exactly `COMMUNICATION_OP`'s
+  row count — so that stream *is* the op table's source.
+- Record prefix is `magic 0x5a5a, level 10000, type 10, thread, data_len 26,
+  timestamp`; the hashes resolve through `unaging.additional.hash_dic`:
+  `5862276093215481612 -> group_name_0`, `8452606241940441763 -> MESH-RING-NHR`.
+- The naive packed-struct offsets are **wrong**: reading `<BBIQQQ` at data+0
+  gives `count = 64` where `COMMUNICATION_OP` says `3847744`. `HcclOpInfoBean`
+  indexes `data[6..10]`, i.e. **8-byte words of the whole record**, not bytes of
+  the payload — that indexing is what still needs pinning down.
+- `COMMUNICATION_TASK_INFO` has **39 910 rows** vs 40 736 `ph: X` events, so the
+  task table is the track's source.
+
+Not started: the op→task join (`opId`/`notifyId`) to place tasks under
+groups/planes, the flow-event generation, and the CSV aggregation.
 `COMMUNICATION_OP` / `COMMUNICATION_TASK_INFO` in the reference DB show the
 expected joins and are usable as ground truth without being consumed.
 
