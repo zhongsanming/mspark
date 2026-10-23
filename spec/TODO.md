@@ -147,6 +147,31 @@ Values exact (816/816), timestamps differ in the sub-µs digits
 
 ## Not started
 
+### T24. `step_trace` — needs iteration markers (none in our captures)
+Empirically blocked: this capture produces **no** `STEP_TRACE` table in the
+reference DB and **no** `step_trace` artifact, even though
+`device_N/data/ts_track.data.N.slice_0` exists (that stream is already consumed
+by our `TsTrackRow` for the special ACSQ tasks). Iteration step tracing needs the
+GE iteration markers (a `--iteration`-style collection), which these runs did
+not enable.
+
+Format, for when data exists (`msparser/data_struct_size_constant.py`):
+
+```
+STEP_TRACE_FMT    = "BBHLQQQHHHH"   (40 bytes)
+STEP_TRACE_V6_FMT = "BBHLQQQHHI"
+```
+
+read by `msparser/step_trace/ts_binary_data_reader/step_trace_reader.py`
+(`StepTrace` / `StepTraceChipV6`) from `ts_track.data`.
+
+Artifact shape (both a timeline track and a summary CSV, per
+`filename_introduction_config.py`): iteration ID, `FP Start`, `BP End`,
+`Iteration End`, then the derived `FP_BP Time` (BP End − FP Start),
+`Iteration Refresh` (Iteration End − BP End), `Data_aug Bound` (current FP Start
+− previous Iteration End, `N/A` for iteration 0) and `Reduce` (collective time;
+absent single-device).
+
 ### T23. `msproftx` (mstx markers) — format located, needs data
 Not exercised yet: our captures were taken without `--msproftx=on`, so there is
 no `msprof_tx` track and no mstx stream (`host/data/*mstx*` is absent).
