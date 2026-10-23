@@ -264,9 +264,22 @@ duplicated `(stream, task)` keys seen earlier.
 Splitting the field and keying on `(stream, task_id)` was tried and **made things
 worse**: `kernel_name` dropped from 55 580 to 46 223 of 85 241, because batch 0
 and batch 1 then collide on one key and the map keeps only one name.
-Disambiguating needs `batch_id` on the *device* side too (`DeviceTask`), which
-`stars_soc` must carry somewhere we have not mapped — so this is blocked on that,
-not on the task_track side.
+Disambiguating needs `batch_id` on the *device* side too — and the source is
+**code, not a raw field**: `FlipCalculator.compute_batch_id` derives it.
+
+- `task_track` rows whose task type resolves to `FLIP_TASK` carry the iteration
+  marker; `format_task_track_data` sets `flip_num = data.batch_id` on them.
+- `AscendTaskGenerator` groups by `(device, stream)`, sorts tasks and flips by
+  timestamp, and walks them together: each time a task's timestamp reaches the
+  next flip, the batch id advances (`get_next_batch_id`, with
+  `calibrate_when_flip_task_id_not_zero` handling the first task of a round).
+  `AscendTaskGenerator._sep_task_by_stream_task_ctx_batch` then keys everything by
+  `(stream, task, context, batch)`.
+
+So the port is: read `FLIP_TASK` rows from `task_track`, walk them against
+`DeviceTask`s per `(device, stream)`, assign batch ids, and only then split the
+task_track field and key by `(stream, task, batch)`. No reverse engineering
+required, and no unknown fields.
 
 Concrete next steps:
 1. find `batch_id` in the `stars_soc`/ACSQ record so `DeviceTask` can be keyed by
