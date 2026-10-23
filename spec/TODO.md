@@ -147,6 +147,37 @@ Values exact (816/816), timestamps differ in the sub-µs digits
 
 ## Not started
 
+### T23. `msproftx` (mstx markers) — format located, needs data
+Not exercised yet: our captures were taken without `--msproftx=on`, so there is
+no `msprof_tx` track and no mstx stream (`host/data/*mstx*` is absent).
+
+Format is fully documented in msprof, so this is transcription rather than
+archaeology:
+
+```
+StructFmt.MSPROFTX_FMT = 'HH3IQ2H I2H 4I i5Q i 156s'      (256-byte records)
+```
+
+decoded by `profiling_bean/struct_info/msproftx_decoder.py`, field indices:
+
+| idx | field | idx | field |
+|---|---|---|---|
+| 0 | magic | 12 | thread_id |
+| 6 | info_type (0 = tx, 1 = tx_ex) | 13 | category |
+| 7 | seg_idx (for tx_ex reassembly) | 14 | event_type |
+| 10 | data_tag | 15 | payload_type |
+| 11 | process_id | 16 | payload_value |
+| 17 | start_time | 19 | mark_id |
+| 18 | end_time | 20 | domain |
+| 21 | message_type | 22 | message (156 s, NUL-trimmed) |
+
+Event kinds come from `MsprofTxParser.EVENT_DICT` — `marker`, `push/pop`,
+`start/end`, `marker_ex` — and `marker_ex` payloads are reassembled by
+`(mark_id, seg_idx)` before emission.
+
+To implement: parse the stream, resolve `mark_id`/`domain` in the hash dic, emit
+`ph: X`/`i` events per event_type. Blocked only on a capture with mstx data.
+
 ### T22. `Communication` track + `communication_statistic.csv`
 The multi-device capture adds both. Shapes, from the golden and from
 `prof_struct.h`:
