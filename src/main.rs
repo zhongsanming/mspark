@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -2343,24 +2344,29 @@ fn timeline(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         .map(|device| device_timeline(device))
         .collect::<Result<Vec<_>>>()?;
 
-    // Reserve up front: appending 7 device chunks otherwise reallocates and
-    // memmoves the whole event vector several times.
-    let capacity: usize = chunks.iter().map(|(chunk, _)| chunk.len()).sum();
-    let mut events: Vec<TraceEvent> = Vec::with_capacity(capacity);
-    let mut total = 0usize;
-    for (mut chunk, count) in chunks {
-        events.append(&mut chunk);
-        total += count;
-    }
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Stream straight to the file: building a ~100 MB `String` first costs a large
-    // allocation and a full memmove of the payload.
+    // Stream device chunks straight into the JSON array: the merged vector used to
+    // be built (and then dropped) in full, which costs a large allocation, a copy
+    // of every event and the peak memory of all devices at once.
     let file = std::fs::File::create(out)?;
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
-    serde_json::to_writer(&mut writer, &events)?;
-    std::io::Write::flush(&mut writer)?;
+    writer.write_all(b"[")?;
+    let mut first = true;
+    let mut total = 0usize;
+    for (chunk, count) in chunks {
+        for event in &chunk {
+            if !first {
+                writer.write_all(b",")?;
+            }
+            first = false;
+            serde_json::to_writer(&mut writer, event)?;
+        }
+        total += count;
+    }
+    writer.write_all(b"]")?;
+    writer.flush()?;
     println!("wrote {total} timeline events to {}", out.display());
     Ok(())
 }
