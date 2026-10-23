@@ -208,11 +208,29 @@ Calibration already done:
   (9965001205355668516, 16260104095319113122, …) which correspond to the three
   op types in the CSV (`hcom_broadcast_`, `hcom_allReduce_`, `hcom_allGather_`),
   so the record carries the op *type*, not the op identity.
-- Consequence for `communication_statistic.csv`: the golden counts are **per op**
-  (415 / 410 / 1 = 826), so the CSV cannot be built from `hccl_info` alone —
-  each op's duration needs its own tasks, and the task→op assignment is still
-  missing (positional order is the obvious candidate: ops and tasks both carry
-  monotonic timestamps).
+- **Op→task assignment works.** Assigning each task to the last op whose stamp
+  precedes it reproduces the golden per-type counts exactly: **415 + 410**, plus
+  one op that receives no tasks (= the third type's single op).
+
+- **Per-op durations are not in the raw data.** Two candidates were measured
+  against the golden totals (3 821 169.012 / 1 530 594.697 us):
+
+  | candidate | type A | type B |
+  |---|---|---|
+  | `sum(durationEstimated)` | 11 795.041 | 545 339.457 |
+  | `span(max_ts - min_ts)` | 0.0 | 0.0 |
+
+  `span` is 0 because every task of an op shares its stamp, and the estimate sum
+  is 1-2 orders of magnitude short. The op `start`/`end` used by
+  `CommunicationInfoProcessor::UpdateOpInfo` come from
+  `hccl_single_device.db:HCCLOpSingleDevice` (host-profiler output), i.e. they
+  are **not recoverable from the raw streams**.
+
+- Therefore `communication_statistic.csv` is blocked on a missing raw field (same
+  class as `host_cpu.data`'s producer). The `Communication` **track** is still
+  implementable approximately from the task records (args + plane/group
+  threading), with `dur` from `durationEstimated` — documented as an
+  approximation.
 
 - Still unknown: where the track's `dur` comes from. The golden event has
   `dur = 0.92` while `durationEstimated = 0.6002`, so it is not that field —
