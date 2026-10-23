@@ -175,6 +175,35 @@ Values exact (816/816), timestamps differ in the sub-µs digits
 
 ## Not started
 
+### T26. Overlap Analysis on multi-device captures — only 2 of 4 kinds
+On the multi-device capture the golden Overlap track has **four** threads while we
+emit two:
+
+| thread | golden | ours |
+|---|---|---|
+| `Computing` (tid 2) | 65 629 | 66 066 |
+| `Free` (tid 3) | 38 179 | 66 067 |
+| `Communication` (tid 0) | 826 | — |
+| `Communication(Not Overlapped)` (tid 1) | 28 907 | — |
+| total | 133 541 | 132 133 |
+
+So `matched = 0`: our `Computing` currently includes the HCCL tasks, whereas
+msprof classifies them separately and derives the not-overlapped portion.
+
+The fix is a classification step in `OverlapRow`:
+- **communication** tasks (HCCL: `task_type` 9 / 256) → `Communication` intervals;
+- `Communication(Not Overlapped)` = communication minus computing;
+- **Computing** = union of *non-communication* task intervals;
+- **Free** = window minus (computing ∪ communication).
+
+`Communication` = 826 matches the op count, consistent with the op/task analysis
+in T22. Note the window also changes: the golden `Computing` starts at
+`1792632288550840` while ours starts at `1792632297012977` (the first task in our
+set is a communication task).
+
+Single-device captures have no communication tasks, which is why this went
+unnoticed — the earlier 54 946/109 892 result came from one.
+
 ### T25. Host-usage family — code-derived, unverified
 `host_mem_usage` is implemented (node + CSV) straight from
 `HostMemUsagePresenter._parse_mem_data`:
