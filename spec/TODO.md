@@ -163,7 +163,7 @@ its own twist:
 
 | artifact | stream | notes |
 |---|---|---|
-| `host_disk_usage` | `host_disk.data` | converts to KB/s using `sample.json` disk freq; `interval = 1/freq * FREQ_TO_NS` |
+| `host_disk_usage` | `host_disk.data` | **node done** (parse + KB/s units + `interval = 1/host_disk_freq * 1e9`); CSV/track still to wire — `get_recommend_value('disk_read'/'disk_write')` decides the Peak/Recommend columns |
 | `host_network_usage` | `host_network.data` | per-interface rates, same text pattern |
 | `os_runtime_statistic` | `SystemCpuUsage.data` / `host_sys_cpu.data` | different table shape |
 | `cpu_usage` | derived from the same streams | per-process, `--host-sys=cpu` |
