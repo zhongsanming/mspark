@@ -202,6 +202,18 @@ Calibration already done:
   matching `(srcRank 4, dstRank 4294967295, size 4, dataType 2, linkType 0,
   planeId 0, notifyId 0)` exactly.
 
+- **Join shape (new).** `COMMUNICATION_TASK_INFO.opId` is `0..825` with 826
+  distinct values — a **positional index into the 826 `COMMUNICATION_OP` rows**,
+  not a hash. The task record's `cclTag` has only **3 distinct values**
+  (9965001205355668516, 16260104095319113122, …) which correspond to the three
+  op types in the CSV (`hcom_broadcast_`, `hcom_allReduce_`, `hcom_allGather_`),
+  so the record carries the op *type*, not the op identity.
+- Consequence for `communication_statistic.csv`: the golden counts are **per op**
+  (415 / 410 / 1 = 826), so the CSV cannot be built from `hccl_info` alone —
+  each op's duration needs its own tasks, and the task→op assignment is still
+  missing (positional order is the obvious candidate: ops and tasks both carry
+  monotonic timestamps).
+
 - Still unknown: where the track's `dur` comes from. The golden event has
   `dur = 0.92` while `durationEstimated = 0.6002`, so it is not that field —
   most likely the device-side communication task window from `stars_soc`,
