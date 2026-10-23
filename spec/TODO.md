@@ -188,8 +188,24 @@ Calibration already done:
   *different* ops — records are not in DB order.)
 - `opName`, `opType`, `startNs`/`endNs`, `connectionId`, `opId` and `rankSize`
   are **not** in this stream; they must come from the task-info join.
-- `COMMUNICATION_TASK_INFO` has **39 910 rows** vs 40 736 `ph: X` events, so the
-  task table is the track's source.
+- `COMMUNICATION_TASK_INFO` (39 910 rows) is fed by
+  `unaging.additional.hccl_info` (256-byte records, `dlen 120`). Layout
+  `MsprofHcclInfo` at data+0 verified field by field against a DB row:
+
+  ```
+  itemId, cclTag, groupName(u64)          -> groupName hash resolves to group_name_0
+  localRank, remoteRank, rankSize, workFlowMode, planeID, ctxID (u32)
+  notifyID(u64), stage, role(u32), durationEstimated(f64)
+  srcAddr, dstAddr, dataSize(u64), opType, dataType, linkType (u32)
+  ```
+
+  matching `(srcRank 4, dstRank 4294967295, size 4, dataType 2, linkType 0,
+  planeId 0, notifyId 0)` exactly.
+
+- Still unknown: where the track's `dur` comes from. The golden event has
+  `dur = 0.92` while `durationEstimated = 0.6002`, so it is not that field —
+  most likely the device-side communication task window from `stars_soc`,
+  enriched by these records for args and plane/group threading.
 
 Not started: the op→task join (`opId`/`notifyId`) to place tasks under
 groups/planes, the flow-event generation, and the CSV aggregation.
