@@ -8,11 +8,11 @@ use mspark_model::raw;
 use mspark_model::tables;
 use mspark_model::{
     AccPmuSample, ApiEventRow, ApiStatisticRow, ChipTransKind, ChipTransSample, Clock, DeviceInfo,
-    DvppRow, HbmRecord, HccsRateRow, InterSocSample, L2CacheRow, LlcRecord, LpmInfo, NicRow,
-    NpuMemRow, NpuModuleMemRow, OpStatisticRow, OpSummaryRow, OverlapKind, OverlapRow, PcieRecord,
-    PmuData, QosRow, RoceRow, SioSample, StarsSocEntry, TaskTimeRow, TimelineTask, TrackFlip,
-    TscpuRecord, fmt_us, load_clock, load_device_info, load_dictionaries, load_host_clock,
-    load_sample_string,
+    DvppRow, HbmRecord, HccsRateRow, HostCpuUsageRow, InterSocSample, L2CacheRow, LlcRecord,
+    LpmInfo, NicRow, NpuMemRow, NpuModuleMemRow, OpStatisticRow, OpSummaryRow, OverlapKind,
+    OverlapRow, PcieRecord, PmuData, QosRow, RoceRow, SioSample, StarsSocEntry, TaskTimeRow,
+    TimelineTask, TrackFlip, TscpuRecord, fmt_us, load_clock, load_device_info, load_dictionaries,
+    load_host_clock, load_sample_string,
 };
 use palc::{Parser, Subcommand};
 use rayon::prelude::*;
@@ -603,6 +603,7 @@ enum Artifact {
     TsCpuTopFunction,
     Hccs,
     Hbm,
+    HostCpuUsage,
     Llc,
     Nic,
     Pcie,
@@ -626,6 +627,7 @@ impl Artifact {
             Artifact::TsCpuTopFunction => "ts_cpu_top_function",
             Artifact::Hccs => "hccs",
             Artifact::Hbm => "hbm",
+            Artifact::HostCpuUsage => "host_cpu_usage",
             Artifact::Llc => "llc_read_write",
             Artifact::Nic => "nic",
             Artifact::Pcie => "pcie",
@@ -649,6 +651,7 @@ impl Artifact {
             Artifact::TsCpuTopFunction => "ts_cpu_top_function.csv",
             Artifact::Hccs => "hccs.csv",
             Artifact::Hbm => "hbm.csv",
+            Artifact::HostCpuUsage => "host_cpu_usage.csv",
             Artifact::Llc => "llc_read_write.csv",
             Artifact::Nic => "nic.csv",
             Artifact::Pcie => "pcie.csv",
@@ -659,7 +662,7 @@ impl Artifact {
     }
 }
 
-const CSV_ARTIFACTS: [Artifact; 17] = [
+const CSV_ARTIFACTS: [Artifact; 18] = [
     Artifact::TaskTime,
     Artifact::OpSummary,
     Artifact::ApiStatistic,
@@ -672,6 +675,7 @@ const CSV_ARTIFACTS: [Artifact; 17] = [
     Artifact::TsCpuTopFunction,
     Artifact::Hccs,
     Artifact::Hbm,
+    Artifact::HostCpuUsage,
     Artifact::Llc,
     Artifact::Nic,
     Artifact::Pcie,
@@ -679,7 +683,7 @@ const CSV_ARTIFACTS: [Artifact; 17] = [
     Artifact::Summary,
 ];
 
-const ALL_ARTIFACTS: [Artifact; 18] = [
+const ALL_ARTIFACTS: [Artifact; 19] = [
     Artifact::TaskTime,
     Artifact::OpSummary,
     Artifact::ApiStatistic,
@@ -692,6 +696,7 @@ const ALL_ARTIFACTS: [Artifact; 18] = [
     Artifact::TsCpuTopFunction,
     Artifact::Hccs,
     Artifact::Hbm,
+    Artifact::HostCpuUsage,
     Artifact::Llc,
     Artifact::Nic,
     Artifact::Pcie,
@@ -811,6 +816,7 @@ fn write_artifact(artifact: Artifact, prof: &Path, only: Option<&str>, dir: &Pat
         Artifact::TsCpuTopFunction => ts_cpu_top_function(prof, only, &out),
         Artifact::Hccs => hccs_csv(prof, only, &out),
         Artifact::Hbm => hbm_csv(prof, only, &out),
+        Artifact::HostCpuUsage => host_cpu_csv(prof, only, &out),
         Artifact::Llc => llc_csv(prof, only, &out),
         Artifact::Nic => nic_csv(prof, only, &out),
         Artifact::Pcie => pcie_csv(prof, only, &out),
@@ -1039,6 +1045,81 @@ fn net_rows(samples: &[NetSample], ty: &str) -> Vec<CounterRow> {
         let _ = ty;
     }
     out
+}
+
+/// `local_time_offset` for the *host* domain, in milli-microseconds.
+///
+/// Host tracks use `host/start_info` (the host process's own report), which is a
+/// few microseconds away from the device one.
+fn host_local_offset_milli(prof_root: &Path) -> Result<i128> {
+    let text = std::fs::read_to_string(prof_root.join("host").join("start_info"))?;
+    let root: serde_json::Value = serde_json::from_str(&text)?;
+    let get = |key: &str| -> Result<i128> {
+        root.get(key)
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i128>().ok())
+            .ok_or_else(|| anyhow::anyhow!("host/start_info has no {key}"))
+    };
+    Ok(get("collectionTimeBegin")? * 1000 - get("clockMonotonicRaw")?)
+}
+
+fn host_ts_us(start_ns: u64, offset_milli: i128) -> String {
+    let milli = start_ns as i128 + offset_milli;
+    format!("{}.{:03}", milli / 1000, milli % 1000)
+}
+
+fn host_cpu_rows(samples: &[HostCpuUsageRow], offset_milli: i128) -> Vec<CounterRow> {
+    samples
+        .iter()
+        .map(|sample| CounterRow {
+            name: format!("CPU {}", sample.cpu_no),
+            tid: 0,
+            ts: host_ts_us(sample.start_ns, offset_milli),
+            args: vec![("Usage(%)".to_string(), Num::Float(sample.usage))],
+        })
+        .collect()
+}
+
+fn host_cpu_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
+    let mut body =
+        String::from("Device_id,Total Cpu Numbers,Occupied Cpu Numbers,Recommend Cpu Numbers\n");
+    let mut total_rows = 0usize;
+    for device in devices(prof, only)? {
+        let (ctx, _info) = build_ctx(prof, &device)?;
+        let mut store = Store::new();
+        let samples = resolve::<HostCpuUsageRow>(&mut store, &ctx)?;
+        use std::collections::BTreeMap;
+        let mut peak: BTreeMap<u64, f64> = BTreeMap::new();
+        let mut total = 0u64;
+        for sample in samples.iter() {
+            if sample.cpu_no == "Avg" {
+                continue;
+            }
+            if let Ok(cpu) = sample.cpu_no.parse::<u64>() {
+                total = total.max(cpu + 1);
+                let entry = peak.entry(cpu).or_insert(0.0);
+                *entry = entry.max(sample.usage);
+            }
+        }
+        // `Total` is the machine's logical CPU count from `host/info.json`
+        // (`cpuNums`), not the highest CPU id that happened to be sampled.
+        let info_cpus = std::fs::read_to_string(ctx.root().join("host").join("info.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|root| root.get("cpuNums").and_then(|v| v.as_u64()))
+            .unwrap_or(total);
+        let total = info_cpus.max(total);
+        let occupied = peak.len();
+        let recommend = peak.values().filter(|usage| **usage > 0.0).count();
+        body.push_str(&format!("host,{total},{occupied},{recommend}\n"));
+        total_rows += 1;
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, body)?;
+    println!("wrote {total_rows} rows to {}", out.display());
+    Ok(())
 }
 
 fn llc_samples(
@@ -2215,6 +2296,33 @@ fn device_timeline(prof: &Path, device: &Path) -> Result<(Vec<TraceEvent>, usize
         // --- NPU MEM ---
         let npu_mem = resolve::<NpuMemRow>(&mut store, &ctx)?;
         let npu_mem_pid = track_pid(16);
+        // --- CPU Usage (host track) ---
+        let cpu_usage = resolve::<HostCpuUsageRow>(&mut store, &ctx)?;
+        let cpu_pid = (info.pid << 10) | (9 << 5) | 31;
+        events.push(TraceEvent::meta(
+            "process_name",
+            cpu_pid,
+            0,
+            args(vec![("name", Num::Str("CPU Usage".to_string()))]),
+        ));
+        events.push(TraceEvent::meta(
+            "process_labels",
+            cpu_pid,
+            0,
+            args(vec![("labels", Num::Str("CPU".to_string()))]),
+        ));
+        events.push(TraceEvent::meta(
+            "process_sort_index",
+            cpu_pid,
+            0,
+            args(vec![("sort_index", Num::Int(9))]),
+        ));
+        let cpu_offset = host_local_offset_milli(ctx.root())?;
+        for row in host_cpu_rows(&cpu_usage, cpu_offset) {
+            write_counter(&mut events, cpu_pid, &row);
+            total += 1;
+        }
+
         // --- HCCS ---
         let hccs = resolve::<HccsRateRow>(&mut store, &ctx)?;
         let hccs_pid = track_pid(19);
@@ -2311,8 +2419,11 @@ fn golden_process_meta(array: &[serde_json::Value]) -> HashMap<u64, (String, Str
 
 fn golden_pid_for(meta: &HashMap<u64, (String, String)>, name: &str, dev: u32) -> Option<u64> {
     let label = format!("NPU {dev}");
+    // Device tracks carry `NPU <dev>`; host tracks (`CPU Usage`, `CANN`) carry
+    // their own label, so fall back to a name-only match.
     meta.iter()
         .find(|(_, (track, lbl))| track == name && (lbl.is_empty() || *lbl == label))
+        .or_else(|| meta.iter().find(|(_, (track, _))| track == name))
         .map(|(pid, _)| *pid)
 }
 
@@ -2481,6 +2592,14 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
             (28u32, "QoS", qos_rows_v),
             (16u32, "NPU MEM", npu_mem_rows_v),
             (19u32, "HCCS", hccs_rows_v),
+            (
+                9u32,
+                "CPU Usage",
+                host_cpu_rows(
+                    &resolve::<HostCpuUsageRow>(&mut store, &ctx)?,
+                    host_local_offset_milli(ctx.root())?,
+                ),
+            ),
             (
                 20u32,
                 "NIC",

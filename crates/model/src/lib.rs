@@ -36,6 +36,7 @@ mspark_df::graph!(
     DvppRow,
     HbmRecord,
     HccsRateRow,
+    HostCpuUsageRow,
     InterSocSample,
     L2CacheRow,
     NodeBasicInfoRow,

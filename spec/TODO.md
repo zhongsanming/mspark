@@ -147,6 +147,51 @@ Values exact (816/816), timestamps differ in the sub-µs digits
 
 ## Not started
 
+### T21. `host_cpu_usage.csv` + `CPU Usage` track — algorithm found
+`host_cpu.data` is **text**: repeated dumps of `/proc/<pid>/stat` with an
+`uptime` line. msprof parses it in
+`analysis/host_prof/host_cpu_usage/` (`model/cpu_time_info.py` +
+`presenter/host_cpu_usage_presenter.py`); the analysis C++ only reads the
+resulting `host/sqlite/host_cpu_usage.db`.
+
+Structure, per block:
+
+```
+time <sample_ts_ns>
+<uptime_seconds> <idle>
+<pid> (<comm>) <state> ... # per sampled process
+```
+
+Fields are `line.split()` indices: **0 = pid, 3 = tid, 13 = utime, 14 = stime,
+38 = cpu_no**. `curr_jiffies = Decimal(uptime) * clk_jiffies` (`CpuInfo =
+(num=192, clk_jiffies=100)`).
+
+Per consecutive pair of blocks (all `Decimal`, quantized to `USAGE_PLACES`):
+
+```
+delta        = curr_jiffies - last_jiffies
+proc_jiffies = min((utime+stime)_curr - (utime+stime)_last, delta)
+usage        = (proc_jiffies * 100 / delta).quantize(...)
+cpu[proc.cpu_no] += proc_jiffies                       # then
+cpu_usage    = (cpu[cpu_no] * 100 / delta).quantize(...)   # skipped when > 100
+avg          = (sum(proc_jiffies) * 100 / (delta * cpu_num)).quantize(...)
+row          = [last_ts, curr_ts, cpu_no | 'Avg', usage]
+```
+
+26 slices, 1 153 blocks, the first block of each slice repeating the previous
+slice's stamp → 1 127 distinct samples (`CPU Avg` count ✓).
+
+Artifacts:
+- track `CPU Usage` (label `CPU`, sort 9): counters `CPU <n>` / `CPU Avg`,
+  `args: {"Usage(%)": f64}`;
+- CSV: `Total` = 192, `Occupied` = distinct cpu_no excluding `Avg` (148),
+  `Recommend` = those with `max(usage) > 0` (92).
+
+Open: the host-domain timestamp. `trans_into_local_time(ts_ns, is_host=True)`
+should be `ts_ns/1000 + local_time_offset`, but the golden's first stamp
+(`1792632287147377.840`) is ~3.9 µs below that, so `_host_local_time_offset`
+needs the same treatment as the NIC offset (exact decimal, not f64).
+
 ### T3b. `llc_read_write.csv` — **done**
 Per bank: `hit = round3(mean(row_hit)*100)`, `tp = round3(mean(MiB/s))`;
 `Average` = mean of the *unrounded* lane means. Exact on the fresh profile
