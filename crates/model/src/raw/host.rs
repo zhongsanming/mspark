@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use mspark_df::Ctx;
-use zerocopy::byteorder::little_endian::{U16, U32, U64};
+use zerocopy::byteorder::little_endian::{F64, U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 use super::{cast, read_concat};
@@ -191,6 +191,78 @@ pub fn decode_task_track(bytes: &[u8]) -> Result<Vec<TaskTrackRaw>> {
             task_id: data.task_id.get(),
             task_type: data.task_type.get(),
             kernel_name: data.kernel_name.get(),
+        });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// HCCL task info (`MsprofHcclInfo` inside an `MsprofAdditionalInfo`)
+// ---------------------------------------------------------------------------
+
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+#[repr(C, packed)]
+struct HcclInfoData {
+    item_id: U64,
+    ccl_tag: U64,
+    group_name: U64,
+    local_rank: U32,
+    remote_rank: U32,
+    rank_size: U32,
+    work_flow_mode: U32,
+    plane_id: U32,
+    ctx_id: U32,
+    notify_id: U64,
+    stage: U32,
+    role: U32,
+    duration_estimated: F64,
+    src_addr: U64,
+    dst_addr: U64,
+    data_size: U64,
+    op_type: U32,
+    data_type: U32,
+    link_type: U32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HcclInfoRaw {
+    pub timestamp: u64,
+    pub ccl_tag: u64,
+    pub group_name: u64,
+    pub local_rank: u32,
+    pub remote_rank: u32,
+    pub rank_size: u32,
+    pub plane_id: u32,
+    pub notify_id: u64,
+    pub duration_estimated: f64,
+    pub data_size: u64,
+    pub op_type: u32,
+    pub data_type: u32,
+    pub link_type: u32,
+}
+
+pub fn decode_hccl_info(bytes: &[u8]) -> Result<Vec<HcclInfoRaw>> {
+    let mut out = Vec::new();
+    for chunk in bytes.as_chunks::<ADDITIONAL_TRUNK>().0 {
+        let head = AdditionalHead::ref_from_bytes(chunk).map_err(cast)?;
+        if head.magic.get() != COMPACT_MAGIC {
+            continue;
+        }
+        let data = HcclInfoData::ref_from_bytes(&head.data).map_err(cast)?;
+        out.push(HcclInfoRaw {
+            timestamp: head.timestamp.get(),
+            ccl_tag: data.ccl_tag.get(),
+            group_name: data.group_name.get(),
+            local_rank: data.local_rank.get(),
+            remote_rank: data.remote_rank.get(),
+            rank_size: data.rank_size.get(),
+            plane_id: data.plane_id.get(),
+            notify_id: data.notify_id.get(),
+            duration_estimated: data.duration_estimated.get(),
+            data_size: data.data_size.get(),
+            op_type: data.op_type.get(),
+            data_type: data.data_type.get(),
+            link_type: data.link_type.get(),
         });
     }
     Ok(out)

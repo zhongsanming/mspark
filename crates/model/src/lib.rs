@@ -35,6 +35,8 @@ mspark_df::graph!(
     DeviceTask,
     DvppRow,
     HbmRecord,
+    HcclInfoRow,
+    HcclInfoRow,
     HccsRateRow,
     HostCpuUsageRow,
     InterSocSample,
