@@ -6,24 +6,83 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, anyhow};
 use serde_json::Value;
 
-/// Chip family. Extend as support is ported; v1 validates against `V4_1_0`.
+/// Chip family, keyed by the `platform_version` reported in `info.json`.
+///
+/// The values match `ChipId` in msprof (`infrastructure/resource/chip_id.h`).
+/// Only [`Chip::V4_1_0`] has been verified against a capture; the rest are
+/// ported from the reference implementation and are **unverified** — see the
+/// "Chip support" section of the README.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Chip {
+    V1_1_0,
+    V1_1_1,
+    V1_1_2,
+    V1_1_3,
+    V2_1_0,
+    V3_1_0,
+    V3_2_0,
+    V3_3_0,
     V4_1_0,
+    V5_1_0,
+    V6_1_0,
+    V6_1_1,
+    V6_2_0,
 }
 
 impl Chip {
     pub fn from_platform_version(v: i64) -> Option<Self> {
         match v {
+            0 => Some(Self::V1_1_0),
+            1 => Some(Self::V2_1_0),
+            2 => Some(Self::V3_1_0),
+            3 => Some(Self::V3_2_0),
+            4 => Some(Self::V3_3_0),
             5 => Some(Self::V4_1_0),
+            7 => Some(Self::V1_1_1),
+            8 => Some(Self::V1_1_2),
+            9 => Some(Self::V5_1_0),
+            11 => Some(Self::V1_1_3),
+            15 => Some(Self::V6_1_0),
+            16 => Some(Self::V6_2_0),
+            19 => Some(Self::V6_1_1),
             _ => None,
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::V1_1_0 => "V1_1_0",
+            Self::V1_1_1 => "V1_1_1",
+            Self::V1_1_2 => "V1_1_2",
+            Self::V1_1_3 => "V1_1_3",
+            Self::V2_1_0 => "V2_1_0",
+            Self::V3_1_0 => "V3_1_0",
+            Self::V3_2_0 => "V3_2_0",
+            Self::V3_3_0 => "V3_3_0",
             Self::V4_1_0 => "V4_1_0",
+            Self::V5_1_0 => "V5_1_0",
+            Self::V6_1_0 => "V6_1_0",
+            Self::V6_1_1 => "V6_1_1",
+            Self::V6_2_0 => "V6_2_0",
         }
+    }
+
+    /// `Atlas 200/500/300` family (`IsChipV1` upstream).
+    pub fn is_v1(self) -> bool {
+        matches!(
+            self,
+            Self::V1_1_0 | Self::V1_1_1 | Self::V1_1_2 | Self::V1_1_3
+        )
+    }
+
+    /// `910B` family (`IsChipV4` upstream).
+    pub fn is_v4(self) -> bool {
+        matches!(self, Self::V4_1_0)
+    }
+
+    /// Next-generation datacenter parts (`IsChipV6` upstream).
+    pub fn is_v6(self) -> bool {
+        matches!(self, Self::V6_1_0 | Self::V6_1_1 | Self::V6_2_0)
     }
 }
 
@@ -44,6 +103,8 @@ pub struct DeviceInfo {
     pub pid: u32,
     /// `StreamExpandSpec.expand_status`; msprof defaults to 0 when the table is absent.
     pub expand_status: u16,
+    /// `info.json:version` — the layout version of the versioned streams.
+    pub collection_version: String,
 }
 
 /// Load `info.json` (or `info.json.<id>`) from a device directory.
@@ -58,8 +119,19 @@ pub fn load_device_info(device_dir: &Path) -> Result<DeviceInfo> {
         .and_then(as_i64)
         .ok_or_else(|| anyhow!("{} has no platform_version", path.display()))?;
     let chip = Chip::from_platform_version(platform_version).ok_or_else(|| {
-        anyhow!("unsupported platform_version {platform_version} (expected 5 = V4_1_0)")
+        anyhow!(
+            "unknown platform_version {platform_version} in {}; known values are \
+             0,1,2,3,4,5,7,8,9,11,15,16,19",
+            path.display()
+        )
     })?;
+    // `info.json:version` selects the binary layout of the versioned streams
+    // (`hbm`, `llc`, `npu_mem`); msprof defaults to "1.0" when absent.
+    let collection_version = root
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("1.0")
+        .to_string();
 
     let device = root
         .get("DeviceInfo")
@@ -107,6 +179,7 @@ pub fn load_device_info(device_dir: &Path) -> Result<DeviceInfo> {
             })
             .unwrap_or(0) as u32,
         expand_status: 0,
+        collection_version,
     })
 }
 

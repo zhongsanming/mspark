@@ -19,7 +19,19 @@ impl Node for HbmRecord {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = raw::read_stream(ctx, "hbm.", raw::HBM_TRUNK)?;
+        // Layout version comes from `info.json:version` (msprof's
+        // `VersionedStructParser`): 2.x stores the stamp last and in absolute ns.
+        let version = ctx
+            .require::<crate::ctx::DeviceInfo>()?
+            .collection_version
+            .clone();
+        let v2 = version.starts_with('2');
+        let trunk = if v2 {
+            raw::HBM_TRUNK_V2
+        } else {
+            raw::HBM_TRUNK
+        };
+        let bytes = raw::read_stream(ctx, "hbm.", trunk)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
