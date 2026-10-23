@@ -127,6 +127,24 @@ Note also that this capture is much larger than the one used for the earlier
 54 981-row measurements (85 241 tasks), so cross-capture percentages are not
 comparable; always re-measure on the capture being discussed.
 
+### T1j. `task_time` residual on the multi-device capture
+Reported as 6 327 rows beyond 2 ns with `max |Δ| = 24.9 ms`. Investigated:
+
+- The verifier keys rows by `(stream, task)`, and this capture has **16 388
+  duplicated keys** (85 241 rows collapse to 68 853 keys, each duplicated at
+  most twice) — so the comparison is empirically under-specified in principle.
+- Re-measured with a *fair* pairing (durations sorted within each key before
+  comparing): `exact 79 331`, `within 2 ns 84 904`, `kernel_type 38 254` of
+  85 241. Essentially identical to the keyed numbers, so the duplicates are
+  **not** the explanation and the residual is real.
+- The 169 rows that differ by > 2 ns are large, low-duration mismatches
+  (golden 0.62 us vs ours 127.5 us) — i.e. a pairing/attribution problem for a
+  handful of tasks, not a clock problem.
+
+Conclusion: the residual is small (~0.4 %) and localized. Fixing it needs the
+same `(stream, batch, task, context)` key that `kernel_type` needs, so both are
+blocked on the same missing join key.
+
 ### T1i (original analysis)
 The `mix` flag must **not** override the core type: golden takes it from
 `node_basic_info.task_type` (0 → AI_CORE, 2 → AI_VECTOR_CORE, 5 → MIX_AIV).
