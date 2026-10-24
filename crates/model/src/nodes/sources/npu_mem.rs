@@ -1,6 +1,8 @@
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
+use crate::stream::NPU_MEM_TRUNK;
+use crate::stream::{CtxStreams, Stream};
 use crate::time::Clock;
 
 #[derive(Debug, Clone, Copy)]
@@ -16,7 +18,7 @@ impl Node for NpuMemRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_stream(ctx, "npu_mem.", super::npu_mem::NPU_MEM_TRUNK)?;
+        let bytes = ctx.stream(Stream::NpuMem)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -40,8 +42,6 @@ impl Node for NpuMemRow {
         Ok(out)
     }
 }
-
-pub const NPU_MEM_TRUNK: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 pub struct NpuMemRaw {

@@ -6,6 +6,8 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 use mspark_df::{Ctx, Node};
 
 use crate::host::{HashDic, TypeDic};
+use crate::stream::API_EVENT_TRUNK;
+use crate::stream::{CtxStreams, Stream};
 
 #[derive(Debug, Clone)]
 pub struct ApiEventRow {
@@ -47,11 +49,7 @@ impl Node for ApiEventRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_host_stream(
-            ctx,
-            "aging.api_event.data.",
-            super::api_event::API_EVENT_TRUNK,
-        )?;
+        let bytes = ctx.stream(Stream::ApiEvent)?;
         let mut raws = super::api_event::decode_api_event(&bytes)?;
         // msprof emits the CANN track sorted by the API start timestamp.
         raws.sort_by_key(|r| r.begin);
@@ -89,8 +87,6 @@ impl Node for ApiEventRow {
             .collect())
     }
 }
-
-pub const API_EVENT_TRUNK: usize = 40;
 
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C, packed)]

@@ -1,3 +1,4 @@
+use crate::stream::{CtxStreams, Stream};
 use crate::time::DeviceStartLogs;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
@@ -24,7 +25,7 @@ impl Node for HccsRateRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_stream(ctx, "hccs.", 1)?;
+        let bytes = ctx.stream(Stream::Hccs)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }

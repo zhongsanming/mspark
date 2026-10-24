@@ -1,6 +1,8 @@
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
+use crate::stream::QOS_TRUNK;
+use crate::stream::{CtxStreams, Stream};
 use crate::time::{Clock, fmt_us};
 
 #[derive(Debug, Clone)]
@@ -14,7 +16,7 @@ impl Node for QosRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_stream(ctx, "qos.", super::qos::QOS_TRUNK)?;
+        let bytes = ctx.stream(Stream::Qos)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -34,8 +36,6 @@ impl Node for QosRow {
         Ok(out)
     }
 }
-
-pub const QOS_TRUNK: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 pub struct QosRaw {

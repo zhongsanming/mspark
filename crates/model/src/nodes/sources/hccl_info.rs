@@ -6,6 +6,7 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 use mspark_df::{Ctx, Node};
 
 use crate::host::HashDic;
+use crate::stream::{CtxStreams, Stream};
 
 /// One HCCL task-info record (`unaging.additional.hccl_info`, 256 B, `dlen 120`).
 ///
@@ -38,11 +39,7 @@ impl Node for HcclInfoRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_host_stream(
-            ctx,
-            "unaging.additional.hccl_info.",
-            crate::stream::ADDITIONAL_TRUNK,
-        )?;
+        let bytes = ctx.stream(Stream::HcclInfo)?;
         let dic = ctx.require::<HashDic>()?;
         Ok(super::hccl_info::decode_hccl_info(&bytes)?
             .into_iter()

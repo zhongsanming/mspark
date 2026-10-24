@@ -127,6 +127,13 @@ mspark --strict verify-llc-csv PROF_… --golden …/llc_read_write_*.csv
 
 ### Project layout of the binary
 
+Raw input is requested by **stream identity**, never by path: a node calls
+`ctx.stream(Stream::StarsSoc)` and gets the bytes of that stream. The prefix, the
+directory (device vs host) and the record size live once in `stream::Stream`, so a
+node cannot disagree with the file it needs and a typo is a compile error instead
+of an empty table. `Stream::trunk` also owns the versioned layouts (`hbm` v1/v2),
+and a unit test keeps every prefix unique and non-overlapping per directory.
+
 Each device is a `DeviceSession { ctx, info, store }`: the context (including the
 parsed `StartLogs`, `sample.json` and host `info.json`) is built once per process
 and the store memoises node tables for that device only.

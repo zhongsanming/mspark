@@ -816,6 +816,17 @@ The `Mutex` itself is not removable: artifacts fan out over devices in parallel
 and share one memoised `Store` per device. The worthwhile part was shrinking the
 critical section and the number of owners, not deleting the lock.
 
+### T21. Stream identity instead of path+record-size at call sites (done)
+The 25 read sites each spelled out `read_stream(ctx, "stars_soc.", 64)`; the
+prefix, directory and record size now live in `stream::Stream` and nodes ask for
+`ctx.stream(Stream::StarsSoc)`. Bytes are returned, never cached — the parsed
+table is what `Store` memoises and the streams reach hundreds of MB.
+
+Deliberately **not** done: a `pattern` string API (`ctx.read("stars_soc.*")`).
+That only relocates the string, keeps the silent-empty-table failure mode, and
+loses the compile-time check; the enum is the same idea made checkable. Also not
+done: routing *decoding* through `Ctx` — decoders stay pure `&[u8] -> Vec<Row>`.
+
 ### T19. Review items deliberately not taken
 Recorded so the next pass does not re-litigate them:
 

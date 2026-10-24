@@ -32,15 +32,8 @@ impl Node for HostCpuUsageRow {
         // msprof parses each `slice_*` file independently, so no interval spans
         // a slice boundary (the first block of a slice has no predecessor).
         let dir = ctx.host_data_dir();
-        let mut files: Vec<std::path::PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("host_cpu.data.") && !name.ends_with(".done") {
-                files.push(entry.path());
-            }
-        }
-        files.sort();
+        // `files_with_prefix` already returns slice order.
+        let files = crate::stream::files_with_prefix(&dir, &["host_cpu.data"]);
         let mut out = Vec::new();
         for file in files {
             let bytes = std::fs::read(&file)?;

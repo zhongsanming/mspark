@@ -23,11 +23,7 @@ impl Node for TensorInfoRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_host_stream(
-            ctx,
-            "aging.additional.tensor_info.",
-            crate::stream::ADDITIONAL_TRUNK,
-        )?;
+        let bytes = ctx.stream(Stream::TensorInfo)?;
         let raws = super::tensor_info::decode_tensor_info(&bytes)?;
         // A task's tensors span several 256-byte records that share
         // (op hash, timestamp, threadId); merge them into one descriptor set.

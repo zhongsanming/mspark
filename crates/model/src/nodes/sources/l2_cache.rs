@@ -1,4 +1,6 @@
 use crate::format::round6;
+use crate::stream::L2_CACHE_TRUNK;
+use crate::stream::{CtxStreams, Stream};
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -19,7 +21,7 @@ impl Node for L2CacheRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_stream(ctx, "l2_cache.", super::l2_cache::L2_CACHE_TRUNK)?;
+        let bytes = ctx.stream(Stream::L2Cache)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -59,8 +61,6 @@ fn load_l2_events(ctx: &Ctx) -> Result<Vec<String>> {
         .require::<crate::ctx::SampleConfig>()?
         .list("l2CacheTaskProfilingEvents"))
 }
-
-pub const L2_CACHE_TRUNK: usize = 72;
 
 #[derive(Debug, Clone, Copy)]
 pub struct L2CacheRaw {

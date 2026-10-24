@@ -1,4 +1,5 @@
 use crate::format::round6;
+use crate::stream::{CtxStreams, Stream};
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -27,7 +28,7 @@ impl Node for HostMemUsageRow {
         if mem_total == 0 {
             return Ok(Vec::new());
         }
-        let bytes = crate::stream::read_host_stream(ctx, "host_mem.data.", 1)?;
+        let bytes = ctx.stream(Stream::HostMemData)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }

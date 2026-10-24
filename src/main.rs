@@ -7,6 +7,7 @@ use anyhow::{Context as _, Result, bail};
 use mspark::text::{civil_from_days, nic_timestamp_column, parse_us_to_ns, py_float, py_round3};
 use mspark::verify::{compare_generated, gate, read_rows};
 use mspark_df::{Ctx, Store, resolve};
+use mspark_model::CtxStreams;
 use mspark_model::NetSample;
 use mspark_model::{
     AccPmuSample, ApiEventRow, ApiStatisticRow, ChipTransKind, ChipTransSample, Clock, DeviceInfo,
@@ -1203,10 +1204,9 @@ fn host_mem_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         let session = session_for(&device)?;
         let ctx = session.ctx();
         let samples = session.resolve::<HostMemUsageRow>()?;
-        let total_kb = std::fs::read_to_string(ctx.root().join("host").join("info.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .and_then(|root| root.get("memoryTotal").and_then(|v| v.as_u64()))
+        let total_kb = ctx
+            .require::<mspark_model::HostInfo>()
+            .map(|info| info.memory_total_kb)
             .unwrap_or(0);
         let peak = samples
             .iter()
@@ -1631,29 +1631,17 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
         let lpm = session.resolve::<LpmInfo>()?;
 
         let soc_hist = mspark_model::nodes::sources::stars_soc::decode_stars_soc(
-            &mspark_model::stream::read_stream(
-                ctx,
-                "stars_soc.",
-                mspark_model::nodes::sources::stars_soc::STARS_SOC_TRUNK,
-            )?,
+            &ctx.stream(mspark_model::Stream::StarsSoc)?,
             info.expand_status,
         )?
         .1;
         let pmu_hist = mspark_model::nodes::sources::ffts_profile::decode_ffts_profile(
-            &mspark_model::stream::read_stream(
-                ctx,
-                "ffts_profile.",
-                mspark_model::nodes::sources::ffts_profile::FFTS_PROFILE_TRUNK,
-            )?,
+            &ctx.stream(mspark_model::Stream::FftsProfile)?,
             info.expand_status,
         )?
         .1;
         let track_hist = mspark_model::nodes::sources::ts_track::decode_ts_track(
-            &mspark_model::stream::read_stream(
-                ctx,
-                "ts_track.",
-                mspark_model::nodes::sources::ts_track::TS_TRACK_TRUNK,
-            )?,
+            &ctx.stream(mspark_model::Stream::TsTrack)?,
         )?
         .1;
 

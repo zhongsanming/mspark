@@ -1,6 +1,7 @@
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
+use crate::stream::{CtxStreams, Stream};
 use crate::time::DeviceStartLogs;
 
 /// One text network sample (`nic.data` / `roce.data`).
@@ -17,8 +18,8 @@ pub struct NetSample {
     pub tx: [u64; 6],
 }
 
-pub fn decode_net(ctx: &Ctx, prefix: &str) -> Result<Vec<NetSample>> {
-    let bytes = crate::stream::read_stream(ctx, prefix, 1)?;
+pub fn decode_net(ctx: &Ctx, net_stream: Stream) -> Result<Vec<NetSample>> {
+    let bytes = ctx.stream(net_stream)?;
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
@@ -57,7 +58,10 @@ impl Node for NicRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        Ok(decode_net(ctx, "nic.")?.into_iter().map(NicRow).collect())
+        Ok(decode_net(ctx, Stream::Nic)?
+            .into_iter()
+            .map(NicRow)
+            .collect())
     }
 }
 
@@ -69,6 +73,9 @@ impl Node for RoceRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        Ok(decode_net(ctx, "roce.")?.into_iter().map(RoceRow).collect())
+        Ok(decode_net(ctx, Stream::Roce)?
+            .into_iter()
+            .map(RoceRow)
+            .collect())
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::stream::{CtxStreams, Stream};
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -20,7 +21,7 @@ impl Node for DvppRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_stream(ctx, "dvpp.data.", 1)?;
+        let bytes = ctx.stream(Stream::Dvpp)?;
         let text = String::from_utf8_lossy(&bytes);
         let mut agg: BTreeMap<(u32, u32, u32), DvppAgg> = BTreeMap::new();
         for line in text.lines() {

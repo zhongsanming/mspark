@@ -1,3 +1,4 @@
+use crate::stream::{CtxStreams, HBM_TRUNK, Stream};
 use crate::time::DeviceStartLogs;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
@@ -20,17 +21,8 @@ impl Node for HbmRecord {
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
         // Layout version comes from `info.json:version` (msprof's
         // `VersionedStructParser`): 2.x stores the stamp last and in absolute ns.
-        let version = ctx
-            .require::<crate::ctx::DeviceInfo>()?
-            .collection_version
-            .clone();
-        let v2 = version.starts_with('2');
-        let trunk = if v2 {
-            super::hbm::HBM_TRUNK_V2
-        } else {
-            super::hbm::HBM_TRUNK
-        };
-        let bytes = crate::stream::read_stream(ctx, "hbm.", trunk)?;
+        // `Stream::Hbm` picks the matching record size.
+        let bytes = ctx.stream(Stream::Hbm)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -63,11 +55,8 @@ impl Node for HbmRecord {
     }
 }
 
-pub const HBM_TRUNK: usize = 24;
-
 // ---------------------------------------------------------------------------
 // PCIe (`PcieRecord`, `Q22I`, 96 bytes)
 // ---------------------------------------------------------------------------
 
 // Collection-version 2.x layouts of the versioned streams.
-pub const HBM_TRUNK_V2: usize = 32;

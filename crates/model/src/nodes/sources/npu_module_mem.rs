@@ -2,6 +2,8 @@ use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
 use crate::ctx::DeviceInfo;
+use crate::stream::NPU_MODULE_MEM_TRUNK;
+use crate::stream::{CtxStreams, Stream};
 use crate::time::DeviceStartLogs;
 
 #[derive(Debug, Clone, Copy)]
@@ -16,11 +18,7 @@ impl Node for NpuModuleMemRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_stream(
-            ctx,
-            "npu_module_mem.",
-            super::npu_module_mem::NPU_MODULE_MEM_TRUNK,
-        )?;
+        let bytes = ctx.stream(Stream::NpuModuleMem)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -46,8 +44,6 @@ impl Node for NpuModuleMemRow {
         Ok(out)
     }
 }
-
-pub const NPU_MODULE_MEM_TRUNK: usize = 24;
 
 #[derive(Debug, Clone, Copy)]
 pub struct NpuModuleMemRaw {

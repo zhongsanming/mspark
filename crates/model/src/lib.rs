@@ -19,6 +19,7 @@ pub use nodes::sources::npu_mem::npu_mem_event;
 pub use nodes::sources::npu_module_mem::module_name;
 pub use nodes::sources::{LLC_READ_SLOTS, NetSample};
 pub use nodes::*;
+pub use stream::{CtxStreams, Location, Stream, Trunk};
 
 pub use nodes::sources::ffts_profile::PmuData;
 pub use nodes::sources::lpm::{LpmInfo, LpmSample};
