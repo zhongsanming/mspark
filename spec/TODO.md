@@ -788,7 +788,15 @@ pre-existing, none caused by the review work):
 - `npu_mem`: `timestamp(us)` 0/2238 (every other column exact).
 - `hbm`: `Read(MB/s)` 4/5.
 - `hccs`: `Average` 0/2 on this capture (was 5/5 on the older one).
-- `SIO`/`HCCS` tracks: we emit 8 and 2 events more than golden.
+- `SIO`/`HCCS` tracks: we emit 8 and 2 events more than golden. **Diagnosed
+  (SIO)**: the difference is exactly one extra *sample per die* (8 metrics ×
+  2 dies would be 16, so it is one sample) carrying all-zero counters at
+  `…288191127480` ns, i.e. 20.5 µs *earlier* than the first row msprof stores in
+  its own `SIO` table (`…288211607749`; 1098 rows per die). `SESSION_TIME_INFO`
+  starts even earlier (`…287139823000`), so this is not a start-time filter —
+  msprof's SIO parser drops its first record per die, most likely because its
+  rate/delta conversion has no predecessor for it. Drop the first sample per die
+  and compare again.
 - `op_summary`: still the duplicate-key row-alignment problem (T1k).
 
 ### T20. Per-device session and I/O in `Ctx` (done)
