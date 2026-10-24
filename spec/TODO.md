@@ -476,6 +476,51 @@ Event kinds come from `MsprofTxParser.EVENT_DICT` — `marker`, `push/pop`,
 To implement: parse the stream, resolve `mark_id`/`domain` in the hash dic, emit
 `ph: X`/`i` events per event_type. Blocked only on a capture with mstx data.
 
+### T22b. `communication_statistic` time columns — investigated, blocked on the CANN call stack
+The report is a plain aggregate (msprof `hccl_op_report.py`): group by `op_type`,
+`total/min/avg/max` of `end - start` over merged op instances, ns → µs, ROUND_THREE,
+`ratio = total * 100 / sum(total)`, sorted by total desc, warmup ops
+(`end <= start_time_raw_timestamp`) dropped. Our `Count` column already matches
+for two of the three types (415 broadcast, 410 allReduce); the single `allGather`
+op has no attributed task and is skipped, so we emit 825 of 826 ops.
+
+The missing input is the **op window**, which msprof takes from device master
+tasks, not from the host event:
+
+- `hccl_calculator._merge_hccl_ops_and_tasks` groups HCCL tasks per
+  `(thread_id, op_id)`, starts a new round when `op_id` changes or the
+  `(stream, task, context, batch)` tuple repeats, and takes
+  `start = min(task.timestamp)`, `end = max(task.timestamp + task.duration)`
+  over **master** tasks only.
+- `task.duration` does not exist in the `HCCLTask` table: `hccl_model.get_hccl_task_data`
+  joins it to `ASCEND_TASK` on
+  `(stream_id, task_id, batch_id, context_id, device_id)` — our `DeviceTask` —
+  which is the same `batch_id` blocker as T1i.
+- `is_master` comes from the **api event** (`struct_type == 'master'`), `op_id`
+  from the node-level event's `connection_id`, and the task↔op association from
+  the CANN analyzer's open-event stack (`cann_analysis_gear.add_hccl_task` reads
+  `event.additional_record` of the api event that is open when the task arrives).
+
+What the streams themselves can offer was measured on the multi-device capture:
+
+```
+hccl_info records            43 223  (per HCCL-internal task, not per op)
+their item names             Notify_Record 15 225, Notify_Wait 15 225,
+                             Memcpy 8 666, Reduce_Inline 4 107
+their timestamp field        identical (515400224347) on every record
+duration_estimated          0.6–1.29 (µs-scale; golden totals are ~5.3 s)
+stream_id / task_id         absent from the record
+task_track names             71 distinct in the merged capture's hash_dic
+```
+
+So there is no per-task timing in the HCCL streams, and the `role`/`stage` fields
+do not carry the ids needed to join. Reproducing the columns means implementing the
+event call-stack analyzer, which is the same subsystem that would unlock the
+4-thread Overlap (T26) and possibly the `kernel_type` permutation (T1i).
+
+Verdict: not a step, a project. The `Count` column is kept; the time columns stay
+omitted rather than approximated (`duration_estimated` is not the op duration).
+
 ### T22. `Communication` track + `communication_statistic.csv`
 The multi-device capture adds both. Shapes, from the golden and from
 `prof_struct.h`:
