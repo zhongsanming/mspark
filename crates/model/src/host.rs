@@ -104,6 +104,18 @@ pub fn load_dictionaries(host_data: &Path) -> (HashDic, TypeDic) {
         }
     }
 
+    if hash.is_empty() {
+        eprintln!(
+            "warning: no hash_dic slices under {}; names will render as N/A",
+            host_data.display()
+        );
+    }
+    if types.is_empty() {
+        eprintln!(
+            "warning: no type_info_dic slices under {}; kernel types will render as N/A",
+            host_data.display()
+        );
+    }
     (HashDic(hash), TypeDic(types))
 }
 

@@ -27,7 +27,7 @@ impl Node for HccsRateRow {
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        let clock = crate::time::load_mono_clock(ctx.device_dir()?, 0.0)?;
+        let clock = crate::time::load_mono_clock(ctx.device_dir()?, None)?;
         let text = String::from_utf8_lossy(&bytes);
         let mut samples: Vec<(u64, u64, u64)> = Vec::new();
         for line in text.lines() {

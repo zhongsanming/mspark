@@ -22,7 +22,7 @@ pub fn decode_net(ctx: &Ctx, prefix: &str) -> Result<Vec<NetSample>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
-    let clock = load_mono_clock(ctx.device_dir()?, 0.0)?;
+    let clock = load_mono_clock(ctx.device_dir()?, None)?;
     let text = String::from_utf8_lossy(&bytes);
     let mut out = Vec::new();
     for line in text.lines() {

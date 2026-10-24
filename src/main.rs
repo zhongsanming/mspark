@@ -37,6 +37,9 @@ struct Cli {
     /// Restrict to one device directory, e.g. `device_7`.
     #[arg(long)]
     device: Option<String>,
+    /// Make verification commands exit non-zero on any mismatch.
+    #[arg(long)]
+    strict: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -391,6 +394,7 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    STRICT.store(cli.strict, std::sync::atomic::Ordering::Relaxed);
     let Some(command) = cli.command else {
         let prof = cli.prof.as_deref().ok_or_else(|| {
             anyhow::anyhow!("missing PROF_* directory (or pass a subcommand, e.g. `verify`)")
@@ -1168,10 +1172,13 @@ fn host_mem_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
             .iter()
             .map(|sample| sample.usage)
             .fold(0.0f64, f64::max);
-        if let Some(last) = samples.last() {
+        if !samples.is_empty() {
             let used_kb = (peak * total_kb as f64 / 100.0).round() as u64;
+            // TODO(T-host-mem): the `Device_id` column is written as `host`
+            // because no golden `host_mem_usage` file exists in any capture we
+            // have, so the literal cannot be checked. msprof may write the
+            // numeric device id here like every other host-side table.
             body.push_str(&format!("host,{total_kb},{used_kb},{used_kb}\n"));
-            let _ = last;
             rows += 1;
         }
     }
@@ -1843,7 +1850,19 @@ fn verify(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     println!(
         "task_start: exact {start_exact}/{matched}, within 2ns {start_close}/{matched}, max |Δ| = {max_start_ns} ns"
     );
-    Ok(())
+    let clean = missing == 0
+        && extras == 0
+        && matched == golden_rows.len()
+        && names_ok == matched
+        && types_ok == matched
+        && dur_exact == matched
+        && start_exact == matched;
+    gate(clean, || {
+        format!(
+            "task_time is not an exact match: {matched} matched, {missing} missing, {extras} extra, \
+             {names_ok}/{matched} names, {dur_exact}/{matched} durations, {start_exact}/{matched} starts"
+        )
+    })
 }
 
 /// Parse a `us` decimal string (`123.456`) into exact integer nanoseconds.
@@ -3006,13 +3025,41 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
     println!("CANN level:     {api_level_ok}");
     println!("CANN id:        {api_id_ok}");
     println!("CANN item_id:   {api_item_ok}");
-    for (name, golden, produced, matched) in track_stats {
+    for &(name, golden, produced, matched) in &track_stats {
         println!("track {name:<16} golden={golden:<6} produced={produced:<6} matched={matched}");
     }
     println!(
         "overlap golden={overlap_golden} produced={overlap_produced} matched={overlap_matched} max_dur={overlap_max_dur:.6}"
     );
-    Ok(())
+    let mut clean = produced_rows == golden_rows
+        && name_ok == produced_rows
+        && tid_ok == produced_rows
+        && ts_ok == produced_rows
+        && dur_ok == produced_rows
+        && type_ok == produced_rows
+        && stream_ok == produced_rows
+        && task_ok == produced_rows
+        && subtask_ok == produced_rows
+        && api_produced == api_golden
+        && api_name_ok == api_produced
+        && api_tid_ok == api_produced
+        && api_ts_ok == api_produced
+        && api_dur_ok == api_produced
+        && api_mode_ok == api_produced
+        && api_level_ok == api_produced
+        && api_id_ok == api_produced
+        && api_item_ok == api_produced
+        && overlap_golden == overlap_produced
+        && overlap_matched == overlap_golden;
+    for &(name, golden, produced, matched) in &track_stats {
+        if golden != produced || matched != golden {
+            clean = false;
+            eprintln!("strict: track {name} is not an exact match");
+        }
+    }
+    gate(clean, || {
+        "timeline is not an exact match (see the counters above)".to_string()
+    })
 }
 
 fn ts_cpu_event_name(event: u64) -> &'static str {
@@ -3333,54 +3380,6 @@ fn verify_op_statistic(prof: &Path, only: Option<&str>, golden: &Path) -> Result
         &[4, 5, 6, 7, 8],
         0.05,
     )
-}
-
-fn compare_table_relaxed(
-    golden: &Path,
-    header: &[&str],
-    produced: &[Vec<String>],
-    tolerance_cols: &[usize],
-    tolerance: f64,
-) -> Result<()> {
-    let rows = read_rows(golden)?;
-    let Some((golden_header, body)) = rows.split_first() else {
-        anyhow::bail!("golden file is empty");
-    };
-    if golden_header.len() != header.len() {
-        anyhow::bail!(
-            "header width mismatch: golden {} vs mspark {}",
-            golden_header.len(),
-            header.len()
-        );
-    }
-    let n = body.len().min(produced.len());
-    let mut exact = vec![0usize; header.len()];
-    let mut near = vec![0usize; header.len()];
-    for i in 0..n {
-        for (c, slot) in exact.iter_mut().enumerate() {
-            let (Some(g), Some(p)) = (body[i].get(c), produced[i].get(c)) else {
-                continue;
-            };
-            if g == p {
-                *slot += 1;
-                near[c] += 1;
-            } else if tolerance_cols.contains(&c)
-                && let (Ok(gv), Ok(pv)) = (g.parse::<f64>(), p.parse::<f64>())
-                && (gv - pv).abs() <= tolerance
-            {
-                near[c] += 1;
-            }
-        }
-    }
-    println!("golden rows: {}", body.len());
-    println!("produced rows: {}", produced.len());
-    for (c, name) in header.iter().enumerate() {
-        println!(
-            "{c:>2}  {name:<22} exact {}/{n}  near {}/{n}",
-            exact[c], near[c]
-        );
-    }
-    Ok(())
 }
 
 fn py_float(value: f64) -> String {
@@ -3883,7 +3882,36 @@ fn verify_npu_module_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Resu
     )
 }
 
-fn compare_table(golden: &Path, header: &[&str], produced: &[Vec<String>]) -> Result<()> {
+/// Comparison strictness for the `--strict` flag: verifiers always print their
+/// per-column statistics, but only a strict run turns a mismatch into a non-zero
+/// exit status (so CI can gate on regressions while interactive use still shows
+/// partial matches).
+static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn strict() -> bool {
+    STRICT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Fail the run when `ok` is false and `--strict` was requested.
+fn gate(ok: bool, what: impl FnOnce() -> String) -> Result<()> {
+    if ok || !strict() {
+        return Ok(());
+    }
+    anyhow::bail!("{}", what());
+}
+
+/// Compare a produced table against a golden CSV.
+///
+/// Columns are matched **by header name**, not by position, so a reordered
+/// golden file is reported instead of silently compared against the wrong
+/// columns. `tolerance` marks columns that only have to be within `eps`
+/// (HPFloat residuals).
+fn compare_table_with(
+    golden: &Path,
+    header: &[&str],
+    produced: &[Vec<String>],
+    tolerance: Option<(&[usize], f64)>,
+) -> Result<()> {
     let rows = read_rows(golden)?;
     let Some((golden_header, body)) = rows.split_first() else {
         anyhow::bail!("golden file is empty");
@@ -3895,55 +3923,109 @@ fn compare_table(golden: &Path, header: &[&str], produced: &[Vec<String>]) -> Re
             header.len()
         );
     }
+    // golden column -> produced column, by name.
+    let mut order = Vec::with_capacity(header.len());
+    for (position, name) in golden_header.iter().enumerate() {
+        match header.iter().position(|ours| ours == name) {
+            Some(index) => order.push(index),
+            None => anyhow::bail!(
+                "golden column {position} `{name}` is not produced; mspark header: {header:?}"
+            ),
+        }
+    }
+
+    let (tolerance_cols, eps) = tolerance.unwrap_or((&[], 0.0));
     let n = body.len().min(produced.len());
     let mut exact = vec![0usize; header.len()];
+    let mut near = vec![0usize; header.len()];
     for i in 0..n {
-        for (c, slot) in exact.iter_mut().enumerate() {
-            if body[i].get(c) == produced[i].get(c) {
-                *slot += 1;
+        for (column, &target) in order.iter().enumerate() {
+            let (Some(g), Some(p)) = (body[i].get(column), produced[i].get(target)) else {
+                continue;
+            };
+            if g == p {
+                exact[target] += 1;
+                near[target] += 1;
+            } else if tolerance_cols.contains(&target)
+                && let (Ok(gv), Ok(pv)) = (g.parse::<f64>(), p.parse::<f64>())
+                && (gv - pv).abs() <= eps
+            {
+                near[target] += 1;
             }
         }
     }
     println!("golden rows: {}", body.len());
     println!("produced rows: {}", produced.len());
+    let mut ok = body.len() == produced.len();
     for (c, name) in header.iter().enumerate() {
-        println!("{c:>2}  {name:<22} {}/{n}", exact[c]);
+        if tolerance.is_some() {
+            println!(
+                "{c:>2}  {name:<22} exact {}/{n}  near {}/{n}",
+                exact[c], near[c]
+            );
+            ok &= near[c] == body.len() && produced.len() == body.len();
+        } else {
+            println!("{c:>2}  {name:<22} {}/{n}", exact[c]);
+            ok &= exact[c] == body.len() && produced.len() == body.len();
+        }
     }
-    Ok(())
+    gate(ok, || {
+        format!("table {golden:?} is not an exact match (see the per-column counts above)")
+    })
 }
 
+fn compare_table(golden: &Path, header: &[&str], produced: &[Vec<String>]) -> Result<()> {
+    compare_table_with(golden, header, produced, None)
+}
+
+fn compare_table_relaxed(
+    golden: &Path,
+    header: &[&str],
+    produced: &[Vec<String>],
+    tolerance_cols: &[usize],
+    tolerance: f64,
+) -> Result<()> {
+    compare_table_with(golden, header, produced, Some((tolerance_cols, tolerance)))
+}
+
+/// Minimal RFC 4180 reader: quoted fields may contain commas, doubled quotes and
+/// newlines. Fields are **not** trimmed — msprof emits ` N/A` style values with
+/// meaningful leading spaces in some tables, and trimming hid differences.
 fn read_rows(path: &Path) -> Result<Vec<Vec<String>>> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut rows = Vec::new();
-    for line in text.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let mut fields = Vec::new();
-        let mut current = String::new();
-        let mut in_quotes = false;
-        let mut chars = line.chars().peekable();
-        while let Some(ch) = chars.next() {
-            match ch {
-                '"' if in_quotes => {
-                    if chars.peek() == Some(&'"') {
-                        current.push('"');
-                        chars.next();
-                    } else {
-                        in_quotes = false;
-                    }
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut row: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if in_quotes => {
+                if chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
                 }
-                '"' => in_quotes = true,
-                ',' if !in_quotes => {
-                    fields.push(current.trim().to_string());
-                    current.clear();
-                }
-                _ => current.push(ch),
             }
+            '"' if field.is_empty() => in_quotes = true,
+            ',' if !in_quotes => row.push(std::mem::take(&mut field)),
+            '\r' if !in_quotes => {}
+            '\n' if !in_quotes => {
+                row.push(std::mem::take(&mut field));
+                if !(row.len() == 1 && row[0].is_empty()) {
+                    rows.push(std::mem::take(&mut row));
+                } else {
+                    row.clear();
+                }
+            }
+            other => field.push(other),
         }
-        fields.push(current.trim().to_string());
-        rows.push(fields);
+    }
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
     }
     Ok(rows)
 }

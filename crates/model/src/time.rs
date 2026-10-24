@@ -298,7 +298,9 @@ impl MonoClock {
     }
 }
 
-pub fn load_mono_clock(device_dir: &Path, host_freq_mhz: f64) -> Result<MonoClock> {
+/// `host_freq_mhz` enables the `hostCntvctDiff` correction; pass `None` for the
+/// streams that msprof converts without it (PCIe, HCCS, NIC/RoCE).
+pub fn load_mono_clock(device_dir: &Path, host_freq_mhz: Option<f64>) -> Result<MonoClock> {
     let start_info = read_json(&find_one(device_dir, "start_info")?)?;
     let begin_us = as_u64(&start_info, "collectionTimeBegin")
         .ok_or_else(|| anyhow!("start_info has no collectionTimeBegin"))?;
@@ -320,10 +322,9 @@ pub fn load_mono_clock(device_dir: &Path, host_freq_mhz: f64) -> Result<MonoCloc
         .get("cntvct_diff")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
-    let correction = if host_freq_mhz > 0.0 {
-        (diff as f64 * 1000.0 / host_freq_mhz).round() as i128
-    } else {
-        0
+    let correction = match host_freq_mhz {
+        Some(freq) if freq > 0.0 => (diff as f64 * 1000.0 / freq).round() as i128,
+        _ => 0,
     };
 
     let offset_ns = (host_mono as i128 + correction - dev_mono as i128)

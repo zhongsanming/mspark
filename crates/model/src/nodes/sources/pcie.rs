@@ -24,7 +24,7 @@ impl Node for PcieRecord {
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        let clock = crate::time::load_mono_clock(ctx.device_dir()?, 0.0)?;
+        let clock = crate::time::load_mono_clock(ctx.device_dir()?, None)?;
         Ok(bytes
             .as_chunks::<{ super::pcie::PCIE_TRUNK }>()
             .0

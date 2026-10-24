@@ -42,8 +42,6 @@ mspark_df::graph!(
     HbmRecord,
     HcclInfoRow,
     HcclOpRow,
-    HcclInfoRow,
-    HcclOpRow,
     HccsRateRow,
     HostCpuUsageRow,
     HostDiskUsageRow,
@@ -73,3 +71,17 @@ mspark_df::graph!(
     TimelineTask,
     TscpuRecord,
 );
+
+#[cfg(test)]
+mod tests {
+    /// `mspark graph` renders `NODE_GRAPH`; a duplicate entry would render a
+    /// duplicate node and its edges twice.
+    #[test]
+    fn node_graph_has_unique_names() {
+        let mut names: Vec<&str> = super::NODE_GRAPH.iter().map(|(name, _)| *name).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "duplicate node in NODE_GRAPH");
+    }
+}

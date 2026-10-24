@@ -1,10 +1,20 @@
 //! Output formatting helpers shared by the CSV/JSON exporters.
 
-pub(crate) fn csv_field(field: &str) -> String {
-    if field.contains(',') || field.contains('"') || field.contains('\n') {
-        format!("\"{}\"", field.replace('"', "\"\""))
+/// Append `field` to `out`, quoting it the way msprof does (RFC 4180) when it
+/// contains a comma, a quote or a newline. Avoids the per-cell allocation of a
+/// `csv_field` returning `String`.
+pub fn push_csv_field(out: &mut String, field: &str) {
+    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
+        out.push('"');
+        for ch in field.chars() {
+            if ch == '"' {
+                out.push('"');
+            }
+            out.push(ch);
+        }
+        out.push('"');
     } else {
-        field.to_string()
+        out.push_str(field);
     }
 }
 

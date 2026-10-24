@@ -178,9 +178,45 @@ pub fn load_device_info(device_dir: &Path) -> Result<DeviceInfo> {
                     .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             })
             .unwrap_or(0) as u32,
-        expand_status: 0,
+        expand_status: load_expand_status(device_dir),
         collection_version,
     })
+}
+
+/// `StreamExpandSpec.expand_status`: `1` when the capture hit the stream-expand
+/// (dynamic stream) scenario, `0` otherwise.
+///
+/// The stream holds 64-byte records laid out as `<2H3IQ4B9I`; msprof reads the
+/// seventh unpacked field, i.e. the first of the four bytes at offset 24.
+/// Absent stream → `0` (msprof's default).
+fn load_expand_status(device_dir: &Path) -> u16 {
+    let data = device_dir.join("data");
+    let mut files: Vec<(u64, PathBuf)> = Vec::new();
+    let Ok(entries) = fs::read_dir(&data) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("stream_expand_spec.") || name.ends_with(".done") {
+            continue;
+        }
+        let slice = name
+            .rsplit('_')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        files.push((slice, entry.path()));
+    }
+    files.sort_by_key(|entry| entry.0);
+    for (_, path) in files {
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        if bytes.len() >= 25 {
+            return u16::from(bytes[24]);
+        }
+    }
+    0
 }
 
 fn find_info_json(dir: &Path) -> Result<PathBuf> {

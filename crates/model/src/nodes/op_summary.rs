@@ -4,7 +4,7 @@ use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
 use crate::ctx::DeviceInfo;
-use crate::format::{csv_field, fmt_metric};
+use crate::format::{fmt_metric, push_csv_field};
 use crate::host::ge_task_type;
 use crate::nodes::sources::tensor_info::{format_str, join_or_na, shapes_field, take_tensors};
 use crate::time::{Clock, fmt_us};
@@ -68,12 +68,14 @@ impl OpSummaryRow {
     ];
 
     pub fn to_csv(&self) -> String {
-        let mut s = self
-            .cols
-            .iter()
-            .map(|field| csv_field(field))
-            .collect::<Vec<_>>()
-            .join(",");
+        debug_assert_eq!(self.cols.len(), Self::HEADER.len(), "column count drifted");
+        let mut s = String::with_capacity(256);
+        for (i, field) in self.cols.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            push_csv_field(&mut s, field);
+        }
         s.push('\n');
         s
     }
@@ -247,6 +249,13 @@ impl Node for OpSummaryRow {
             };
             cols.push(format!("{cube:.3}"));
 
+            assert_eq!(
+                cols.len(),
+                Self::HEADER.len(),
+                "op_summary row has {} columns, header has {}",
+                cols.len(),
+                Self::HEADER.len()
+            );
             rows.push(OpSummaryRow { cols });
         }
 
