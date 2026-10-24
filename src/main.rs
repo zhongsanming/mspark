@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, bail};
+use mspark::text::{civil_from_days, nic_timestamp_column, parse_us_to_ns, py_float, py_round3};
+use mspark::verify::{compare_generated, gate, read_rows};
 use mspark_df::{Ctx, Store, resolve};
 use mspark_model::NetSample;
 use mspark_model::{
@@ -394,7 +396,7 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    STRICT.store(cli.strict, std::sync::atomic::Ordering::Relaxed);
+    mspark::verify::set_strict(cli.strict);
     let Some(command) = cli.command else {
         let prof = cli.prof.as_deref().ok_or_else(|| {
             anyhow::anyhow!("missing PROF_* directory (or pass a subcommand, e.g. `verify`)")
@@ -421,13 +423,13 @@ fn main() -> Result<()> {
             prof,
             device,
             golden,
-        } => verify_op_summary(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::OpSummary, &prof, device.as_deref(), &golden),
         Command::NpuMem { prof, device, out } => npu_mem(&prof, device.as_deref(), &out),
         Command::VerifyNpuMem {
             prof,
             device,
             golden,
-        } => verify_npu_mem(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::NpuMem, &prof, device.as_deref(), &golden),
         Command::NpuModuleMem { prof, device, out } => {
             npu_module_mem(&prof, device.as_deref(), &out)
         }
@@ -435,51 +437,51 @@ fn main() -> Result<()> {
             prof,
             device,
             golden,
-        } => verify_npu_module_mem(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::NpuModuleMem, &prof, device.as_deref(), &golden),
         Command::Dvpp { prof, device, out } => dvpp(&prof, device.as_deref(), &out),
         Command::VerifyDvpp {
             prof,
             device,
             golden,
-        } => verify_dvpp(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::Dvpp, &prof, device.as_deref(), &golden),
         Command::HccsCsv { prof, device, out } => hccs_csv(&prof, device.as_deref(), &out),
         Command::VerifyHccsCsv {
             prof,
             device,
             golden,
-        } => verify_hccs_csv(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::Hccs, &prof, device.as_deref(), &golden),
         Command::HbmCsv { prof, device, out } => hbm_csv(&prof, device.as_deref(), &out),
         Command::VerifyHbmCsv {
             prof,
             device,
             golden,
-        } => verify_hbm_csv(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::Hbm, &prof, device.as_deref(), &golden),
         Command::VerifyLlcCsv {
             prof,
             device,
             golden,
-        } => verify_llc_csv(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::Llc, &prof, device.as_deref(), &golden),
         Command::VerifyNicCsv {
             prof,
             device,
             golden,
-        } => verify_net_csv(&prof, device.as_deref(), &golden, false),
+        } => verify_csv(Artifact::Nic, &prof, device.as_deref(), &golden),
         Command::VerifyRoceCsv {
             prof,
             device,
             golden,
-        } => verify_net_csv(&prof, device.as_deref(), &golden, true),
+        } => verify_csv(Artifact::Roce, &prof, device.as_deref(), &golden),
         Command::VerifyPcieCsv {
             prof,
             device,
             golden,
-        } => verify_pcie_csv(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::Pcie, &prof, device.as_deref(), &golden),
         Command::L2Cache { prof, device, out } => l2_cache(&prof, device.as_deref(), &out),
         Command::VerifyL2Cache {
             prof,
             device,
             golden,
-        } => verify_l2_cache(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::L2Cache, &prof, device.as_deref(), &golden),
         Command::TsCpuPmuEvents { prof, device, out } => {
             ts_cpu_pmu_events(&prof, device.as_deref(), &out)
         }
@@ -487,7 +489,7 @@ fn main() -> Result<()> {
             prof,
             device,
             golden,
-        } => verify_ts_cpu_pmu_events(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::TsCpuPmuEvents, &prof, device.as_deref(), &golden),
         Command::TsCpuTopFunction { prof, device, out } => {
             ts_cpu_top_function(&prof, device.as_deref(), &out)
         }
@@ -495,7 +497,12 @@ fn main() -> Result<()> {
             prof,
             device,
             golden,
-        } => verify_ts_cpu_top_function(&prof, device.as_deref(), &golden),
+        } => verify_csv(
+            Artifact::TsCpuTopFunction,
+            &prof,
+            device.as_deref(),
+            &golden,
+        ),
         Command::ApiStatistic { prof, device, out } => {
             api_statistic(&prof, device.as_deref(), &out)
         }
@@ -503,13 +510,13 @@ fn main() -> Result<()> {
             prof,
             device,
             golden,
-        } => verify_api_statistic(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::ApiStatistic, &prof, device.as_deref(), &golden),
         Command::OpStatistic { prof, device, out } => op_statistic(&prof, device.as_deref(), &out),
         Command::VerifyOpStatistic {
             prof,
             device,
             golden,
-        } => verify_op_statistic(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::OpStatistic, &prof, device.as_deref(), &golden),
         Command::Timeline { prof, device, out } => timeline(&prof, device.as_deref(), &out),
         Command::VerifyTimeline {
             prof,
@@ -789,19 +796,6 @@ fn parse_outputs(spec: &str) -> Result<Vec<Artifact>> {
     Ok(selected)
 }
 
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if month <= 2 { year + 1 } else { year }, month, day)
-}
-
 fn timestamp_dir() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -922,27 +916,6 @@ fn find_start_info(device: &Path) -> Result<std::path::PathBuf> {
     bail!("no start_info in {}", device.display())
 }
 
-/// `format_high_precision_for_csv(trans_into_local_time(duration_ns))`.
-///
-/// msprof computes `duration/1000 + local_time_offset` in `Decimal`, where the
-/// offset is the *shortest decimal repr* of an `f64` (≈0.1 µs resolution at this
-/// magnitude). `duration` is a nanosecond count, so the sum is done in
-/// milli-microseconds; the offset is rounded to that 0.1 µs grid with
-/// ties-to-even to match the repr.
-fn nic_timestamp_column(begin_us: i128, cmr_ns: i128, duration_ns: u64) -> String {
-    let offset_milli = begin_us * 1000 - cmr_ns;
-    let q = offset_milli.div_euclid(100);
-    let r = offset_milli.rem_euclid(100);
-    let rounded = match r.cmp(&50) {
-        std::cmp::Ordering::Greater => q + 1,
-        std::cmp::Ordering::Less => q,
-        std::cmp::Ordering::Equal if q % 2 == 0 => q,
-        std::cmp::Ordering::Equal => q + 1,
-    };
-    let milli = rounded * 100 + duration_ns as i128;
-    format!("{}.{:03}\t", milli / 1000, milli % 1000)
-}
-
 fn net_summary_rows(samples: &[NetSample], device: &Path) -> Result<Vec<[String; 10]>> {
     if samples.is_empty() {
         return Ok(Vec::new());
@@ -1008,51 +981,6 @@ fn net_csv(prof: &Path, only: Option<&str>, out: &Path, roce: bool) -> Result<()
     std::fs::write(out, body)?;
     println!("wrote {total} rows to {}", out.display());
     Ok(())
-}
-
-fn verify_net_csv(prof: &Path, only: Option<&str>, golden: &Path, roce: bool) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let samples: Vec<NetSample> = if roce {
-            resolve::<RoceRow>(&mut store, &ctx)?
-                .iter()
-                .map(|r| r.0)
-                .collect()
-        } else {
-            resolve::<NicRow>(&mut store, &ctx)?
-                .iter()
-                .map(|r| r.0)
-                .collect()
-        };
-        for row in net_summary_rows(&samples, &device)? {
-            let mut cells = vec![dev.clone()];
-            cells.extend(row.iter().cloned());
-            cells.push("0".to_string());
-            produced.push(cells);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "Timestamp(us)",
-            "Bandwidth(MB/s)",
-            "Rx Bandwidth efficiency(%)",
-            "rxPacket/s",
-            "rxError rate(%)",
-            "rxDropped rate(%)",
-            "Tx Bandwidth efficiency(%)",
-            "txPacket/s",
-            "txError rate(%)",
-            "txDropped rate(%)",
-            "funcId",
-        ],
-        &produced,
-    )
 }
 
 fn nic_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
@@ -1424,32 +1352,6 @@ fn llc_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_llc_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let rows = resolve::<LlcRecord>(&mut store, &ctx)?;
-        let clock = mspark_model::load_sampling_clock(ctx.device_dir()?)?;
-        for [task, hit, tp] in llc_csv_table(&rows, &clock) {
-            produced.push(vec![dev.clone(), "read".to_string(), task, hit, tp]);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "Mode",
-            "Task",
-            "Hit Rate(%)",
-            "Throughput(MB/s)",
-        ],
-        &produced,
-    )
-}
-
 fn pcie_track_rows(rows: &[PcieRecord]) -> Vec<CounterRow> {
     let mut out = Vec::with_capacity(rows.len() * 4);
     for row in rows {
@@ -1523,24 +1425,6 @@ fn pcie_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     std::fs::write(out, body)?;
     println!("wrote {total} rows to {}", out.display());
     Ok(())
-}
-
-fn verify_pcie_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for [mode, min, max, avg] in pcie_table(&resolve::<PcieRecord>(&mut store, &ctx)?) {
-            produced.push(vec![dev.clone(), mode, min, max, avg]);
-        }
-    }
-    compare_table(
-        golden,
-        &["Device_id", "Mode", "Min", "Max", "Avg"],
-        &produced,
-    )
 }
 
 fn summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
@@ -1865,21 +1749,6 @@ fn verify(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     })
 }
 
-/// Parse a `us` decimal string (`123.456`) into exact integer nanoseconds.
-/// Doing this through `f64` loses ~256 ns at 1.8e18 ns.
-fn parse_us_to_ns(s: &str) -> Result<i128> {
-    let s = s.trim();
-    let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
-    let int_part: i128 = int_part.parse()?;
-    let mut frac = frac_part.to_string();
-    frac.truncate(3);
-    while frac.len() < 3 {
-        frac.push('0');
-    }
-    let frac: i128 = frac.parse()?;
-    Ok(int_part * 1000 + frac)
-}
-
 fn op_summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let chunks = per_device(prof, only, |ctx, _info| {
         let shared_store = store_for(ctx.device_dir()?);
@@ -1905,59 +1774,6 @@ fn op_summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     }
     std::fs::write(out, body)?;
     println!("wrote {total} rows to {}", out.display());
-    Ok(())
-}
-
-fn verify_op_summary(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let golden_rows = read_rows(golden)?;
-    let Some((header, golden_rows)) = golden_rows.split_first() else {
-        anyhow::bail!("golden file is empty");
-    };
-    let expected: Vec<&str> = OpSummaryRow::HEADER.to_vec();
-    if header.len() != expected.len() {
-        anyhow::bail!(
-            "header width mismatch: golden {} vs mspark {}",
-            header.len(),
-            expected.len()
-        );
-    }
-
-    let mut produced = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, _) = ctx_for(&device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        produced.extend(resolve::<OpSummaryRow>(&mut store, &ctx)?.iter().cloned());
-    }
-
-    let n = golden_rows.len().min(produced.len());
-    let mut exact = vec![0usize; expected.len()];
-    let mut near = vec![0usize; expected.len()];
-    for i in 0..n {
-        for (c, slot) in exact.iter_mut().enumerate() {
-            if let (Some(g), Some(p)) = (golden_rows[i].get(c), produced[i].cols.get(c)) {
-                let p = p.trim();
-                if g == p {
-                    *slot += 1;
-                    near[c] += 1;
-                } else if matches!(c, 8 | 9 | 10 | 45)
-                    && let (Ok(gv), Ok(pv)) = (g.parse::<f64>(), p.parse::<f64>())
-                    && (gv - pv).abs() <= 0.0011
-                {
-                    near[c] += 1;
-                }
-            }
-        }
-    }
-
-    println!("golden rows: {}", golden_rows.len());
-    println!("produced rows: {}", produced.len());
-    for (c, name) in expected.iter().enumerate() {
-        println!(
-            "{c:>3}  {name:<28} exact {}/{n}  near {}/{n}",
-            exact[c], near[c]
-        );
-    }
     Ok(())
 }
 
@@ -3121,39 +2937,6 @@ fn ts_cpu_pmu_events(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> 
     Ok(())
 }
 
-fn verify_ts_cpu_pmu_events(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let records = resolve::<TscpuRecord>(&mut store, &ctx)?;
-        let mut rows: Vec<(u64, u64)> = ts_cpu_event_ids(&device)?
-            .into_iter()
-            .map(|event| {
-                let total = records
-                    .iter()
-                    .flat_map(|record| record.0.events.iter().zip(record.0.counts.iter()))
-                    .filter(|(value, _)| **value == event)
-                    .map(|(_, count)| *count)
-                    .sum();
-                (event, total)
-            })
-            .collect();
-        rows.sort_by_key(|row| std::cmp::Reverse(row.1.to_string()));
-        for (event, total) in rows {
-            produced.push(vec![
-                dev.clone(),
-                format!("0x{event:x}"),
-                ts_cpu_event_name(event).to_string(),
-                total.to_string(),
-            ]);
-        }
-    }
-    compare_table(golden, &["Device_id", "Event", "Name", "Count"], &produced)
-}
-
 fn ts_cpu_top_function(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Function,Cycles,Cycles(%)\n");
     for device in devices(prof, only)? {
@@ -3198,54 +2981,6 @@ fn ts_cpu_top_function(prof: &Path, only: Option<&str>, out: &Path) -> Result<()
     Ok(())
 }
 
-fn verify_ts_cpu_top_function(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let records = resolve::<TscpuRecord>(&mut store, &ctx)?;
-        let mut counts: Vec<(u64, u64)> = Vec::new();
-        let mut index: HashMap<u64, usize> = HashMap::new();
-        for record in records.iter() {
-            for (&event, &count) in record.0.events.iter().zip(record.0.counts.iter()) {
-                if event == 0x11 {
-                    match index.get(&record.0.pc) {
-                        Some(&i) => counts[i].1 += count,
-                        None => {
-                            index.insert(record.0.pc, counts.len());
-                            counts.push((record.0.pc, count));
-                        }
-                    }
-                }
-            }
-        }
-        let total: u64 = counts.iter().map(|(_, count)| *count).sum();
-        if total == 0 {
-            continue;
-        }
-        let mut items = counts;
-        items.sort_by_key(|item| std::cmp::Reverse(item.1));
-        for (pc, cycles) in items.into_iter().take(5) {
-            let rate: f64 = format!("{:.3}", cycles as f64 * 100.0 / total as f64)
-                .parse()
-                .unwrap_or(0.0);
-            produced.push(vec![
-                dev.clone(),
-                format!("0x{pc:x}"),
-                cycles.to_string(),
-                format!("{rate}"),
-            ]);
-        }
-    }
-    compare_table(
-        golden,
-        &["Device_id", "Function", "Cycles", "Cycles(%)"],
-        &produced,
-    )
-}
-
 fn api_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body =
         String::from("Device_id,Level,API Name,Time(us),Count,Avg(us),Min(us),Max(us),Variance\n");
@@ -3273,43 +3008,6 @@ fn api_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     std::fs::write(out, body)?;
     println!("wrote api_statistic to {}", out.display());
     Ok(())
-}
-
-fn verify_api_statistic(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    if let Some(device) = devices(prof, only)?.first() {
-        let (ctx, _) = ctx_for(device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<ApiStatisticRow>(&mut store, &ctx)?.iter() {
-            produced.push(vec![
-                "host".to_string(),
-                mspark_model::api_level_name(row.level).to_string(),
-                row.api_name.clone(),
-                row.time.clone(),
-                row.count.to_string(),
-                row.avg.clone(),
-                row.min.clone(),
-                row.max.clone(),
-                row.variance.clone(),
-            ]);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "Level",
-            "API Name",
-            "Time(us)",
-            "Count",
-            "Avg(us)",
-            "Min(us)",
-            "Max(us)",
-            "Variance",
-        ],
-        &produced,
-    )
 }
 
 fn op_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
@@ -3341,65 +3039,6 @@ fn op_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     std::fs::write(out, body)?;
     println!("wrote op_statistic to {}", out.display());
     Ok(())
-}
-
-fn verify_op_statistic(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, _) = ctx_for(&device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<OpStatisticRow>(&mut store, &ctx)?.iter() {
-            produced.push(vec![
-                row.device_id.to_string(),
-                row.op_type.clone(),
-                row.core_type.clone(),
-                row.count.clone(),
-                row.total_time.clone(),
-                row.min.clone(),
-                row.avg.clone(),
-                row.max.clone(),
-                row.ratio.clone(),
-            ]);
-        }
-    }
-    compare_table_relaxed(
-        golden,
-        &[
-            "Device_id",
-            "OP Type",
-            "Core Type",
-            "Count",
-            "Total Time(us)",
-            "Min Time(us)",
-            "Avg Time(us)",
-            "Max Time(us)",
-            "Ratio(%)",
-        ],
-        &produced,
-        &[4, 5, 6, 7, 8],
-        0.05,
-    )
-}
-
-fn py_float(value: f64) -> String {
-    if value == 0.0 {
-        return "0.0".to_string();
-    }
-    let abs = value.abs();
-    if abs < 1e-4 || abs >= 1e16 {
-        let text = format!("{value:e}");
-        if let Some((mantissa, exponent)) = text.split_once('e') {
-            let (sign, digits) = match exponent.strip_prefix('-') {
-                Some(digits) => ("-", digits),
-                None => ("+", exponent),
-            };
-            return format!("{mantissa}e{sign}{digits:0>2}");
-        }
-        text
-    } else {
-        format!("{value}")
-    }
 }
 
 fn l2_cache(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
@@ -3444,48 +3083,6 @@ fn l2_cache(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_l2_cache(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let rows = resolve::<L2CacheRow>(&mut store, &ctx)?;
-        let tasks = resolve::<TimelineTask>(&mut store, &ctx)?;
-        let op_map: HashMap<(u32, u32), String> = tasks
-            .iter()
-            .map(|task| ((task.stream_id, task.task_id), task.name.clone()))
-            .collect();
-        for row in rows.iter() {
-            let op_name = op_map
-                .get(&(row.stream_id as u32, row.task_id as u32))
-                .cloned()
-                .unwrap_or_else(|| "N/A".to_string());
-            produced.push(vec![
-                dev.clone(),
-                row.stream_id.to_string(),
-                row.task_id.to_string(),
-                "N/A".to_string(),
-                py_float(row.victim_rate),
-                op_name,
-            ]);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "Stream Id",
-            "Task Id",
-            "Hit Rate",
-            "Victim Rate",
-            "Op Name",
-        ],
-        &produced,
-    )
-}
-
 fn dvpp(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from(
         "Device_id,Dvpp Id,Engine Type,Engine ID,All Time(us),All Frame,All Utilization(%)\n",
@@ -3515,44 +3112,6 @@ fn dvpp(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     std::fs::write(out, body)?;
     println!("wrote {total} rows to {}", out.display());
     Ok(())
-}
-
-fn verify_dvpp(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<DvppRow>(&mut store, &ctx)?.iter() {
-            produced.push(vec![
-                dev.clone(),
-                row.dvpp_id.to_string(),
-                mspark_model::dvpp_engine_name(row.engine_type).to_string(),
-                row.engine_id.to_string(),
-                format!("{:?}", row.all_time),
-                format!("{:?}", row.all_frame),
-                row.all_utilization.clone(),
-            ]);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "Dvpp Id",
-            "Engine Type",
-            "Engine ID",
-            "All Time(us)",
-            "All Frame",
-            "All Utilization(%)",
-        ],
-        &produced,
-    )
-}
-
-fn py_round3(value: f64) -> String {
-    format!("{:?}", (value * 1000.0).round_ties_even() / 1000.0)
 }
 
 fn hccs_table(rows: &[HccsRateRow]) -> Vec<[String; 4]> {
@@ -3605,24 +3164,6 @@ fn hccs_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     std::fs::write(out, body)?;
     println!("wrote {total} rows to {}", out.display());
     Ok(())
-}
-
-fn verify_hccs_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for [mode, max, min, avg] in hccs_table(&resolve::<HccsRateRow>(&mut store, &ctx)?) {
-            produced.push(vec![dev.clone(), mode, max, min, avg]);
-        }
-    }
-    compare_table(
-        golden,
-        &["Device_id", "Mode", "Max", "Min", "Average"],
-        &produced,
-    )
 }
 
 fn hbm_track_rows(rows: &[HbmRecord]) -> Vec<CounterRow> {
@@ -3743,24 +3284,6 @@ fn hbm_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_hbm_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for [metric, read, write] in hbm_table(&resolve::<HbmRecord>(&mut store, &ctx)?) {
-            produced.push(vec![dev.clone(), metric, read, write]);
-        }
-    }
-    compare_table(
-        golden,
-        &["Device_id", "Metric", "Read(MB/s)", "Write(MB/s)"],
-        &produced,
-    )
-}
-
 fn npu_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,event,ddr(KB),hbm(KB),memory(KB),timestamp(us)\n");
     let mut total = 0usize;
@@ -3787,38 +3310,6 @@ fn npu_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     std::fs::write(out, body)?;
     println!("wrote {total} rows to {}", out.display());
     Ok(())
-}
-
-fn verify_npu_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<NpuMemRow>(&mut store, &ctx)?.iter() {
-            produced.push(vec![
-                dev.clone(),
-                mspark_model::npu_mem_event(row.event).to_string(),
-                (row.ddr / 1024).to_string(),
-                (row.hbm / 1024).to_string(),
-                ((row.ddr + row.hbm) / 1024).to_string(),
-                fmt_us(row.ts_ns, false).to_string(),
-            ]);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "event",
-            "ddr(KB)",
-            "hbm(KB)",
-            "memory(KB)",
-            "timestamp(us)",
-        ],
-        &produced,
-    )
 }
 
 fn npu_module_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
@@ -3852,182 +3343,31 @@ fn npu_module_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_npu_module_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<NpuModuleMemRow>(&mut store, &ctx)?.iter() {
-            produced.push(vec![
-                dev.to_string(),
-                mspark_model::module_name(row.module_id).to_string(),
-                fmt_us(row.ts_ns, false).to_string(),
-                (row.total_size / 1024).to_string(),
-                format!("NPU:{dev}"),
-            ]);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "Component",
-            "Timestamp(us)",
-            "Total Reserved(KB)",
-            "Device",
-        ],
-        &produced,
-    )
-}
-
 /// Comparison strictness for the `--strict` flag: verifiers always print their
 /// per-column statistics, but only a strict run turns a mismatch into a non-zero
 /// exit status (so CI can gate on regressions while interactive use still shows
 /// partial matches).
-static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn strict() -> bool {
-    STRICT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Fail the run when `ok` is false and `--strict` was requested.
-fn gate(ok: bool, what: impl FnOnce() -> String) -> Result<()> {
-    if ok || !strict() {
-        return Ok(());
-    }
-    anyhow::bail!("{}", what());
-}
-
-/// Compare a produced table against a golden CSV.
-///
-/// Columns are matched **by header name**, not by position, so a reordered
-/// golden file is reported instead of silently compared against the wrong
-/// columns. `tolerance` marks columns that only have to be within `eps`
-/// (HPFloat residuals).
-fn compare_table_with(
-    golden: &Path,
-    header: &[&str],
-    produced: &[Vec<String>],
-    tolerance: Option<(&[usize], f64)>,
-) -> Result<()> {
-    let rows = read_rows(golden)?;
-    let Some((golden_header, body)) = rows.split_first() else {
-        anyhow::bail!("golden file is empty");
-    };
-    if golden_header.len() != header.len() {
-        anyhow::bail!(
-            "header width mismatch: golden {} vs mspark {}",
-            golden_header.len(),
-            header.len()
-        );
-    }
-    // golden column -> produced column, by name.
-    let mut order = Vec::with_capacity(header.len());
-    for (position, name) in golden_header.iter().enumerate() {
-        match header.iter().position(|ours| ours == name) {
-            Some(index) => order.push(index),
-            None => anyhow::bail!(
-                "golden column {position} `{name}` is not produced; mspark header: {header:?}"
-            ),
+/// Verify any CSV artifact by exporting it exactly as production does and
+/// comparing the result against the golden file. Replaces the per-artifact
+/// verifiers, which were copy-paste twins of the exporters and could drift.
+fn verify_csv(artifact: Artifact, prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
+    let dir = std::env::temp_dir().join(format!(
+        "mspark-verify-{}-{}",
+        std::process::id(),
+        artifact.name()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    write_artifact(artifact, prof, only, &dir)?;
+    let produced = read_rows(&dir.join(artifact.file()))?;
+    let _ = std::fs::remove_dir_all(&dir);
+    // Columns that only need to agree within an HPFloat residual.
+    match artifact {
+        Artifact::OpSummary => compare_generated(golden, &produced, Some((&[8, 9, 10], 0.001))),
+        Artifact::ApiStatistic | Artifact::OpStatistic => {
+            compare_generated(golden, &produced, Some((&[3, 4, 5, 6, 7, 8], 0.05)))
         }
+        _ => compare_generated(golden, &produced, None),
     }
-
-    let (tolerance_cols, eps) = tolerance.unwrap_or((&[], 0.0));
-    let n = body.len().min(produced.len());
-    let mut exact = vec![0usize; header.len()];
-    let mut near = vec![0usize; header.len()];
-    for i in 0..n {
-        for (column, &target) in order.iter().enumerate() {
-            let (Some(g), Some(p)) = (body[i].get(column), produced[i].get(target)) else {
-                continue;
-            };
-            if g == p {
-                exact[target] += 1;
-                near[target] += 1;
-            } else if tolerance_cols.contains(&target)
-                && let (Ok(gv), Ok(pv)) = (g.parse::<f64>(), p.parse::<f64>())
-                && (gv - pv).abs() <= eps
-            {
-                near[target] += 1;
-            }
-        }
-    }
-    println!("golden rows: {}", body.len());
-    println!("produced rows: {}", produced.len());
-    let mut ok = body.len() == produced.len();
-    for (c, name) in header.iter().enumerate() {
-        if tolerance.is_some() {
-            println!(
-                "{c:>2}  {name:<22} exact {}/{n}  near {}/{n}",
-                exact[c], near[c]
-            );
-            ok &= near[c] == body.len() && produced.len() == body.len();
-        } else {
-            println!("{c:>2}  {name:<22} {}/{n}", exact[c]);
-            ok &= exact[c] == body.len() && produced.len() == body.len();
-        }
-    }
-    gate(ok, || {
-        format!("table {golden:?} is not an exact match (see the per-column counts above)")
-    })
-}
-
-fn compare_table(golden: &Path, header: &[&str], produced: &[Vec<String>]) -> Result<()> {
-    compare_table_with(golden, header, produced, None)
-}
-
-fn compare_table_relaxed(
-    golden: &Path,
-    header: &[&str],
-    produced: &[Vec<String>],
-    tolerance_cols: &[usize],
-    tolerance: f64,
-) -> Result<()> {
-    compare_table_with(golden, header, produced, Some((tolerance_cols, tolerance)))
-}
-
-/// Minimal RFC 4180 reader: quoted fields may contain commas, doubled quotes and
-/// newlines. Fields are **not** trimmed — msprof emits ` N/A` style values with
-/// meaningful leading spaces in some tables, and trimming hid differences.
-fn read_rows(path: &Path) -> Result<Vec<Vec<String>>> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut row: Vec<String> = Vec::new();
-    let mut field = String::new();
-    let mut in_quotes = false;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if in_quotes => {
-                if chars.peek() == Some(&'"') {
-                    field.push('"');
-                    chars.next();
-                } else {
-                    in_quotes = false;
-                }
-            }
-            '"' if field.is_empty() => in_quotes = true,
-            ',' if !in_quotes => row.push(std::mem::take(&mut field)),
-            '\r' if !in_quotes => {}
-            '\n' if !in_quotes => {
-                row.push(std::mem::take(&mut field));
-                if !(row.len() == 1 && row[0].is_empty()) {
-                    rows.push(std::mem::take(&mut row));
-                } else {
-                    row.clear();
-                }
-            }
-            other => field.push(other),
-        }
-    }
-    if !field.is_empty() || !row.is_empty() {
-        row.push(field);
-        rows.push(row);
-    }
-    Ok(rows)
 }
 
 fn print_info(info: &DeviceInfo) {

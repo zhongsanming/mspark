@@ -10,7 +10,14 @@ use crate::host::{HashDic, TypeDic};
 #[derive(Debug, Clone)]
 pub struct ApiEventRow {
     pub level: u16,
+    /// Trace label: the resolved `type_info_dic` name.
     pub api_name: String,
+    /// `api_statistic` label. msprof's grouping SQL is
+    /// `CASE WHEN level = 'acl' THEN id
+    ///       WHEN level IN ('runtime','model','node') THEN struct_type
+    ///       ELSE item_id END`, so communication rows are named by their
+    /// `item_id` hash, not by the dictionary entry (`master`/`slave`).
+    pub stat_name: String,
     pub tag: String,
     pub item_name: String,
     pub thread_id: u32,
@@ -54,6 +61,11 @@ impl Node for ApiEventRow {
             .into_iter()
             .map(|r| {
                 let api_name = types.get(r.level, r.ty as u64).unwrap_or("N/A").to_string();
+                let stat_name = if r.level == 5_500 {
+                    hash.get(r.item_id).unwrap_or("N/A").to_string()
+                } else {
+                    api_name.clone()
+                };
                 let tag = if r.level == 20_000 {
                     acl_api_tag(r.ty >> 16)
                 } else {
@@ -62,6 +74,7 @@ impl Node for ApiEventRow {
                 ApiEventRow {
                     level: r.level,
                     api_name,
+                    stat_name,
                     tag,
                     item_name: if r.level == 10_000 {
                         hash.get(r.item_id).unwrap_or("N/A").to_string()

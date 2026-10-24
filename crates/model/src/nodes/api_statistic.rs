@@ -32,7 +32,7 @@ impl Node for ApiStatisticRow {
             let end = clock.to_ns(event.end);
             let duration = round3((end as i128 - start as i128) as f64 / 1000.0);
             grouped
-                .entry((event.api_name.clone(), event.level))
+                .entry((event.stat_name.clone(), event.level))
                 .or_default()
                 .push(duration);
         }
