@@ -127,6 +127,23 @@ Note also that this capture is much larger than the one used for the earlier
 54 981-row measurements (85 241 tasks), so cross-capture percentages are not
 comparable; always re-measure on the capture being discussed.
 
+### T1k. `op_summary` row count on the multi-device capture — same root cause
+Golden 66 455 rows against our 54 422. Breakdown of the difference:
+
+```
+              rows    keys    extra rows from duplicate (stream, task) keys
+golden       66 455  55 761  10 694
+ours         54 422  54 259     163
+keys only in golden: 1 502        keys only in ours: 0
+```
+
+So the gap is almost entirely **duplicate-key rows** plus 1 502 keys we never emit,
+and we never invent a key. That is the same `(stream, task, batch)` pairing
+problem as `kernel_type` (T1i): msprof emits one row per task *instance*, we emit
+roughly one per key because the second instance has no distinct key.
+
+Not a separate bug, and not fixable in `op_summary` — it needs the batch key.
+
 ### T1j. `task_time` residual on the multi-device capture
 Reported as 6 327 rows beyond 2 ns with `max |Δ| = 24.9 ms`. Investigated:
 
