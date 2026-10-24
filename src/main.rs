@@ -526,6 +526,42 @@ fn main() -> Result<()> {
     }
 }
 
+/// Track order in the msprof viewer. The value is written to
+/// `process_sort_index` *and* packed into bits 5..10 of the track pid, which is
+/// why it appears in both the writer and the verifier; naming it once removes a
+/// whole class of copy-paste mistakes.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum Track {
+    Cann = 7,
+    CpuUsage = 9,
+    Hardware = 13,
+    AiCoreFreq = 14,
+    Communication = 16,
+    AccPmu = 18,
+    Hccs = 19,
+    Nic = 20,
+    Roce = 21,
+    Pcie = 22,
+    Hbm = 23,
+    StarsSocInfo = 24,
+    ChipTrans = 25,
+    Llc = 26,
+    Sio = 27,
+    Qos = 28,
+    Overlap = 29,
+}
+
+/// Host-side tracks (CANN, CPU usage, …) live on this pseudo device id.
+const HOST_PID: u32 = 31;
+
+impl Track {
+    /// `(pid << 10) | (sort_index << 5) | device`.
+    fn pid(self, host_pid: u32, device: u32) -> u32 {
+        (host_pid << 10) | ((self as u32) << 5) | device
+    }
+}
+
 fn list_devices(prof: &Path) -> Result<Vec<PathBuf>> {
     let mut devices = Vec::new();
     for entry in std::fs::read_dir(prof)? {
@@ -811,6 +847,31 @@ fn timestamp_dir() -> String {
     )
 }
 
+/// Write per-device CSV chunks straight to disk instead of building the whole
+/// file in memory first: these tables reach hundreds of MB and the extra copy
+/// used to double the peak.
+fn write_chunks(
+    out: &Path,
+    header: &str,
+    chunks: impl IntoIterator<Item = String>,
+) -> Result<usize> {
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
+    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+    writer.write_all(header.as_bytes())?;
+    writer.write_all(b"\n")?;
+    let mut total = 0usize;
+    for chunk in chunks {
+        total += chunk.lines().count();
+        writer.write_all(chunk.as_bytes())?;
+    }
+    writer.flush()?;
+    println!("wrote {total} rows to {}", out.display());
+    Ok(total)
+}
+
 fn export(
     prof: &Path,
     outputs: Option<&str>,
@@ -1026,7 +1087,7 @@ fn net_rows(samples: &[NetSample], ty: &str) -> Vec<CounterRow> {
                 name: compact_str::format_compact!("Port 0/{dir}"),
                 tid: 0,
                 ts: ts.clone(),
-                args: vec![
+                args: smallvec::smallvec![
                     (eff_key, Num::Float(efficiency)),
                     (pkt_key, Num::Float(counters[0] as f64)),
                     (err_key, Num::Float(0.0)),
@@ -1067,7 +1128,7 @@ fn host_cpu_rows(samples: &[HostCpuUsageRow], offset_milli: i128) -> Vec<Counter
             name: compact_str::format_compact!("CPU {}", sample.cpu_no),
             tid: 0,
             ts: host_ts_us(sample.start_ns, offset_milli),
-            args: vec![("Usage(%)", Num::Float(sample.usage))],
+            args: smallvec::smallvec![("Usage(%)", Num::Float(sample.usage))],
         })
         .collect()
 }
@@ -1285,13 +1346,13 @@ fn llc_track_rows(rows: &[LlcRecord], clock: &mspark_model::SamplingClock) -> Ve
             name: compact_str::format_compact!("LLC {bank} Read/Hit Rate"),
             tid: 0,
             ts: ts.clone(),
-            args: vec![("Hit Rate(%)", Num::Float(hit))],
+            args: smallvec::smallvec![("Hit Rate(%)", Num::Float(hit))],
         });
         out.push(CounterRow {
             name: compact_str::format_compact!("LLC {bank} Read/Throughput"),
             tid: 0,
             ts,
-            args: vec![("Throughput(MB/s)", Num::Float(tp))],
+            args: smallvec::smallvec![("Throughput(MB/s)", Num::Float(tp))],
         });
     }
     out
@@ -1379,7 +1440,10 @@ fn pcie_track_rows(rows: &[PcieRecord]) -> Vec<CounterRow> {
                 name: compact_str::CompactString::from(name),
                 tid: 0,
                 ts: ts.clone(),
-                args: vec![("Rx", Num::Float(rx_value)), ("Tx", Num::Float(value(tx)))],
+                args: smallvec::smallvec![
+                    ("Rx", Num::Float(rx_value)),
+                    ("Tx", Num::Float(value(tx)))
+                ],
             });
         }
     }
@@ -1627,21 +1691,7 @@ fn task_time(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         }
         Ok(body)
     })?;
-
-    let mut body = String::new();
-    body.push_str(TaskTimeRow::HEADER);
-    body.push('\n');
-    let mut total = 0usize;
-    for chunk in chunks {
-        total += chunk.lines().count();
-        body.push_str(&chunk);
-    }
-
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(out, body)?;
-    println!("wrote {total} rows to {}", out.display());
+    write_chunks(out, TaskTimeRow::HEADER, chunks)?;
     Ok(())
 }
 
@@ -1759,21 +1809,7 @@ fn op_summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         }
         Ok(body)
     })?;
-
-    let mut body = String::new();
-    body.push_str(&OpSummaryRow::HEADER.join(","));
-    body.push('\n');
-    let mut total = 0usize;
-    for chunk in chunks {
-        total += chunk.lines().count();
-        body.push_str(&chunk);
-    }
-
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(out, body)?;
-    println!("wrote {total} rows to {}", out.display());
+    write_chunks(out, &OpSummaryRow::HEADER.join(","), chunks)?;
     Ok(())
 }
 
@@ -1821,8 +1857,10 @@ impl Serialize for Args {
 
 /// Argument list with static keys: the keys are literals, so this avoids a
 /// `String` allocation per argument per event.
-fn args(items: Vec<(&'static str, Num)>) -> Args {
-    Args(smallvec::SmallVec::from_vec(items))
+/// Build the ordered trace arguments without a heap allocation for the common
+/// four-argument event.
+fn args<const N: usize>(items: [(&'static str, Num); N]) -> Args {
+    Args(smallvec::SmallVec::from_iter(items))
 }
 
 /// One Chrome-trace event. Field order here is the serialized key order.
@@ -1894,7 +1932,7 @@ struct CounterRow {
     name: compact_str::CompactString,
     tid: u32,
     ts: compact_str::CompactString,
-    args: Vec<(&'static str, Num)>,
+    args: smallvec::SmallVec<[(&'static str, Num); 4]>,
 }
 
 const SIO_COUNTERS: [&str; 8] = [
@@ -1942,7 +1980,7 @@ fn acc_pmu_rows(samples: &[AccPmuSample]) -> Vec<CounterRow> {
                 name: compact_str::CompactString::from(*name),
                 tid: 0,
                 ts: sample.ts_us.clone(),
-                args: vec![("value", Num::Int(sample.values[i]))],
+                args: smallvec::smallvec![("value", Num::Int(sample.values[i]))],
             });
         }
     }
@@ -1956,7 +1994,7 @@ fn inter_soc_rows(samples: &[InterSocSample]) -> Vec<CounterRow> {
             name: compact_str::CompactString::from("L2 Buffer Bw Level"),
             tid: 0,
             ts: sample.ts_us.clone(),
-            args: vec![(
+            args: smallvec::smallvec![(
                 "L2 Buffer Bw Level",
                 Num::Int(sample.l2_buffer_bw_level as u64),
             )],
@@ -1965,7 +2003,7 @@ fn inter_soc_rows(samples: &[InterSocSample]) -> Vec<CounterRow> {
             name: compact_str::CompactString::from("Mata Bw Level"),
             tid: 0,
             ts: sample.ts_us.clone(),
-            args: vec![("Mata Bw Level", Num::Int(sample.mata_bw_level as u64))],
+            args: smallvec::smallvec![("Mata Bw Level", Num::Int(sample.mata_bw_level as u64))],
         });
     }
     rows
@@ -1997,7 +2035,7 @@ fn chip_trans_rows(samples: &[ChipTransSample]) -> Vec<CounterRow> {
                 name: compact_str::CompactString::from(name),
                 tid,
                 ts: sample.ts_us.clone(),
-                args: vec![
+                args: smallvec::smallvec![
                     (name, Num::Int(value)),
                     (id_key, Num::Int(sample.id as u64)),
                 ],
@@ -2007,13 +2045,20 @@ fn chip_trans_rows(samples: &[ChipTransSample]) -> Vec<CounterRow> {
     rows
 }
 
-fn write_counter(events: &mut Vec<TraceEvent>, pid: u32, row: &CounterRow) {
+fn write_counter(events: &mut Vec<TraceEvent>, pid: u32, row: CounterRow) {
+    let CounterRow {
+        name,
+        tid,
+        ts,
+        args,
+        ..
+    } = row;
     events.push(TraceEvent::counter(
-        row.name.clone(),
+        name,
         pid,
-        row.tid,
-        row.ts.clone(),
-        Args(smallvec::SmallVec::from_vec(row.args.clone())),
+        tid,
+        ts,
+        Args(smallvec::SmallVec::from_iter(args)),
     ));
 }
 
@@ -2099,19 +2144,19 @@ fn push_process_meta(
         "process_name",
         pid,
         0,
-        args(vec![("name", Num::Str(name.to_string()))]),
+        args([("name", Num::Str(name.to_string()))]),
     ));
     events.push(TraceEvent::meta(
         "process_labels",
         pid,
         0,
-        args(vec![("labels", Num::Str(label.to_string()))]),
+        args([("labels", Num::Str(label.to_string()))]),
     ));
     events.push(TraceEvent::meta(
         "process_sort_index",
         pid,
         0,
-        args(vec![("sort_index", Num::Int(sort_index as u64))]),
+        args([("sort_index", Num::Int(sort_index as u64))]),
     ));
 }
 
@@ -2120,13 +2165,13 @@ fn push_thread_meta(events: &mut Vec<TraceEvent>, pid: u32, tid: u32, name: &str
         "thread_name",
         pid,
         tid,
-        args(vec![("name", Num::Str(name.to_string()))]),
+        args([("name", Num::Str(name.to_string()))]),
     ));
     events.push(TraceEvent::meta(
         "thread_sort_index",
         pid,
         tid,
-        args(vec![("sort_index", Num::Int(sort_index as u64))]),
+        args([("sort_index", Num::Int(sort_index as u64))]),
     ));
 }
 
@@ -2147,7 +2192,7 @@ fn qos_rows(samples: &[QosRow], events: &[String]) -> Vec<CounterRow> {
                 name: compact_str::format_compact!("QoS {event}"),
                 tid: 0,
                 ts: sample.ts_us.clone(),
-                args: vec![("value", Num::Int(sample.values[i] as u64))],
+                args: smallvec::smallvec![("value", Num::Int(sample.values[i] as u64))],
             });
         }
     }
@@ -2166,13 +2211,13 @@ fn hccs_rows(samples: &[HccsRateRow]) -> Vec<CounterRow> {
             name: compact_str::CompactString::from("Tx"),
             tid: 0,
             ts: ts.clone(),
-            args: vec![("Tx(MB/s)", Num::Float(round3(sample.tx)))],
+            args: smallvec::smallvec![("Tx(MB/s)", Num::Float(round3(sample.tx)))],
         });
         rows.push(CounterRow {
             name: compact_str::CompactString::from("Rx"),
             tid: 0,
             ts,
-            args: vec![("Rx(MB/s)", Num::Float(round3(sample.rx)))],
+            args: smallvec::smallvec![("Rx(MB/s)", Num::Float(round3(sample.rx)))],
         });
     }
     rows
@@ -2192,7 +2237,7 @@ fn npu_mem_rows(samples: &[NpuMemRow]) -> Vec<CounterRow> {
                 name: compact_str::format_compact!("{owner}/{metric}"),
                 tid: 0,
                 ts: ts.clone(),
-                args: vec![("KB", Num::Float(value as f64 / 1024.0))],
+                args: smallvec::smallvec![("KB", Num::Float(value as f64 / 1024.0))],
             });
         }
     }
@@ -2246,8 +2291,8 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         let tasks = resolve::<TimelineTask>(&mut store, &ctx)?;
 
         let dev = info.device_id.unwrap_or(0);
-        let hw_pid = (info.pid << 10) | (13 << 5) | dev;
-        let freq_pid = (info.pid << 10) | (14 << 5) | dev;
+        let hw_pid = Track::Hardware.pid(info.pid, dev);
+        let freq_pid = Track::AiCoreFreq.pid(info.pid, dev);
 
         for ts in [clock.begin_us, clock.end_us] {
             events.push(TraceEvent::counter(
@@ -2255,7 +2300,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
                 freq_pid,
                 0,
                 fmt_us(ts * 1000, false),
-                args(vec![("MHz", Num::Int(info.aic_freq_mhz as u64))]),
+                args([("MHz", Num::Int(info.aic_freq_mhz as u64))]),
             ));
         }
 
@@ -2281,7 +2326,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
                 task.tid,
                 task.ts_us.clone(),
                 task.dur_us,
-                args(vec![
+                args([
                     ("Model Id", Num::Int(task.model_id as u64)),
                     ("Task Type", Num::Str(task.task_type.clone())),
                     ("Physic Stream Id", Num::Int(task.stream_id as u64)),
@@ -2296,7 +2341,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         // --- CANN host track ---
         let api_events = resolve::<ApiEventRow>(&mut store, &ctx)?;
         let host_clock = load_host_clock(prof_root_of(device))?;
-        let cann_pid = (info.pid << 10) | (7 << 5) | 31;
+        let cann_pid = Track::Cann.pid(info.pid, HOST_PID);
         push_process_meta(&mut events, cann_pid, "CANN", "CPU", 7);
         let mut api_tids: Vec<u32> = api_events.iter().map(|e| e.thread_id).collect();
         api_tids.sort_unstable();
@@ -2327,7 +2372,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
                 event.thread_id,
                 ts,
                 dur,
-                args(vec![
+                args([
                     ("Thread Id", Num::Int(event.thread_id as u64)),
                     ("Mode", Num::Str(mode)),
                     ("level", Num::Str(level_name.to_string())),
@@ -2343,35 +2388,35 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         let acc = resolve::<AccPmuSample>(&mut store, &ctx)?;
         let inter = resolve::<InterSocSample>(&mut store, &ctx)?;
         let chip = resolve::<ChipTransSample>(&mut store, &ctx)?;
-        let track_pid = |sort: u32| (info.pid << 10) | (sort << 5) | dev;
-        for (sort, name) in [
-            (27u32, "SIO"),
-            (18u32, "Acc PMU"),
-            (24u32, "Stars Soc Info"),
-            (25u32, "Stars Chip Trans"),
+        let track_pid = |track: Track| track.pid(info.pid, dev);
+        for (track, name) in [
+            (Track::Sio, "SIO"),
+            (Track::AccPmu, "Acc PMU"),
+            (Track::StarsSocInfo, "Stars Soc Info"),
+            (Track::ChipTrans, "Stars Chip Trans"),
         ] {
-            push_process_meta(&mut events, track_pid(sort), name, &label, sort);
+            push_process_meta(&mut events, track_pid(track), name, &label, track as u32);
         }
         for row in sio_rows(&sio) {
-            write_counter(&mut events, track_pid(27), &row);
+            write_counter(&mut events, track_pid(Track::Sio), row);
             total += 1;
         }
         for row in acc_pmu_rows(&acc) {
-            write_counter(&mut events, track_pid(18), &row);
+            write_counter(&mut events, track_pid(Track::AccPmu), row);
             total += 1;
         }
         for row in inter_soc_rows(&inter) {
-            write_counter(&mut events, track_pid(24), &row);
+            write_counter(&mut events, track_pid(Track::StarsSocInfo), row);
             total += 1;
         }
         for row in chip_trans_rows(&chip) {
-            write_counter(&mut events, track_pid(25), &row);
+            write_counter(&mut events, track_pid(Track::ChipTrans), row);
             total += 1;
         }
 
         // --- Overlap Analysis ---
         let overlap = resolve::<OverlapRow>(&mut store, &ctx)?;
-        let overlap_pid = track_pid(29);
+        let overlap_pid = track_pid(Track::Overlap);
         push_process_meta(&mut events, overlap_pid, "Overlap Analysis", &label, 29);
         for (tid, name) in [
             (0u32, "Communication"),
@@ -2400,97 +2445,97 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         // --- QoS ---
         let qos = resolve::<QosRow>(&mut store, &ctx)?;
         let qos_events = sample_csv_list(ctx.device_dir()?, "qosEvents")?;
-        let qos_pid = track_pid(28);
+        let qos_pid = track_pid(Track::Qos);
         push_process_meta(&mut events, qos_pid, "QoS", &label, 28);
         for row in qos_rows(&qos, &qos_events) {
-            write_counter(&mut events, qos_pid, &row);
+            write_counter(&mut events, qos_pid, row);
             total += 1;
         }
 
         // --- NPU MEM ---
         let npu_mem = resolve::<NpuMemRow>(&mut store, &ctx)?;
-        let npu_mem_pid = track_pid(16);
+        let npu_mem_pid = track_pid(Track::Communication);
         // --- CPU Usage (host track) ---
         let cpu_usage = resolve::<HostCpuUsageRow>(&mut store, &ctx)?;
-        let cpu_pid = (info.pid << 10) | (9 << 5) | 31;
+        let cpu_pid = Track::CpuUsage.pid(info.pid, HOST_PID);
         events.push(TraceEvent::meta(
             "process_name",
             cpu_pid,
             0,
-            args(vec![("name", Num::Str("CPU Usage".to_string()))]),
+            args([("name", Num::Str("CPU Usage".to_string()))]),
         ));
         events.push(TraceEvent::meta(
             "process_labels",
             cpu_pid,
             0,
-            args(vec![("labels", Num::Str("CPU".to_string()))]),
+            args([("labels", Num::Str("CPU".to_string()))]),
         ));
         events.push(TraceEvent::meta(
             "process_sort_index",
             cpu_pid,
             0,
-            args(vec![("sort_index", Num::Int(9))]),
+            args([("sort_index", Num::Int(9))]),
         ));
         let cpu_offset = host_local_offset_milli(ctx.root())?;
         for row in host_cpu_rows(&cpu_usage, cpu_offset) {
-            write_counter(&mut events, cpu_pid, &row);
+            write_counter(&mut events, cpu_pid, row);
             total += 1;
         }
 
         // --- HCCS ---
         let hccs = resolve::<HccsRateRow>(&mut store, &ctx)?;
-        let hccs_pid = track_pid(19);
+        let hccs_pid = track_pid(Track::Hccs);
         push_process_meta(&mut events, hccs_pid, "HCCS", &label, 19);
         let nic: Vec<NetSample> = resolve::<NicRow>(&mut store, &ctx)?
             .iter()
             .map(|row| row.0)
             .collect();
-        let nic_pid = track_pid(20);
+        let nic_pid = track_pid(Track::Nic);
         push_process_meta(&mut events, nic_pid, "NIC", &label, 20);
         for row in net_rows(&nic, "NIC") {
-            write_counter(&mut events, nic_pid, &row);
+            write_counter(&mut events, nic_pid, row);
             total += 1;
         }
         let roce: Vec<NetSample> = resolve::<RoceRow>(&mut store, &ctx)?
             .iter()
             .map(|row| row.0)
             .collect();
-        let roce_pid = track_pid(21);
+        let roce_pid = track_pid(Track::Roce);
         push_process_meta(&mut events, roce_pid, "RoCE", &label, 21);
         for row in net_rows(&roce, "RoCE") {
-            write_counter(&mut events, roce_pid, &row);
+            write_counter(&mut events, roce_pid, row);
             total += 1;
         }
         let llc = resolve::<LlcRecord>(&mut store, &ctx)?;
         let llc_clock = mspark_model::load_sampling_clock(ctx.device_dir()?)?;
-        let llc_pid = track_pid(26);
+        let llc_pid = track_pid(Track::Llc);
         push_process_meta(&mut events, llc_pid, "LLC", &label, 26);
         for row in llc_track_rows(&llc, &llc_clock) {
-            write_counter(&mut events, llc_pid, &row);
+            write_counter(&mut events, llc_pid, row);
             total += 1;
         }
         let hbm = resolve::<HbmRecord>(&mut store, &ctx)?;
-        let hbm_pid = track_pid(23);
+        let hbm_pid = track_pid(Track::Hbm);
         push_process_meta(&mut events, hbm_pid, "HBM", &label, 23);
         for row in hbm_track_rows(&hbm) {
-            write_counter(&mut events, hbm_pid, &row);
+            write_counter(&mut events, hbm_pid, row);
             total += 1;
         }
         let pcie = resolve::<PcieRecord>(&mut store, &ctx)?;
-        let pcie_pid = track_pid(22);
+        let pcie_pid = track_pid(Track::Pcie);
         push_process_meta(&mut events, pcie_pid, "PCIe", &label, 22);
         for row in pcie_track_rows(&pcie) {
-            write_counter(&mut events, pcie_pid, &row);
+            write_counter(&mut events, pcie_pid, row);
             total += 1;
         }
         for row in hccs_rows(&hccs) {
-            write_counter(&mut events, hccs_pid, &row);
+            write_counter(&mut events, hccs_pid, row);
             total += 1;
         }
 
         push_process_meta(&mut events, npu_mem_pid, "NPU MEM", &label, 16);
         for row in npu_mem_rows(&npu_mem) {
-            write_counter(&mut events, npu_mem_pid, &row);
+            write_counter(&mut events, npu_mem_pid, row);
             total += 1;
         }
     }
@@ -2580,7 +2625,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
     for device in devices(prof, only)? {
         let (ctx, info) = ctx_for(&device)?;
         let dev = info.device_id.unwrap_or(0);
-        let hw_pid = ((info.pid << 10) | (13 << 5) | dev) as u64;
+        let hw_pid = Track::Hardware.pid(info.pid, dev) as u64;
         let expected: Vec<&serde_json::Value> = array
             .iter()
             .filter(|event| {
@@ -2631,7 +2676,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
 
         // CANN host track
         let host_clock = load_host_clock(prof)?;
-        let cann_pid = ((info.pid << 10) | (7 << 5) | 31) as u64;
+        let cann_pid = Track::Cann.pid(info.pid, HOST_PID) as u64;
         let expected_api: Vec<&serde_json::Value> = array
             .iter()
             .filter(|event| {
@@ -2700,15 +2745,15 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
         let npu_mem_rows_v = npu_mem_rows(&resolve::<NpuMemRow>(&mut store, &ctx)?);
         let hccs_rows_v = hccs_rows(&resolve::<HccsRateRow>(&mut store, &ctx)?);
         for (sort, name, rows) in [
-            (27u32, "SIO", sio_rows_v),
-            (18u32, "Acc PMU", acc_rows_v),
-            (24u32, "Stars Soc Info", inter_rows_v),
-            (25u32, "Stars Chip Trans", chip_rows_v),
-            (28u32, "QoS", qos_rows_v),
-            (16u32, "NPU MEM", npu_mem_rows_v),
-            (19u32, "HCCS", hccs_rows_v),
+            (Track::Sio, "SIO", sio_rows_v),
+            (Track::AccPmu, "Acc PMU", acc_rows_v),
+            (Track::StarsSocInfo, "Stars Soc Info", inter_rows_v),
+            (Track::ChipTrans, "Stars Chip Trans", chip_rows_v),
+            (Track::Qos, "QoS", qos_rows_v),
+            (Track::Communication, "NPU MEM", npu_mem_rows_v),
+            (Track::Hccs, "HCCS", hccs_rows_v),
             (
-                9u32,
+                Track::CpuUsage,
                 "CPU Usage",
                 host_cpu_rows(
                     &resolve::<HostCpuUsageRow>(&mut store, &ctx)?,
@@ -2716,7 +2761,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                 ),
             ),
             (
-                20u32,
+                Track::Nic,
                 "NIC",
                 net_rows(
                     &resolve::<NicRow>(&mut store, &ctx)?
@@ -2727,7 +2772,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                 ),
             ),
             (
-                21u32,
+                Track::Roce,
                 "RoCE",
                 net_rows(
                     &resolve::<RoceRow>(&mut store, &ctx)?
@@ -2738,7 +2783,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                 ),
             ),
             (
-                26u32,
+                Track::Llc,
                 "LLC",
                 llc_track_rows(
                     &resolve::<LlcRecord>(&mut store, &ctx)?,
@@ -2746,18 +2791,18 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                 ),
             ),
             (
-                23u32,
+                Track::Hbm,
                 "HBM",
                 hbm_track_rows(&resolve::<HbmRecord>(&mut store, &ctx)?),
             ),
             (
-                22u32,
+                Track::Pcie,
                 "PCIe",
                 pcie_track_rows(&resolve::<PcieRecord>(&mut store, &ctx)?),
             ),
         ] {
-            let pid = golden_pid_for(&golden_meta, name, dev)
-                .unwrap_or(((info.pid << 10) | (sort << 5) | dev) as u64);
+            let pid =
+                golden_pid_for(&golden_meta, name, dev).unwrap_or(sort.pid(info.pid, dev) as u64);
             let golden = golden_counter_signatures(array, pid);
             let produced = produced_signatures(&rows);
             let matched = multiset_match(&golden, &produced);
@@ -2766,7 +2811,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
 
         // Overlap Analysis
         let overlap_pid = golden_pid_for(&golden_meta, "Overlap Analysis", dev)
-            .unwrap_or(((info.pid << 10) | (29 << 5) | dev) as u64);
+            .unwrap_or(Track::Overlap.pid(info.pid, dev) as u64);
         let mut golden_overlap: Vec<(String, u32, compact_str::CompactString, f64)> = array
             .iter()
             .filter(|event| {
@@ -3196,7 +3241,7 @@ fn hbm_track_rows(rows: &[HbmRecord]) -> Vec<CounterRow> {
                 name: compact_str::format_compact!("HBM {hbm_id}/{kind}"),
                 tid: 0,
                 ts: fmt_us(ts_ns as u64, false),
-                args: vec![(key, Num::Float(value))],
+                args: smallvec::smallvec![(key, Num::Float(value))],
             });
         }
         prev = Some(ts_ns);
@@ -3328,18 +3373,11 @@ fn npu_module_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         }
         Ok(body)
     })?;
-
-    let mut body = String::from("Device_id,Component,Timestamp(us),Total Reserved(KB),Device\n");
-    let mut total = 0usize;
-    for chunk in chunks {
-        total += chunk.lines().count();
-        body.push_str(&chunk);
-    }
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(out, body)?;
-    println!("wrote {total} rows to {}", out.display());
+    write_chunks(
+        out,
+        "Device_id,Component,Timestamp(us),Total Reserved(KB),Device",
+        chunks,
+    )?;
     Ok(())
 }
 

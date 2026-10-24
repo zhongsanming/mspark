@@ -113,6 +113,26 @@ mspark verify-op-statistic PROF_… --golden …/op_statistic_*.csv
 `process_name`/`process_labels` metadata (the pid encoding changes between
 chips), then compares counter events as multisets.
 
+CSV verification runs the **production exporter** into a temporary directory and
+compares that file against the golden one, so a verifier can never drift from
+the writer. Columns are matched by header name (a reordered golden file is an
+error, not a silent mismatch) and fields are read with a real RFC 4180 parser.
+
+Verification is informational by default; `--strict` turns any mismatch into a
+non-zero exit status so CI can gate on regressions:
+
+```bash
+mspark --strict verify-llc-csv PROF_… --golden …/llc_read_write_*.csv
+```
+
+### Project layout of the binary
+
+`src/main.rs` holds the CLI and the artifact exporters; `src/lib.rs` holds the
+parts that are worth unit-testing — `text` (Python-compatible float/rounding
+helpers, the NIC timestamp column, µs parsing, civil dates) and `verify` (CSV
+reader, comparison, strict gate). `cargo test` covers those plus the node graph
+and the dataflow framework.
+
 ---
 
 ## Status

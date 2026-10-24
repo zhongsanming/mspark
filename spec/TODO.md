@@ -779,6 +779,36 @@ still loop sequentially.
 
 ## Quality
 
+### T18. Residuals the honest verifiers now report
+`verify-*` compares the real exporter output, which surfaced these (all
+pre-existing, none caused by the review work):
+
+- `op_statistic`: 31/31 rows agree but the row *order* differs from golden, so
+  only 4/31 `OP Type` cells match positionally. Needs msprof's ordering rule.
+- `npu_mem`: `timestamp(us)` 0/2238 (every other column exact).
+- `hbm`: `Read(MB/s)` 4/5.
+- `hccs`: `Average` 0/2 on this capture (was 5/5 on the older one).
+- `SIO`/`HCCS` tracks: we emit 8 and 2 events more than golden.
+- `op_summary`: still the duplicate-key row-alignment problem (T1k).
+
+### T19. Review items deliberately not taken
+Recorded so the next pass does not re-litigate them:
+
+- **Per-device session replacing `Arc<Mutex<Store>>` / `OnceLock`** (§2): would
+  remove ~35 `.lock().expect()` sites and the deadlock hazard, but it is a large
+  refactor of the artifact fan-out; the `summary` deadlock is currently avoided
+  by scoping its guard.
+- **`Weak` entries in `Store`**: frees intermediate tables once no artifact holds
+  them, but every artifact would then recompute upstream nodes (re-reading
+  streams), which is slower than the memory it saves at these sizes.
+- **All I/O into `Ctx`** (§2.1): clocks, `sample.json` and `host/info.json` are
+  still read at compute time; they are small and now cached per device anyway.
+- **One file per artifact behind a `Report` trait** (§1): partially done — the
+  duplication that mattered (20 verifier twins) is gone and the pure helpers are
+  in the library, but the exporters still live in `main.rs`.
+- **`next_nbi` extraction, `StartLogs`, decoder `read_*_at` helpers, trybuild
+  cycle test**: mechanical cleanups with no behavioural effect; deferred.
+
 ### T15. Golden-fixture test harness
 Move the verifiers into `cargo test` with checked-in golden CSVs/timelines so
 `cargo test` gates regressions.

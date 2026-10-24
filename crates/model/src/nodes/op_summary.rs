@@ -10,6 +10,8 @@ use crate::nodes::sources::tensor_info::{format_str, join_or_na, shapes_field, t
 use crate::time::{Clock, fmt_us};
 
 use super::device_task::DeviceTask;
+use super::sources::ffts_profile::PmuData;
+use super::sources::lpm::LpmSample;
 use super::sources::{NodeBasicInfoRow, TensorInfoRow};
 
 #[derive(Debug, Clone)]
@@ -87,7 +89,7 @@ impl Node for OpSummaryRow {
         DeviceTask,
         NodeBasicInfoRow,
         TensorInfoRow,
-        super::sources::ffts_profile::PmuData,
+        PmuData,
         super::sources::lpm::LpmInfo,
     );
 
@@ -97,7 +99,7 @@ impl Node for OpSummaryRow {
             std::sync::Arc<Vec<DeviceTask>>,
             std::sync::Arc<Vec<NodeBasicInfoRow>>,
             std::sync::Arc<Vec<TensorInfoRow>>,
-            std::sync::Arc<Vec<super::sources::ffts_profile::PmuData>>,
+            std::sync::Arc<Vec<PmuData>>,
             std::sync::Arc<Vec<super::sources::lpm::LpmInfo>>,
         ),
     ) -> Result<Vec<Self>> {
@@ -114,7 +116,7 @@ impl Node for OpSummaryRow {
             .first()
             .map(|lpm| lpm.samples.clone())
             .unwrap_or_default();
-        let pmu_map: HashMap<(u16, u16), &super::sources::ffts_profile::PmuData> = pmus
+        let pmu_map: HashMap<(u16, u16), &PmuData> = pmus
             .iter()
             .map(|pmu| ((pmu.stream_id, pmu.task_id), pmu))
             .collect();
@@ -277,70 +279,70 @@ impl Node for OpSummaryRow {
     }
 }
 
-pub fn data_type_name(id: u32) -> String {
+pub fn data_type_name(id: u32) -> std::borrow::Cow<'static, str> {
     match id {
-        0 => "FLOAT".to_string(),
-        1 => "FLOAT16".to_string(),
-        2 => "INT8".to_string(),
-        3 => "INT32".to_string(),
-        4 => "UINT8".to_string(),
-        6 => "INT16".to_string(),
-        7 => "UINT16".to_string(),
-        8 => "UINT32".to_string(),
-        9 => "INT64".to_string(),
-        10 => "UINT64".to_string(),
-        11 => "DOUBLE".to_string(),
-        12 => "BOOL".to_string(),
-        13 => "STRING".to_string(),
-        14 => "DUAL_SUB_INT8".to_string(),
-        15 => "DUAL_SUB_UINT8".to_string(),
-        16 => "COMPLEX64".to_string(),
-        17 => "COMPLEX128".to_string(),
-        18 => "QINT8".to_string(),
-        19 => "QINT16".to_string(),
-        20 => "QINT32".to_string(),
-        21 => "QUINT8".to_string(),
-        22 => "QUINT16".to_string(),
-        23 => "RESOURCE".to_string(),
-        24 => "STRING_REF".to_string(),
-        25 => "DUAL".to_string(),
-        26 => "DT_VARIANT".to_string(),
-        27 => "DT_BF16".to_string(),
-        28 => "DT_UNDEFINED".to_string(),
-        29 => "DT_INT4".to_string(),
-        30 => "DT_UINT1".to_string(),
-        31 => "DT_INT2".to_string(),
-        32 => "DT_UINT2".to_string(),
-        33 => "DT_COMPLEX32".to_string(),
-        34 => "DT_HIFLOAT8".to_string(),
-        35 => "DT_FLOAT8_E5M2".to_string(),
-        36 => "DT_FLOAT8_E4M3FN".to_string(),
-        37 => "DT_FLOAT8_E8M0".to_string(),
-        38 => "DT_FLOAT6_E3M2".to_string(),
-        39 => "DT_FLOAT6_E2M3".to_string(),
-        40 => "DT_FLOAT4_E2M1".to_string(),
-        41 => "DT_FLOAT4_E1M2".to_string(),
-        42 => "DT_HIFLOAT4".to_string(),
-        43 => "DT_MAX".to_string(),
-        229 => "NUMBER_TYPE_BEGIN_".to_string(),
-        230 => "BOOL_".to_string(),
-        231 => "INT_".to_string(),
-        232 => "INT8_".to_string(),
-        233 => "INT16_".to_string(),
-        234 => "INT32_".to_string(),
-        235 => "INT64_".to_string(),
-        236 => "UINT_".to_string(),
-        237 => "UINT8_".to_string(),
-        238 => "UINT16_".to_string(),
-        239 => "UINT32_".to_string(),
-        240 => "UINT64_".to_string(),
-        241 => "FLOAT_".to_string(),
-        242 => "FLOAT16_".to_string(),
-        243 => "FLOAT32_".to_string(),
-        244 => "FLOAT64_".to_string(),
-        245 => "COMPLEX_".to_string(),
-        246 => "NUMBER_TYPE_END_".to_string(),
-        _ => id.to_string(),
+        0 => "FLOAT".into(),
+        1 => "FLOAT16".into(),
+        2 => "INT8".into(),
+        3 => "INT32".into(),
+        4 => "UINT8".into(),
+        6 => "INT16".into(),
+        7 => "UINT16".into(),
+        8 => "UINT32".into(),
+        9 => "INT64".into(),
+        10 => "UINT64".into(),
+        11 => "DOUBLE".into(),
+        12 => "BOOL".into(),
+        13 => "STRING".into(),
+        14 => "DUAL_SUB_INT8".into(),
+        15 => "DUAL_SUB_UINT8".into(),
+        16 => "COMPLEX64".into(),
+        17 => "COMPLEX128".into(),
+        18 => "QINT8".into(),
+        19 => "QINT16".into(),
+        20 => "QINT32".into(),
+        21 => "QUINT8".into(),
+        22 => "QUINT16".into(),
+        23 => "RESOURCE".into(),
+        24 => "STRING_REF".into(),
+        25 => "DUAL".into(),
+        26 => "DT_VARIANT".into(),
+        27 => "DT_BF16".into(),
+        28 => "DT_UNDEFINED".into(),
+        29 => "DT_INT4".into(),
+        30 => "DT_UINT1".into(),
+        31 => "DT_INT2".into(),
+        32 => "DT_UINT2".into(),
+        33 => "DT_COMPLEX32".into(),
+        34 => "DT_HIFLOAT8".into(),
+        35 => "DT_FLOAT8_E5M2".into(),
+        36 => "DT_FLOAT8_E4M3FN".into(),
+        37 => "DT_FLOAT8_E8M0".into(),
+        38 => "DT_FLOAT6_E3M2".into(),
+        39 => "DT_FLOAT6_E2M3".into(),
+        40 => "DT_FLOAT4_E2M1".into(),
+        41 => "DT_FLOAT4_E1M2".into(),
+        42 => "DT_HIFLOAT4".into(),
+        43 => "DT_MAX".into(),
+        229 => "NUMBER_TYPE_BEGIN_".into(),
+        230 => "BOOL_".into(),
+        231 => "INT_".into(),
+        232 => "INT8_".into(),
+        233 => "INT16_".into(),
+        234 => "INT32_".into(),
+        235 => "INT64_".into(),
+        236 => "UINT_".into(),
+        237 => "UINT8_".into(),
+        238 => "UINT16_".into(),
+        239 => "UINT32_".into(),
+        240 => "UINT64_".into(),
+        241 => "FLOAT_".into(),
+        242 => "FLOAT16_".into(),
+        243 => "FLOAT32_".into(),
+        244 => "FLOAT64_".into(),
+        245 => "COMPLEX_".into(),
+        246 => "NUMBER_TYPE_END_".into(),
+        _ => std::borrow::Cow::Owned(id.to_string()),
     }
 }
 
@@ -348,11 +350,7 @@ pub fn data_type_name(id: u32) -> String {
 pub(crate) const AIC_EVENTS: [u32; 8] = [0x416, 0x417, 0x9, 0x302, 0xc, 0x303, 0x54, 0x55];
 pub(crate) const AIV_EVENTS: [u32; 8] = [0x8, 0xa, 0x9, 0xb, 0xc, 0xd, 0x54, 0x55];
 
-pub(crate) fn get_freq(
-    samples: &[crate::nodes::sources::lpm::LpmSample],
-    base_hz: f64,
-    end: u64,
-) -> f64 {
+pub(crate) fn get_freq(samples: &[LpmSample], base_hz: f64, end: u64) -> f64 {
     if samples.iter().any(|s| s.value == 0) {
         return base_hz;
     }

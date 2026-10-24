@@ -197,19 +197,7 @@ pub fn load_host_syscnt_clock(device_dir: &Path, host_freq_mhz: f64) -> Result<C
 }
 
 fn find_one(dir: &Path, prefix: &str) -> Result<PathBuf> {
-    let mut candidates = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".done") {
-            continue;
-        }
-        if name == prefix || name.starts_with(&format!("{prefix}.")) {
-            candidates.push(entry.path());
-        }
-    }
-    candidates.sort();
-    candidates
+    crate::stream::files_with_prefix(dir, &[prefix])
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no {prefix} under {}", dir.display()))

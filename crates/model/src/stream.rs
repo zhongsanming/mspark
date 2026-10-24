@@ -25,6 +25,44 @@ pub fn read_host_stream(ctx: &Ctx, prefix: &str, trunk: usize) -> Result<Vec<u8>
     read_concat(&ctx.host_data_dir(), prefix, trunk)
 }
 
+/// Files under `dir` whose name starts with one of `prefixes`, in slice order.
+///
+/// This was implemented four times (`time::find_one`, `ctx::find_info_json`,
+/// `host::files_with_prefix`, `stream::read_concat`); the rules are the same:
+/// skip partial-write markers, order by the trailing slice index.
+pub fn files_with_prefix(dir: &Path, prefixes: &[&str]) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(u64, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".done") || name.ends_with(".complete") {
+            continue;
+        }
+        // A slice file is `<prefix>.<suffix>` (e.g. `start_info.1234.json`) or
+        // `<prefix>_<n>` (e.g. `...type_info_dic.slice_0`); a bare `<prefix>` is
+        // also accepted.
+        if !prefixes
+            .iter()
+            .any(|prefix| match name.strip_prefix(prefix) {
+                Some(rest) => rest.is_empty() || rest.starts_with('.') || rest.starts_with('_'),
+                None => false,
+            })
+        {
+            continue;
+        }
+        let slice = name
+            .rsplit('_')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        files.push((slice, entry.path()));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    files.into_iter().map(|(_, path)| path).collect()
+}
+
 fn read_concat(dir: &Path, prefix: &str, trunk: usize) -> Result<Vec<u8>> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(Vec::new());
@@ -58,9 +96,13 @@ fn read_concat(dir: &Path, prefix: &str, trunk: usize) -> Result<Vec<u8>> {
         bytes.extend_from_slice(&std::fs::read(path)?);
     }
 
+    // Drop the leading partial chunk in place: `to_vec()` used to duplicate the
+    // whole stream (these files reach hundreds of MB).
     let offset = bytes.len() % trunk;
     let end = offset + (bytes.len() / trunk) * trunk;
-    Ok(bytes[offset..end].to_vec())
+    bytes.copy_within(offset..end, 0);
+    bytes.truncate(end - offset);
+    Ok(bytes)
 }
 
 pub(crate) fn cast(e: impl core::fmt::Display) -> anyhow::Error {

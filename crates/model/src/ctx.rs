@@ -30,7 +30,7 @@ pub enum Chip {
 }
 
 impl Chip {
-    pub fn from_platform_version(v: i64) -> Option<Self> {
+    fn from_version(v: i64) -> Option<Self> {
         match v {
             0 => Some(Self::V1_1_0),
             1 => Some(Self::V2_1_0),
@@ -118,13 +118,8 @@ pub fn load_device_info(device_dir: &Path) -> Result<DeviceInfo> {
         .get("platform_version")
         .and_then(as_i64)
         .ok_or_else(|| anyhow!("{} has no platform_version", path.display()))?;
-    let chip = Chip::from_platform_version(platform_version).ok_or_else(|| {
-        anyhow!(
-            "unknown platform_version {platform_version} in {}; known values are \
-             0,1,2,3,4,5,7,8,9,11,15,16,19",
-            path.display()
-        )
-    })?;
+    let chip = Chip::try_from(platform_version)
+        .with_context(|| format!("reading platform_version from {}", path.display()))?;
     // `info.json:version` selects the binary layout of the versioned streams
     // (`hbm`, `llc`, `npu_mem`); msprof defaults to "1.0" when absent.
     let collection_version = root
@@ -220,19 +215,7 @@ fn load_expand_status(device_dir: &Path) -> u16 {
 }
 
 fn find_info_json(dir: &Path) -> Result<PathBuf> {
-    let mut candidates = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".done") {
-            continue;
-        }
-        if name == "info.json" || name.starts_with("info.json.") {
-            candidates.push(entry.path());
-        }
-    }
-    candidates.sort();
-    candidates
+    crate::stream::files_with_prefix(dir, &["info.json"])
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no info.json under {}", dir.display()))
@@ -260,4 +243,18 @@ pub fn load_sample_string(
         .get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string()))
+}
+
+impl TryFrom<i64> for Chip {
+    type Error = anyhow::Error;
+
+    /// `info.json:platform_version` → chip generation.
+    fn try_from(version: i64) -> Result<Self> {
+        Chip::from_version(version).ok_or_else(|| {
+            anyhow!(
+                "unknown platform_version {version}; known values are \
+                 0,1,2,3,4,5,7,8,9,11,15,16,19"
+            )
+        })
+    }
 }

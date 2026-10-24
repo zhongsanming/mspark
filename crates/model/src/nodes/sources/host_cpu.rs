@@ -1,3 +1,4 @@
+use crate::format::round6;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -21,10 +22,6 @@ struct ProcTimes {
     utime: i64,
     stime: i64,
     cpu_no: i64,
-}
-
-fn round6(value: f64) -> f64 {
-    (value * 1e6).round_ties_even() / 1e6
 }
 
 impl Node for HostCpuUsageRow {
@@ -118,18 +115,20 @@ impl HostCpuUsageRow {
             if delta <= 0 {
                 continue;
             }
-            let mut per_cpu: Vec<(i64, i64)> = Vec::new();
+            // O(procs) instead of the previous O(procs^2): index the previous
+            // block by pid and accumulate per CPU in a map keyed by CPU number.
+            let previous: std::collections::HashMap<i64, &ProcTimes> =
+                last_data.iter().map(|(pid, times)| (*pid, times)).collect();
+            let mut per_cpu: std::collections::BTreeMap<i64, i64> =
+                std::collections::BTreeMap::new();
             let mut total = 0i64;
             for (pid, cur_times) in curr_data {
-                let Some(prev) = last_data.iter().find(|(p, _)| p == pid).map(|(_, t)| t) else {
+                let Some(prev) = previous.get(pid) else {
                     continue;
                 };
                 let raw = (cur_times.utime - prev.utime) + (cur_times.stime - prev.stime);
                 let jiffies = raw.min(delta);
-                match per_cpu.iter_mut().find(|(cpu, _)| *cpu == cur_times.cpu_no) {
-                    Some(entry) => entry.1 += jiffies,
-                    None => per_cpu.push((cur_times.cpu_no, jiffies)),
-                }
+                *per_cpu.entry(cur_times.cpu_no).or_insert(0) += jiffies;
                 total += jiffies;
             }
             for (cpu, jiffies) in per_cpu {

@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::format::round6;
 use anyhow::{Context as _, Result};
 use mspark_df::{Ctx, Node};
 
@@ -53,11 +54,6 @@ impl Node for L2CacheRow {
         }
         Ok(out)
     }
-}
-
-fn round6(value: f64) -> f64 {
-    // Python round(x, 6) is round-half-even; Rust {:.6} matches it.
-    format!("{value:.6}").parse().unwrap_or(value)
 }
 
 fn load_l2_events(device_dir: &Path) -> Result<Vec<String>> {

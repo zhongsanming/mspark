@@ -76,7 +76,7 @@ impl Ctx {
     pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
         self.data
             .get(&TypeId::of::<T>())
-            .and_then(|boxed| boxed.downcast_ref::<T>())
+            .map(|boxed| boxed.downcast_ref::<T>().expect("TypeId collision"))
     }
 
     pub fn require<T: Send + Sync + 'static>(&self) -> Result<&T> {
@@ -125,11 +125,12 @@ impl Store {
     }
 
     fn get<T: Node>(&self) -> Option<Arc<Vec<T>>> {
-        self.data
-            .get(&TypeId::of::<T>())?
-            .clone()
-            .downcast::<Vec<T>>()
-            .ok()
+        self.data.get(&TypeId::of::<T>()).map(|boxed| {
+            boxed
+                .clone()
+                .downcast::<Vec<T>>()
+                .expect("TypeId collision")
+        })
     }
 
     fn put<T: Node>(&mut self, value: Arc<Vec<T>>) {

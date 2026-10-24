@@ -75,3 +75,9 @@ pub(crate) fn double_to_str(value: f64) -> String {
     let text = text.trim_end_matches('.');
     text.to_string()
 }
+
+/// `Utils::RoundToDecimalPlaces(v, 6)`: round-half-to-even, no float→string
+/// round trip (three copies of `format!("{v:.6}").parse()` had drifted apart).
+pub fn round6(value: f64) -> f64 {
+    (value * 1e6).round_ties_even() / 1e6
+}

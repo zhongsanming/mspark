@@ -1,3 +1,4 @@
+use crate::format::round6;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -15,10 +16,6 @@ pub struct HostMemUsageRow {
     pub start_ns: u64,
     pub end_ns: u64,
     pub usage: f64,
-}
-
-fn round6(value: f64) -> f64 {
-    (value * 1e6).round_ties_even() / 1e6
 }
 
 impl Node for HostMemUsageRow {

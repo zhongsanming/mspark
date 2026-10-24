@@ -62,12 +62,12 @@ pub(crate) fn shape_str(tensor: &super::tensor_info::TensorDescRaw) -> String {
     dims.join(",")
 }
 
-pub(crate) fn format_str(format: u32) -> String {
+pub(crate) fn format_str(format: u32) -> std::borrow::Cow<'static, str> {
     let id = format & 0xff;
     let sub = (format & 0xffff00) >> 8;
     let name = format_name(id);
     if sub > 0 {
-        format!("{name}:{sub}")
+        std::borrow::Cow::Owned(format!("{name}:{sub}"))
     } else {
         name
     }
@@ -84,12 +84,20 @@ pub(crate) fn shapes_field(tensors: &[super::tensor_info::TensorDescRaw]) -> Str
     }
 }
 
-pub(crate) fn join_or_na(values: Vec<String>) -> String {
+/// Join tensor fields with `;`, or `N/A` when there are none. Takes any
+/// string-ish item so `&'static str` table hits never allocate.
+pub(crate) fn join_or_na<T: AsRef<str>>(values: Vec<T>) -> String {
     if values.is_empty() {
-        "N/A".to_string()
-    } else {
-        values.join(";")
+        return "N/A".to_string();
     }
+    let mut out = String::new();
+    for (i, value) in values.iter().enumerate() {
+        if i > 0 {
+            out.push(';');
+        }
+        out.push_str(value.as_ref());
+    }
+    out
 }
 
 pub(crate) fn take_tensors(
@@ -177,86 +185,86 @@ pub fn decode_tensor_info(bytes: &[u8]) -> Result<Vec<TensorInfoRaw>> {
     Ok(out)
 }
 
-pub fn format_name(id: u32) -> String {
+pub fn format_name(id: u32) -> std::borrow::Cow<'static, str> {
     match id {
-        0 => "NCHW".to_string(),
-        1 => "NHWC".to_string(),
-        2 => "ND".to_string(),
-        3 => "NC1HWC0".to_string(),
-        4 => "FRACTAL_Z".to_string(),
-        5 => "NC1C0HWPAD".to_string(),
-        6 => "NHWC1C0".to_string(),
-        7 => "FSR_NCHW".to_string(),
-        8 => "FRACTAL_DECONV".to_string(),
-        9 => "C1HWNC0".to_string(),
-        10 => "FRACTAL_DECONV_TRANSPOSE".to_string(),
-        11 => "FRACTAL_DECONV_SP_STRIDE_TRANS".to_string(),
-        12 => "NC1HWC0_C04".to_string(),
-        13 => "FRACTAL_Z_C04".to_string(),
-        14 => "CHWN".to_string(),
-        15 => "FRACTAL_DECONV_SP_STRIDE8_TRANS".to_string(),
-        16 => "HWCN".to_string(),
-        17 => "NC1KHKWHWC0".to_string(),
-        18 => "BN_WEIGHT".to_string(),
-        19 => "FILTER_HWCK".to_string(),
-        20 => "HASHTABLE_LOOKUP_LOOKUPS".to_string(),
-        21 => "HASHTABLE_LOOKUP_KEYS".to_string(),
-        22 => "HASHTABLE_LOOKUP_VALUE".to_string(),
-        23 => "HASHTABLE_LOOKUP_OUTPUT".to_string(),
-        24 => "HASHTABLE_LOOKUP_HITS".to_string(),
-        25 => "C1HWNCoC0".to_string(),
-        26 => "MD".to_string(),
-        27 => "NDHWC".to_string(),
-        28 => "FRACTAL_ZZ".to_string(),
-        29 => "FRACTAL_NZ".to_string(),
-        30 => "NCDHW".to_string(),
-        31 => "DHWCN".to_string(),
-        32 => "NDC1HWC0".to_string(),
-        33 => "FRACTAL_Z_3D".to_string(),
-        34 => "CN".to_string(),
-        35 => "NC".to_string(),
-        36 => "DHWNC".to_string(),
-        37 => "FRACTAL_Z_3D_TRANSPOSE".to_string(),
-        38 => "FRACTAL_ZN_LSTM".to_string(),
-        39 => "FRACTAL_Z_G".to_string(),
-        40 => "RESERVED".to_string(),
-        41 => "ALL".to_string(),
-        42 => "NULL".to_string(),
-        43 => "ND_RNN_BIAS".to_string(),
-        44 => "FRACTAL_ZN_RNN".to_string(),
-        45 => "NYUV".to_string(),
-        46 => "NYUV_A".to_string(),
-        47 => "NCL".to_string(),
-        48 => "FRACTAL_Z_WINO".to_string(),
-        49 => "C1HWC0".to_string(),
-        50 => "FRACTAL_NZ_C0_16".to_string(),
-        51 => "FRACTAL_NZ_C0_32".to_string(),
-        52 => "FRACTAL_NZ_C0_2".to_string(),
-        53 => "FRACTAL_NZ_C0_4".to_string(),
-        54 => "FRACTAL_NZ_C0_8".to_string(),
-        55 => "END".to_string(),
-        200 => "UNKNOWN_".to_string(),
-        201 => "DEFAULT_".to_string(),
-        202 => "NC1KHKWHWC0_".to_string(),
-        203 => "ND_".to_string(),
-        204 => "NCHW_".to_string(),
-        205 => "NHWC_".to_string(),
-        206 => "HWCN_".to_string(),
-        207 => "NC1HWC0_".to_string(),
-        208 => "FRAC_Z_".to_string(),
-        209 => "C1HWNCOC0_".to_string(),
-        210 => "FRAC_NZ_".to_string(),
-        211 => "NC1HWC0_C04_".to_string(),
-        212 => "FRACTAL_Z_C04_".to_string(),
-        213 => "NDHWC_".to_string(),
-        214 => "FRACTAL_ZN_LSTM_".to_string(),
-        215 => "FRACTAL_ZN_RNN_".to_string(),
-        216 => "ND_RNN_BIAS_".to_string(),
-        217 => "NDC1HWC0_".to_string(),
-        218 => "NCDHW_".to_string(),
-        219 => "FRACTAL_Z_3D_".to_string(),
-        220 => "DHWNC_".to_string(),
-        221 => "DHWCN_".to_string(),
-        _ => id.to_string(),
+        0 => "NCHW".into(),
+        1 => "NHWC".into(),
+        2 => "ND".into(),
+        3 => "NC1HWC0".into(),
+        4 => "FRACTAL_Z".into(),
+        5 => "NC1C0HWPAD".into(),
+        6 => "NHWC1C0".into(),
+        7 => "FSR_NCHW".into(),
+        8 => "FRACTAL_DECONV".into(),
+        9 => "C1HWNC0".into(),
+        10 => "FRACTAL_DECONV_TRANSPOSE".into(),
+        11 => "FRACTAL_DECONV_SP_STRIDE_TRANS".into(),
+        12 => "NC1HWC0_C04".into(),
+        13 => "FRACTAL_Z_C04".into(),
+        14 => "CHWN".into(),
+        15 => "FRACTAL_DECONV_SP_STRIDE8_TRANS".into(),
+        16 => "HWCN".into(),
+        17 => "NC1KHKWHWC0".into(),
+        18 => "BN_WEIGHT".into(),
+        19 => "FILTER_HWCK".into(),
+        20 => "HASHTABLE_LOOKUP_LOOKUPS".into(),
+        21 => "HASHTABLE_LOOKUP_KEYS".into(),
+        22 => "HASHTABLE_LOOKUP_VALUE".into(),
+        23 => "HASHTABLE_LOOKUP_OUTPUT".into(),
+        24 => "HASHTABLE_LOOKUP_HITS".into(),
+        25 => "C1HWNCoC0".into(),
+        26 => "MD".into(),
+        27 => "NDHWC".into(),
+        28 => "FRACTAL_ZZ".into(),
+        29 => "FRACTAL_NZ".into(),
+        30 => "NCDHW".into(),
+        31 => "DHWCN".into(),
+        32 => "NDC1HWC0".into(),
+        33 => "FRACTAL_Z_3D".into(),
+        34 => "CN".into(),
+        35 => "NC".into(),
+        36 => "DHWNC".into(),
+        37 => "FRACTAL_Z_3D_TRANSPOSE".into(),
+        38 => "FRACTAL_ZN_LSTM".into(),
+        39 => "FRACTAL_Z_G".into(),
+        40 => "RESERVED".into(),
+        41 => "ALL".into(),
+        42 => "NULL".into(),
+        43 => "ND_RNN_BIAS".into(),
+        44 => "FRACTAL_ZN_RNN".into(),
+        45 => "NYUV".into(),
+        46 => "NYUV_A".into(),
+        47 => "NCL".into(),
+        48 => "FRACTAL_Z_WINO".into(),
+        49 => "C1HWC0".into(),
+        50 => "FRACTAL_NZ_C0_16".into(),
+        51 => "FRACTAL_NZ_C0_32".into(),
+        52 => "FRACTAL_NZ_C0_2".into(),
+        53 => "FRACTAL_NZ_C0_4".into(),
+        54 => "FRACTAL_NZ_C0_8".into(),
+        55 => "END".into(),
+        200 => "UNKNOWN_".into(),
+        201 => "DEFAULT_".into(),
+        202 => "NC1KHKWHWC0_".into(),
+        203 => "ND_".into(),
+        204 => "NCHW_".into(),
+        205 => "NHWC_".into(),
+        206 => "HWCN_".into(),
+        207 => "NC1HWC0_".into(),
+        208 => "FRAC_Z_".into(),
+        209 => "C1HWNCOC0_".into(),
+        210 => "FRAC_NZ_".into(),
+        211 => "NC1HWC0_C04_".into(),
+        212 => "FRACTAL_Z_C04_".into(),
+        213 => "NDHWC_".into(),
+        214 => "FRACTAL_ZN_LSTM_".into(),
+        215 => "FRACTAL_ZN_RNN_".into(),
+        216 => "ND_RNN_BIAS_".into(),
+        217 => "NDC1HWC0_".into(),
+        218 => "NCDHW_".into(),
+        219 => "FRACTAL_Z_3D_".into(),
+        220 => "DHWNC_".into(),
+        221 => "DHWCN_".into(),
+        _ => std::borrow::Cow::Owned(id.to_string()),
     }
 }
