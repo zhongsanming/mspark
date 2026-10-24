@@ -791,18 +791,43 @@ pre-existing, none caused by the review work):
 - `SIO`/`HCCS` tracks: we emit 8 and 2 events more than golden.
 - `op_summary`: still the duplicate-key row-alignment problem (T1k).
 
+### T20. Per-device session and I/O in `Ctx` (done)
+`strace` on one full export showed 23 opens of a single device `start_info` and
+20 of `dev_start.log`. Three causes, all fixed:
+
+1. **Five clock loaders re-read the same four files.** They now share one
+   `StartLogs` parse (`StartLogs::clock/host_clock/sampling/mono`), inserted into
+   `Ctx` as `DeviceStartLogs`/`HostStartLogs`. `sample.json` (`SampleConfig`) and
+   `host/info.json` (`HostInfo`) moved into `Ctx` too.
+2. **The `Ctx` cache had a race.** `ctx_for` released the registry lock before
+   `build_ctx`, so the ~20 artifacts running in parallel all missed and rebuilt.
+   The lock is now held across the build — this alone was 20 of the 23 opens.
+3. **Two registries (`Ctx`, `Store`) and 25 `.lock().expect("store lock")`
+   sites** collapsed into one `DeviceSession { ctx, info, store }` with
+   `session.resolve::<T>()`, which takes the lock for exactly one computation.
+   The "the guard must not outlive this call" deadlock hazard in `summary` is
+   structurally gone.
+
+Measured on one capture, `--outputs all`: `openat` 657 → 251, per-device
+`start_info` 23 → 3, `host_start.log` 21 → 1. Output is byte-identical (same
+task_time numbers, same track matches).
+
+The `Mutex` itself is not removable: artifacts fan out over devices in parallel
+and share one memoised `Store` per device. The worthwhile part was shrinking the
+critical section and the number of owners, not deleting the lock.
+
 ### T19. Review items deliberately not taken
 Recorded so the next pass does not re-litigate them:
 
-- **Per-device session replacing `Arc<Mutex<Store>>` / `OnceLock`** (§2): would
-  remove ~35 `.lock().expect()` sites and the deadlock hazard, but it is a large
-  refactor of the artifact fan-out; the `summary` deadlock is currently avoided
-  by scoping its guard.
+
 - **`Weak` entries in `Store`**: frees intermediate tables once no artifact holds
   them, but every artifact would then recompute upstream nodes (re-reading
-  streams), which is slower than the memory it saves at these sizes.
-- **All I/O into `Ctx`** (§2.1): clocks, `sample.json` and `host/info.json` are
-  still read at compute time; they are small and now cached per device anyway.
+  streams), which is slower than the memory it saves at these sizes. The session
+  refactor now lets a device's tables be dropped when that device finishes, which
+  covers the common case.
+- **(done)** All clock/config I/O into `Ctx`, and the per-device session — see
+  T20. Data streams (`host_cpu.data`, `stars_soc`, …) stay in the nodes: they
+  *are* the node inputs, not configuration.
 - **One file per artifact behind a `Report` trait** (§1): partially done — the
   duplication that mattered (20 verifier twins) is gone and the pure helpers are
   in the library, but the exporters still live in `main.rs`.

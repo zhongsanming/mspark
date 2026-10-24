@@ -14,7 +14,7 @@ use mspark_model::{
     InterSocSample, L2CacheRow, LlcRecord, LpmInfo, NicRow, NpuMemRow, NpuModuleMemRow,
     OpStatisticRow, OpSummaryRow, OverlapKind, OverlapRow, PcieRecord, PmuData, QosRow, RoceRow,
     SioSample, StarsSocEntry, TaskTimeRow, TimelineTask, TrackFlip, TscpuRecord, fmt_us,
-    load_clock, load_device_info, load_dictionaries, load_host_clock, load_sample_string,
+    load_device_info, load_dictionaries, load_sample_string,
 };
 use palc::{Parser, Subcommand};
 use rayon::prelude::*;
@@ -630,34 +630,93 @@ fn devices(prof: &Path, only: Option<&str>) -> Result<Vec<PathBuf>> {
 /// Building a context parses `info.json`, the start logs and the host
 /// dictionaries, so doing it per artifact (35 call sites) is pure waste. Like
 /// [`store_for`], the cache is keyed by the device directory.
-type CtxCache = HashMap<std::path::PathBuf, (Arc<Ctx>, DeviceInfo)>;
+/// One device's parsed context and memoised node tables.
+///
+/// A device owns its `Store`, so artifacts never share mutable state by
+/// accident and the tables are dropped when the device is done. Each
+/// `resolve` takes the lock for the duration of one node computation, which
+/// removes the old "do not let the guard outlive this call" hazard.
+struct DeviceSession {
+    ctx: Arc<Ctx>,
+    info: DeviceInfo,
+    store: Mutex<Store>,
+}
 
-fn ctx_for(device: &Path) -> Result<(Arc<Ctx>, DeviceInfo)> {
-    static CTXS: OnceLock<Mutex<CtxCache>> = OnceLock::new();
-    let registry = CTXS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(entry) = registry.lock().expect("ctx registry").get(device) {
-        return Ok(entry.clone());
+impl DeviceSession {
+    fn resolve<T: mspark_df::Node>(&self) -> Result<Arc<Vec<T>>> {
+        let mut store = self.store.lock().expect("store lock");
+        resolve::<T>(&mut store, &self.ctx)
+    }
+
+    fn ctx(&self) -> &Ctx {
+        &self.ctx
+    }
+}
+
+/// Per-device session, built at most once per process.
+///
+/// The lock is held **across** the build on purpose: artifacts run in parallel,
+/// and releasing it before `build_ctx` made every racing artifact miss the cache
+/// and rebuild (20 artifacts → 20 loads of the same start logs, visible in
+/// `strace` as 20+ opens of one `start_info`).
+fn session_for(device: &Path) -> Result<Arc<DeviceSession>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<PathBuf, Arc<DeviceSession>>>> = OnceLock::new();
+    let registry = SESSIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().expect("session registry");
+    if let Some(session) = guard.get(device) {
+        return Ok(session.clone());
     }
     let (ctx, info) = build_ctx(device)?;
-    let entry = (Arc::new(ctx), info);
-    registry
-        .lock()
-        .expect("ctx registry")
-        .insert(device.to_path_buf(), entry.clone());
-    Ok(entry)
+    let session = Arc::new(DeviceSession {
+        ctx: Arc::new(ctx),
+        info,
+        store: Mutex::new(Store::new()),
+    });
+    guard.insert(device.to_path_buf(), session.clone());
+    Ok(session)
+}
+
+/// Run `f` for every selected device, in parallel.
+fn per_session<R, F>(prof: &Path, only: Option<&str>, f: F) -> Result<Vec<R>>
+where
+    R: Send,
+    F: Fn(&DeviceSession) -> Result<R> + Sync + Send,
+{
+    devices(prof, only)?
+        .par_iter()
+        .map(|device| {
+            let session = session_for(device)?;
+            f(&session)
+        })
+        .collect()
 }
 
 fn build_ctx(device: &Path) -> Result<(Ctx, DeviceInfo)> {
     let info = load_device_info(device)
         .with_context(|| format!("loading context for {}", device.display()))?;
-    let clock = load_clock(device, info.host_freq_mhz, info.hwts_freq_mhz)
-        .with_context(|| format!("loading time logs for {}", device.display()))?;
+    // One parse of the start logs feeds both the device clock and every node
+    // that needs a different view of the same four files.
+    let device_logs = mspark_model::StartLogs::load(device)
+        .with_context(|| format!("loading start logs for {}", device.display()))?;
+    let clock = device_logs
+        .clock(info.host_freq_mhz, info.hwts_freq_mhz)
+        .with_context(|| format!("deriving the device clock for {}", device.display()))?;
     // Each device carries its own capture root, so a merged multi-process
     // profile still reads host data from the right directory.
     let root = prof_root_of(device);
     let mut ctx = Ctx::new(root).with_device(device);
     ctx.insert(info.clone());
     ctx.insert(clock);
+    // The four start logs are shared by all five clock derivations; parsing them
+    // once here keeps the nodes from re-reading the same files (a single export
+    // used to open `start_info` 20+ times per device).
+    ctx.insert(mspark_model::DeviceStartLogs(device_logs));
+    ctx.insert(mspark_model::HostStartLogs(
+        mspark_model::StartLogs::load(&root.join("host"))
+            .with_context(|| format!("loading host start logs for {}", root.display()))?,
+    ));
+    ctx.insert(mspark_model::HostInfo::load(root)?);
+    ctx.insert(mspark_model::SampleConfig::load(device)?);
     // Host id→text dictionaries are loaded before any node runs.
     let (hash, types) = load_dictionaries(&root.join("host").join("data"));
     ctx.insert(hash);
@@ -1016,20 +1075,13 @@ fn net_csv(prof: &Path, only: Option<&str>, out: &Path, roce: bool) -> Result<()
     );
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
         let samples: Vec<NetSample> = if roce {
-            resolve::<RoceRow>(&mut store, &ctx)?
-                .iter()
-                .map(|r| r.0)
-                .collect()
+            session.resolve::<RoceRow>()?.iter().map(|r| r.0).collect()
         } else {
-            resolve::<NicRow>(&mut store, &ctx)?
-                .iter()
-                .map(|r| r.0)
-                .collect()
+            session.resolve::<NicRow>()?.iter().map(|r| r.0).collect()
         };
         for row in net_summary_rows(&samples, &device)? {
             body.push_str(&format!("{dev},{},0\n", row.join(",")));
@@ -1148,10 +1200,9 @@ fn host_mem_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Total Memory,Peak Used Memory,Recommend Memory\n");
     let mut rows = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, _info) = ctx_for(&device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let samples = resolve::<HostMemUsageRow>(&mut store, &ctx)?;
+        let session = session_for(&device)?;
+        let ctx = session.ctx();
+        let samples = session.resolve::<HostMemUsageRow>()?;
         let total_kb = std::fs::read_to_string(ctx.root().join("host").join("info.json"))
             .ok()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
@@ -1183,12 +1234,12 @@ fn communication_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> 
     let mut body = String::from("Device_id,OP Type,Count\n");
     let mut rows = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let ctx = session.ctx();
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let ops = resolve::<HcclOpRow>(&mut store, &ctx)?;
-        let tasks = resolve::<HcclInfoRow>(&mut store, &ctx)?;
+        let ops = session.resolve::<HcclOpRow>()?;
+        let tasks = session.resolve::<HcclInfoRow>()?;
         let dic = ctx.require::<mspark_model::HashDic>()?;
 
         // Tasks belong to the last op that started before them (validated: this
@@ -1251,10 +1302,9 @@ fn host_cpu_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         String::from("Device_id,Total Cpu Numbers,Occupied Cpu Numbers,Recommend Cpu Numbers\n");
     let mut total_rows = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, _info) = ctx_for(&device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let samples = resolve::<HostCpuUsageRow>(&mut store, &ctx)?;
+        let session = session_for(&device)?;
+        let ctx = session.ctx();
+        let samples = session.resolve::<HostCpuUsageRow>()?;
         use std::collections::BTreeMap;
         let mut peak: BTreeMap<u64, f64> = BTreeMap::new();
         let mut total = 0u64;
@@ -1394,12 +1444,15 @@ fn llc_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Mode,Task,Hit Rate(%),Throughput(MB/s)\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let ctx = session.ctx();
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let rows = resolve::<LlcRecord>(&mut store, &ctx)?;
-        let clock = mspark_model::load_sampling_clock(ctx.device_dir()?)?;
+        let rows = session.resolve::<LlcRecord>()?;
+        let clock = ctx
+            .require::<mspark_model::DeviceStartLogs>()?
+            .0
+            .sampling()?;
         for [task, hit, tp] in llc_csv_table(&rows, &clock) {
             body.push_str(&format!("{dev},read,{task},{hit},{tp}\n"));
             total += 1;
@@ -1474,11 +1527,10 @@ fn pcie_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Mode,Min,Max,Avg\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for [mode, min, max, avg] in pcie_table(&resolve::<PcieRecord>(&mut store, &ctx)?) {
+        for [mode, min, max, avg] in pcie_table(&session.resolve::<PcieRecord>()?) {
             body.push_str(&format!("{dev},{mode},{min},{max},{avg}\n"));
             total += 1;
         }
@@ -1496,28 +1548,20 @@ fn summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let (mut tasks_total, mut ops_total, mut events_total) = (0u64, 0u64, 0u64);
     let mut peak_max = 0u64;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        // The guard must not outlive the calls below: `device_timeline` locks the
-        // same per-device store and would deadlock.
-        let tasks = {
-            let mut store = shared_store.lock().expect("store lock");
-            resolve::<TaskTimeRow>(&mut store, &ctx)?.len() as u64
-        };
-        let ops = {
-            let mut store = shared_store.lock().expect("store lock");
-            resolve::<OpSummaryRow>(&mut store, &ctx)?.len() as u64
-        };
+        // Each `resolve` takes the store lock for one computation only, so the
+        // "do not let the guard escape" hazard that used to live here is gone.
+        let tasks = session.resolve::<TaskTimeRow>()?.len() as u64;
+        let ops = session.resolve::<OpSummaryRow>()?.len() as u64;
         let (_, events) = device_timeline(&device)?;
-        let peak = {
-            let mut store = shared_store.lock().expect("store lock");
-            resolve::<NpuMemRow>(&mut store, &ctx)?
-                .iter()
-                .map(|row| (row.ddr + row.hbm) / 1024)
-                .max()
-                .unwrap_or(0)
-        };
+        let peak = session
+            .resolve::<NpuMemRow>()?
+            .iter()
+            .map(|row| (row.ddr + row.hbm) / 1024)
+            .max()
+            .unwrap_or(0);
         body.push_str(&format!("{dev},{tasks},{ops},{events},{peak}\n"));
         tasks_total += tasks;
         ops_total += ops;
@@ -1569,21 +1613,6 @@ fn graph(format: &str) -> Result<()> {
     Ok(())
 }
 
-/// One memoised [`Store`] per device directory, shared by every artifact.
-///
-/// `resolve` already memoises within a store, so a single store per device makes
-/// the whole export share one `DeviceTask` / `stars_soc` decode instead of
-/// rebuilding it once per artifact.
-fn store_for(device: &Path) -> Arc<Mutex<Store>> {
-    static STORES: OnceLock<Mutex<HashMap<std::path::PathBuf, Arc<Mutex<Store>>>>> =
-        OnceLock::new();
-    let registry = STORES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = registry.lock().expect("store registry");
-    map.entry(device.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(Store::new())))
-        .clone()
-}
-
 fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
     let devices = devices(prof, only)?;
     println!("profile: {}", prof.display());
@@ -1593,17 +1622,17 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
     }
 
     for device in &devices {
-        let (ctx, info) = ctx_for(device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let soc = resolve::<StarsSocEntry>(&mut store, &ctx)?;
-        let pmu = resolve::<PmuData>(&mut store, &ctx)?;
-        let track = resolve::<TrackFlip>(&mut store, &ctx)?;
-        let lpm = resolve::<LpmInfo>(&mut store, &ctx)?;
+        let session = session_for(device)?;
+        let ctx = session.ctx();
+        let info = &session.info;
+        let soc = session.resolve::<StarsSocEntry>()?;
+        let pmu = session.resolve::<PmuData>()?;
+        let track = session.resolve::<TrackFlip>()?;
+        let lpm = session.resolve::<LpmInfo>()?;
 
         let soc_hist = mspark_model::nodes::sources::stars_soc::decode_stars_soc(
             &mspark_model::stream::read_stream(
-                &ctx,
+                ctx,
                 "stars_soc.",
                 mspark_model::nodes::sources::stars_soc::STARS_SOC_TRUNK,
             )?,
@@ -1612,7 +1641,7 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
         .1;
         let pmu_hist = mspark_model::nodes::sources::ffts_profile::decode_ffts_profile(
             &mspark_model::stream::read_stream(
-                &ctx,
+                ctx,
                 "ffts_profile.",
                 mspark_model::nodes::sources::ffts_profile::FFTS_PROFILE_TRUNK,
             )?,
@@ -1621,7 +1650,7 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
         .1;
         let track_hist = mspark_model::nodes::sources::ts_track::decode_ts_track(
             &mspark_model::stream::read_stream(
-                &ctx,
+                ctx,
                 "ts_track.",
                 mspark_model::nodes::sources::ts_track::TS_TRACK_TRUNK,
             )?,
@@ -1632,7 +1661,7 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
             "\n== {} ==",
             device.file_name().unwrap_or_default().to_string_lossy()
         );
-        print_info(&info);
+        print_info(info);
         println!(
             "  stars_soc   {:>6} rows  funcs={}",
             soc.len(),
@@ -1658,7 +1687,10 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
         } else {
             println!("  lpmFreqConv  absent");
         }
-        println!("  store: {} nodes memoised", store.len());
+        println!(
+            "  store: {} nodes memoised",
+            session.store.lock().expect("store lock").len()
+        );
     }
     Ok(())
 }
@@ -1668,25 +1700,15 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
 fn per_device<R, F>(prof: &Path, only: Option<&str>, f: F) -> Result<Vec<R>>
 where
     R: Send,
-    F: Fn(&Ctx, &DeviceInfo) -> Result<R> + Send + Sync,
+    F: Fn(&DeviceSession) -> Result<R> + Send + Sync,
 {
-    let devices = devices(prof, only)?;
-    let chunks: Vec<R> = devices
-        .par_iter()
-        .map(|device| {
-            let (ctx, info) = ctx_for(device)?;
-            f(&ctx, &info)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(chunks)
+    per_session(prof, only, f)
 }
 
 fn task_time(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
-    let chunks = per_device(prof, only, |ctx, _info| {
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
+    let chunks = per_device(prof, only, |session| {
         let mut body = String::new();
-        for row in resolve::<TaskTimeRow>(&mut store, ctx)?.iter() {
+        for row in session.resolve::<TaskTimeRow>()?.iter() {
             body.push_str(&row.to_csv());
         }
         Ok(body)
@@ -1707,10 +1729,8 @@ fn verify(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
 
     let mut produced: HashMap<(u32, u32), Vec<TaskTimeRow>> = HashMap::new();
     for device in devices(prof, only)? {
-        let (ctx, _) = ctx_for(&device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<TaskTimeRow>(&mut store, &ctx)?.iter() {
+        let session = session_for(&device)?;
+        for row in session.resolve::<TaskTimeRow>()?.iter() {
             produced
                 .entry((row.stream_id, row.task_id))
                 .or_default()
@@ -1800,11 +1820,9 @@ fn verify(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
 }
 
 fn op_summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
-    let chunks = per_device(prof, only, |ctx, _info| {
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
+    let chunks = per_device(prof, only, |session| {
         let mut body = String::new();
-        for row in resolve::<OpSummaryRow>(&mut store, ctx)?.iter() {
+        for row in session.resolve::<OpSummaryRow>()?.iter() {
             body.push_str(&row.to_csv());
         }
         Ok(body)
@@ -2281,14 +2299,14 @@ fn timeline(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 /// Build one device's timeline events. Devices are independent, so this runs
 /// in parallel; the caller concatenates chunks in device order.
 fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
-    let (ctx, info) = ctx_for(device)?;
+    let session = session_for(device)?;
+    let ctx = session.ctx();
+    let info = &session.info;
     let mut events: Vec<TraceEvent> = Vec::new();
     let mut total = 0usize;
     {
         let clock = ctx.require::<Clock>()?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let tasks = resolve::<TimelineTask>(&mut store, &ctx)?;
+        let tasks = session.resolve::<TimelineTask>()?;
 
         let dev = info.device_id.unwrap_or(0);
         let hw_pid = Track::Hardware.pid(info.pid, dev);
@@ -2339,8 +2357,11 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         }
 
         // --- CANN host track ---
-        let api_events = resolve::<ApiEventRow>(&mut store, &ctx)?;
-        let host_clock = load_host_clock(prof_root_of(device))?;
+        let api_events = session.resolve::<ApiEventRow>()?;
+        let host_clock = ctx
+            .require::<mspark_model::HostStartLogs>()?
+            .0
+            .host_clock(ctx.require::<mspark_model::DeviceInfo>()?.host_freq_mhz)?;
         let cann_pid = Track::Cann.pid(info.pid, HOST_PID);
         push_process_meta(&mut events, cann_pid, "CANN", "CPU", 7);
         let mut api_tids: Vec<u32> = api_events.iter().map(|e| e.thread_id).collect();
@@ -2384,10 +2405,10 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
 
         // --- SOC profile tracks ---
         let label = format!("NPU {dev}");
-        let sio = resolve::<SioSample>(&mut store, &ctx)?;
-        let acc = resolve::<AccPmuSample>(&mut store, &ctx)?;
-        let inter = resolve::<InterSocSample>(&mut store, &ctx)?;
-        let chip = resolve::<ChipTransSample>(&mut store, &ctx)?;
+        let sio = session.resolve::<SioSample>()?;
+        let acc = session.resolve::<AccPmuSample>()?;
+        let inter = session.resolve::<InterSocSample>()?;
+        let chip = session.resolve::<ChipTransSample>()?;
         let track_pid = |track: Track| track.pid(info.pid, dev);
         for (track, name) in [
             (Track::Sio, "SIO"),
@@ -2415,7 +2436,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         }
 
         // --- Overlap Analysis ---
-        let overlap = resolve::<OverlapRow>(&mut store, &ctx)?;
+        let overlap = session.resolve::<OverlapRow>()?;
         let overlap_pid = track_pid(Track::Overlap);
         push_process_meta(&mut events, overlap_pid, "Overlap Analysis", &label, 29);
         for (tid, name) in [
@@ -2443,7 +2464,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         }
 
         // --- QoS ---
-        let qos = resolve::<QosRow>(&mut store, &ctx)?;
+        let qos = session.resolve::<QosRow>()?;
         let qos_events = sample_csv_list(ctx.device_dir()?, "qosEvents")?;
         let qos_pid = track_pid(Track::Qos);
         push_process_meta(&mut events, qos_pid, "QoS", &label, 28);
@@ -2453,10 +2474,10 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         }
 
         // --- NPU MEM ---
-        let npu_mem = resolve::<NpuMemRow>(&mut store, &ctx)?;
+        let npu_mem = session.resolve::<NpuMemRow>()?;
         let npu_mem_pid = track_pid(Track::Communication);
         // --- CPU Usage (host track) ---
-        let cpu_usage = resolve::<HostCpuUsageRow>(&mut store, &ctx)?;
+        let cpu_usage = session.resolve::<HostCpuUsageRow>()?;
         let cpu_pid = Track::CpuUsage.pid(info.pid, HOST_PID);
         events.push(TraceEvent::meta(
             "process_name",
@@ -2483,10 +2504,11 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         }
 
         // --- HCCS ---
-        let hccs = resolve::<HccsRateRow>(&mut store, &ctx)?;
+        let hccs = session.resolve::<HccsRateRow>()?;
         let hccs_pid = track_pid(Track::Hccs);
         push_process_meta(&mut events, hccs_pid, "HCCS", &label, 19);
-        let nic: Vec<NetSample> = resolve::<NicRow>(&mut store, &ctx)?
+        let nic: Vec<NetSample> = session
+            .resolve::<NicRow>()?
             .iter()
             .map(|row| row.0)
             .collect();
@@ -2496,7 +2518,8 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
             write_counter(&mut events, nic_pid, row);
             total += 1;
         }
-        let roce: Vec<NetSample> = resolve::<RoceRow>(&mut store, &ctx)?
+        let roce: Vec<NetSample> = session
+            .resolve::<RoceRow>()?
             .iter()
             .map(|row| row.0)
             .collect();
@@ -2506,22 +2529,25 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
             write_counter(&mut events, roce_pid, row);
             total += 1;
         }
-        let llc = resolve::<LlcRecord>(&mut store, &ctx)?;
-        let llc_clock = mspark_model::load_sampling_clock(ctx.device_dir()?)?;
+        let llc = session.resolve::<LlcRecord>()?;
+        let llc_clock = ctx
+            .require::<mspark_model::DeviceStartLogs>()?
+            .0
+            .sampling()?;
         let llc_pid = track_pid(Track::Llc);
         push_process_meta(&mut events, llc_pid, "LLC", &label, 26);
         for row in llc_track_rows(&llc, &llc_clock) {
             write_counter(&mut events, llc_pid, row);
             total += 1;
         }
-        let hbm = resolve::<HbmRecord>(&mut store, &ctx)?;
+        let hbm = session.resolve::<HbmRecord>()?;
         let hbm_pid = track_pid(Track::Hbm);
         push_process_meta(&mut events, hbm_pid, "HBM", &label, 23);
         for row in hbm_track_rows(&hbm) {
             write_counter(&mut events, hbm_pid, row);
             total += 1;
         }
-        let pcie = resolve::<PcieRecord>(&mut store, &ctx)?;
+        let pcie = session.resolve::<PcieRecord>()?;
         let pcie_pid = track_pid(Track::Pcie);
         push_process_meta(&mut events, pcie_pid, "PCIe", &label, 22);
         for row in pcie_track_rows(&pcie) {
@@ -2623,7 +2649,9 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
     let mut overlap_max_dur = 0.0f64;
 
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let ctx = session.ctx();
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
         let hw_pid = Track::Hardware.pid(info.pid, dev) as u64;
         let expected: Vec<&serde_json::Value> = array
@@ -2633,9 +2661,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                     && event.get("ph").and_then(|p| p.as_str()) == Some("X")
             })
             .collect();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let produced = resolve::<TimelineTask>(&mut store, &ctx)?;
+        let produced = session.resolve::<TimelineTask>()?;
 
         golden_rows += expected.len();
         produced_rows += produced.len();
@@ -2675,7 +2701,10 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
         }
 
         // CANN host track
-        let host_clock = load_host_clock(prof)?;
+        let host_clock = ctx
+            .require::<mspark_model::HostStartLogs>()?
+            .0
+            .host_clock(ctx.require::<mspark_model::DeviceInfo>()?.host_freq_mhz)?;
         let cann_pid = Track::Cann.pid(info.pid, HOST_PID) as u64;
         let expected_api: Vec<&serde_json::Value> = array
             .iter()
@@ -2684,7 +2713,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                     && event.get("ph").and_then(|p| p.as_str()) == Some("X")
             })
             .collect();
-        let produced_api = resolve::<ApiEventRow>(&mut store, &ctx)?;
+        let produced_api = session.resolve::<ApiEventRow>()?;
         api_golden += expected_api.len();
         api_produced += produced_api.len();
         for (golden, ours) in expected_api.iter().zip(produced_api.iter()) {
@@ -2736,14 +2765,14 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
         }
 
         // SOC profile counter tracks
-        let sio_rows_v = sio_rows(&resolve::<SioSample>(&mut store, &ctx)?);
-        let acc_rows_v = acc_pmu_rows(&resolve::<AccPmuSample>(&mut store, &ctx)?);
-        let inter_rows_v = inter_soc_rows(&resolve::<InterSocSample>(&mut store, &ctx)?);
-        let chip_rows_v = chip_trans_rows(&resolve::<ChipTransSample>(&mut store, &ctx)?);
+        let sio_rows_v = sio_rows(&session.resolve::<SioSample>()?);
+        let acc_rows_v = acc_pmu_rows(&session.resolve::<AccPmuSample>()?);
+        let inter_rows_v = inter_soc_rows(&session.resolve::<InterSocSample>()?);
+        let chip_rows_v = chip_trans_rows(&session.resolve::<ChipTransSample>()?);
         let qos_events = sample_csv_list(ctx.device_dir()?, "qosEvents")?;
-        let qos_rows_v = qos_rows(&resolve::<QosRow>(&mut store, &ctx)?, &qos_events);
-        let npu_mem_rows_v = npu_mem_rows(&resolve::<NpuMemRow>(&mut store, &ctx)?);
-        let hccs_rows_v = hccs_rows(&resolve::<HccsRateRow>(&mut store, &ctx)?);
+        let qos_rows_v = qos_rows(&session.resolve::<QosRow>()?, &qos_events);
+        let npu_mem_rows_v = npu_mem_rows(&session.resolve::<NpuMemRow>()?);
+        let hccs_rows_v = hccs_rows(&session.resolve::<HccsRateRow>()?);
         for (sort, name, rows) in [
             (Track::Sio, "SIO", sio_rows_v),
             (Track::AccPmu, "Acc PMU", acc_rows_v),
@@ -2756,7 +2785,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                 Track::CpuUsage,
                 "CPU Usage",
                 host_cpu_rows(
-                    &resolve::<HostCpuUsageRow>(&mut store, &ctx)?,
+                    &session.resolve::<HostCpuUsageRow>()?,
                     host_local_offset_milli(ctx.root())?,
                 ),
             ),
@@ -2764,7 +2793,8 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                 Track::Nic,
                 "NIC",
                 net_rows(
-                    &resolve::<NicRow>(&mut store, &ctx)?
+                    &session
+                        .resolve::<NicRow>()?
                         .iter()
                         .map(|row| row.0)
                         .collect::<Vec<_>>(),
@@ -2775,7 +2805,8 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                 Track::Roce,
                 "RoCE",
                 net_rows(
-                    &resolve::<RoceRow>(&mut store, &ctx)?
+                    &session
+                        .resolve::<RoceRow>()?
                         .iter()
                         .map(|row| row.0)
                         .collect::<Vec<_>>(),
@@ -2786,19 +2817,21 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                 Track::Llc,
                 "LLC",
                 llc_track_rows(
-                    &resolve::<LlcRecord>(&mut store, &ctx)?,
-                    &mspark_model::load_sampling_clock(ctx.device_dir()?)?,
+                    &session.resolve::<LlcRecord>()?,
+                    &ctx.require::<mspark_model::DeviceStartLogs>()?
+                        .0
+                        .sampling()?,
                 ),
             ),
             (
                 Track::Hbm,
                 "HBM",
-                hbm_track_rows(&resolve::<HbmRecord>(&mut store, &ctx)?),
+                hbm_track_rows(&session.resolve::<HbmRecord>()?),
             ),
             (
                 Track::Pcie,
                 "PCIe",
-                pcie_track_rows(&resolve::<PcieRecord>(&mut store, &ctx)?),
+                pcie_track_rows(&session.resolve::<PcieRecord>()?),
             ),
         ] {
             let pid =
@@ -2833,7 +2866,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                 )
             })
             .collect();
-        let produced_overlap = resolve::<OverlapRow>(&mut store, &ctx)?;
+        let produced_overlap = session.resolve::<OverlapRow>()?;
         let mut produced_rows: Vec<(String, u32, compact_str::CompactString, f64)> =
             produced_overlap
                 .iter()
@@ -2949,11 +2982,10 @@ fn ts_cpu_event_ids(device: &Path) -> Result<Vec<u64>> {
 fn ts_cpu_pmu_events(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Event,Name,Count\n");
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let records = resolve::<TscpuRecord>(&mut store, &ctx)?;
+        let records = session.resolve::<TscpuRecord>()?;
         let mut rows: Vec<(u64, u64)> = ts_cpu_event_ids(&device)?
             .into_iter()
             .map(|event| {
@@ -2985,11 +3017,10 @@ fn ts_cpu_pmu_events(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> 
 fn ts_cpu_top_function(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Function,Cycles,Cycles(%)\n");
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let records = resolve::<TscpuRecord>(&mut store, &ctx)?;
+        let records = session.resolve::<TscpuRecord>()?;
         let mut counts: Vec<(u64, u64)> = Vec::new();
         let mut index: HashMap<u64, usize> = HashMap::new();
         for record in records.iter() {
@@ -3030,10 +3061,8 @@ fn api_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body =
         String::from("Device_id,Level,API Name,Time(us),Count,Avg(us),Min(us),Max(us),Variance\n");
     if let Some(device) = devices(prof, only)?.first() {
-        let (ctx, _) = ctx_for(device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<ApiStatisticRow>(&mut store, &ctx)?.iter() {
+        let session = session_for(device)?;
+        for row in session.resolve::<ApiStatisticRow>()?.iter() {
             body.push_str(&format!(
                 "host,{},{},{},{},{},{},{},{}\n",
                 mspark_model::api_level_name(row.level),
@@ -3060,10 +3089,8 @@ fn op_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         "Device_id,OP Type,Core Type,Count,Total Time(us),Min Time(us),Avg Time(us),Max Time(us),Ratio(%)\n",
     );
     for device in devices(prof, only)? {
-        let (ctx, _) = ctx_for(&device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<OpStatisticRow>(&mut store, &ctx)?.iter() {
+        let session = session_for(&device)?;
+        for row in session.resolve::<OpStatisticRow>()?.iter() {
             body.push_str(&format!(
                 "{},{},{},{},{},{},{},{},{}\n",
                 row.device_id,
@@ -3087,12 +3114,11 @@ fn op_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 }
 
 fn l2_cache(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
-    let chunks = per_device(prof, only, |ctx, info| {
+    let chunks = per_device(prof, only, |session| {
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let rows = resolve::<L2CacheRow>(&mut store, ctx)?;
-        let tasks = resolve::<TimelineTask>(&mut store, ctx)?;
+        let rows = session.resolve::<L2CacheRow>()?;
+        let tasks = session.resolve::<TimelineTask>()?;
         let op_map: HashMap<(u32, u32), String> = tasks
             .iter()
             .map(|task| ((task.stream_id, task.task_id), task.name.clone()))
@@ -3134,11 +3160,10 @@ fn dvpp(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     );
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<DvppRow>(&mut store, &ctx)?.iter() {
+        for row in session.resolve::<DvppRow>()?.iter() {
             body.push_str(&format!(
                 "{dev},{},{},{},{:?},{:?},{}\n",
                 row.dvpp_id,
@@ -3193,11 +3218,10 @@ fn hccs_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Mode,Max,Min,Average\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let rows = resolve::<HccsRateRow>(&mut store, &ctx)?;
+        let rows = session.resolve::<HccsRateRow>()?;
         for [mode, max, min, avg] in hccs_table(&rows) {
             body.push_str(&format!("{dev},{mode},{max},{min},{avg}\n"));
             total += 1;
@@ -3312,11 +3336,10 @@ fn hbm_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Metric,Read(MB/s),Write(MB/s)\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for [metric, read, write] in hbm_table(&resolve::<HbmRecord>(&mut store, &ctx)?) {
+        for [metric, read, write] in hbm_table(&session.resolve::<HbmRecord>()?) {
             body.push_str(&format!("{dev},{metric},{read},{write}\n"));
             total += 1;
         }
@@ -3333,11 +3356,10 @@ fn npu_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,event,ddr(KB),hbm(KB),memory(KB),timestamp(us)\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<NpuMemRow>(&mut store, &ctx)?.iter() {
+        for row in session.resolve::<NpuMemRow>()?.iter() {
             body.push_str(&format!(
                 "{dev},{},{},{},{},{}\n",
                 mspark_model::npu_mem_event(row.event),
@@ -3358,12 +3380,11 @@ fn npu_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 }
 
 fn npu_module_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
-    let chunks = per_device(prof, only, |ctx, info| {
+    let chunks = per_device(prof, only, |session| {
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
         let mut body = String::new();
-        for row in resolve::<NpuModuleMemRow>(&mut store, ctx)?.iter() {
+        for row in session.resolve::<NpuModuleMemRow>()?.iter() {
             body.push_str(&format!(
                 "{dev},{},{},{},NPU:{dev}\n",
                 mspark_model::module_name(row.module_id),

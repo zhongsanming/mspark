@@ -1,7 +1,5 @@
-use std::path::Path;
-
 use crate::format::round6;
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
 /// V4 L2-cache event selection (`msconfig/l2_cache_config.py`).
@@ -25,7 +23,7 @@ impl Node for L2CacheRow {
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        let events = load_l2_events(ctx.device_dir()?)?;
+        let events = load_l2_events(ctx)?;
         let index = |name: &str| events.iter().position(|event| event == name);
         let request: Vec<usize> = REQUEST_EVENTS.iter().filter_map(|e| index(e)).collect();
         let victim: Vec<usize> = VICTIM_EVENTS.iter().filter_map(|e| index(e)).collect();
@@ -56,20 +54,10 @@ impl Node for L2CacheRow {
     }
 }
 
-fn load_l2_events(device_dir: &Path) -> Result<Vec<String>> {
-    let path = device_dir.join("sample.json");
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&text)?;
-    let raw = value
-        .get("l2CacheTaskProfilingEvents")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    Ok(raw
-        .split(',')
-        .map(|event| event.trim().to_lowercase())
-        .filter(|event| !event.is_empty())
-        .collect())
+fn load_l2_events(ctx: &Ctx) -> Result<Vec<String>> {
+    Ok(ctx
+        .require::<crate::ctx::SampleConfig>()?
+        .list("l2CacheTaskProfilingEvents"))
 }
 
 pub const L2_CACHE_TRUNK: usize = 72;

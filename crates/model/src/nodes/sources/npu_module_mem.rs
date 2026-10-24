@@ -2,7 +2,7 @@ use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
 use crate::ctx::DeviceInfo;
-use crate::time::load_host_syscnt_clock;
+use crate::time::DeviceStartLogs;
 
 #[derive(Debug, Clone, Copy)]
 pub struct NpuModuleMemRow {
@@ -25,7 +25,10 @@ impl Node for NpuModuleMemRow {
             return Ok(Vec::new());
         }
         let info = ctx.require::<DeviceInfo>()?;
-        let clock = load_host_syscnt_clock(ctx.device_dir()?, info.host_freq_mhz)?;
+        let clock = ctx
+            .require::<DeviceStartLogs>()?
+            .0
+            .host_clock(info.host_freq_mhz)?;
         let begin_ns = clock.begin_us as i128 * 1000;
         let mut out = Vec::new();
         for record in super::npu_module_mem::decode_npu_module_mem(&bytes)? {

@@ -1,3 +1,4 @@
+use crate::time::DeviceStartLogs;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -33,7 +34,7 @@ impl Node for HbmRecord {
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        let clock = crate::time::load_sampling_clock(ctx.device_dir()?)?;
+        let clock = ctx.require::<DeviceStartLogs>()?.0.sampling()?;
         let mut out = Vec::new();
         for chunk in bytes.as_chunks::<{ super::hbm::HBM_TRUNK }>().0 {
             let u64_at = |o: usize| {

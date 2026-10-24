@@ -1,3 +1,4 @@
+use crate::time::DeviceStartLogs;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -27,7 +28,7 @@ impl Node for HccsRateRow {
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        let clock = crate::time::load_mono_clock(ctx.device_dir()?, None)?;
+        let clock = ctx.require::<DeviceStartLogs>()?.0.mono(None)?;
         let text = String::from_utf8_lossy(&bytes);
         let mut samples: Vec<(u64, u64, u64)> = Vec::new();
         for line in text.lines() {

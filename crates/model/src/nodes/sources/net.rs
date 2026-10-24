@@ -1,7 +1,7 @@
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::time::load_mono_clock;
+use crate::time::DeviceStartLogs;
 
 /// One text network sample (`nic.data` / `roce.data`).
 ///
@@ -22,7 +22,7 @@ pub fn decode_net(ctx: &Ctx, prefix: &str) -> Result<Vec<NetSample>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
-    let clock = load_mono_clock(ctx.device_dir()?, None)?;
+    let clock = ctx.require::<DeviceStartLogs>()?.0.mono(None)?;
     let text = String::from_utf8_lossy(&bytes);
     let mut out = Vec::new();
     for line in text.lines() {

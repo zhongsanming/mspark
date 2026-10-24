@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
+use crate::ctx::DeviceInfo;
 use crate::format::{double_to_str, round3};
-use crate::time::load_host_clock;
+use crate::time::HostStartLogs;
 
 use super::sources::ApiEventRow;
 
@@ -25,7 +26,10 @@ impl Node for ApiStatisticRow {
     type Deps = (ApiEventRow,);
 
     fn compute(ctx: &Ctx, (events,): (std::sync::Arc<Vec<ApiEventRow>>,)) -> Result<Vec<Self>> {
-        let clock = load_host_clock(ctx.root())?;
+        let clock = ctx
+            .require::<HostStartLogs>()?
+            .0
+            .host_clock(ctx.require::<DeviceInfo>()?.host_freq_mhz)?;
         let mut grouped: BTreeMap<(String, u16), Vec<f64>> = BTreeMap::new();
         for event in events.iter() {
             let start = clock.to_ns(event.begin);

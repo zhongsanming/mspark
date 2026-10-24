@@ -61,10 +61,6 @@ impl Node for HostMemUsageRow {
 
 /// `info.json: memoryTotal` (KB), used as the denominator.
 fn host_mem_total(ctx: &Ctx) -> Option<u64> {
-    let text = std::fs::read_to_string(ctx.root().join("host").join("info.json")).ok()?;
-    let root: serde_json::Value = serde_json::from_str(&text).ok()?;
-    root.get("memoryTotal").and_then(|v| {
-        v.as_u64()
-            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-    })
+    let total = ctx.require::<crate::ctx::HostInfo>().ok()?.memory_total_kb;
+    (total > 0).then_some(total)
 }

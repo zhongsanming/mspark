@@ -127,6 +127,10 @@ mspark --strict verify-llc-csv PROF_… --golden …/llc_read_write_*.csv
 
 ### Project layout of the binary
 
+Each device is a `DeviceSession { ctx, info, store }`: the context (including the
+parsed `StartLogs`, `sample.json` and host `info.json`) is built once per process
+and the store memoises node tables for that device only.
+
 `src/main.rs` holds the CLI and the artifact exporters; `src/lib.rs` holds the
 parts that are worth unit-testing — `text` (Python-compatible float/rounding
 helpers, the NIC timestamp column, µs parsing, civil dates) and `verify` (CSV

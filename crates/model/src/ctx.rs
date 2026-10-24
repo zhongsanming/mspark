@@ -258,3 +258,74 @@ impl TryFrom<i64> for Chip {
         })
     }
 }
+
+/// The `host/info.json` fields that are not part of [`DeviceInfo`].
+#[derive(Debug, Clone, Default)]
+pub struct HostInfo {
+    /// `memoryTotal` (KB) — the denominator for the memory-percentage columns.
+    pub memory_total_kb: u64,
+    /// `cpuNums` — the per-interval CPU count for the `Total` usage rows.
+    pub cpu_nums: u32,
+}
+
+impl HostInfo {
+    pub fn load(root: &Path) -> Result<Self> {
+        let path = root.join("host").join("info.json");
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            // Host mem/disk artefacts are optional: an absent file is not an error.
+            Err(_) => return Ok(Self::default()),
+        };
+        let root: Value =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let as_u64 = |key: &str| {
+            root.get(key).and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+        };
+        Ok(Self {
+            memory_total_kb: as_u64("memoryTotal").unwrap_or(0),
+            cpu_nums: as_u64("cpuNums").unwrap_or(0) as u32,
+        })
+    }
+}
+
+/// `sample.json` for a device: the collection switches and sample settings
+/// (`l2CacheTaskProfilingEvents`, `host_disk_freq`, `msproftx`, …).
+#[derive(Debug, Clone, Default)]
+pub struct SampleConfig(pub Value);
+
+impl SampleConfig {
+    pub fn load(device_dir: &Path) -> Result<Self> {
+        let path = device_dir.join("sample.json");
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(_) => return Ok(Self(Value::Null)),
+        };
+        let value =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(Self(value))
+    }
+
+    pub fn string(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(Value::as_str)
+    }
+
+    pub fn f64(&self, key: &str) -> Option<f64> {
+        self.0.get(key).and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+    }
+
+    /// A comma-separated list, trimmed and lowercased, empty entries dropped.
+    pub fn list(&self, key: &str) -> Vec<String> {
+        self.string(key)
+            .unwrap_or("")
+            .split(',')
+            .map(|item| item.trim().to_lowercase())
+            .filter(|item| !item.is_empty())
+            .collect()
+    }
+}
