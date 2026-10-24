@@ -1,8 +1,6 @@
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
-
 /// Raw `hbm.data` sample (v1 layout, `QQII` = 24 bytes).
 #[derive(Debug, Clone, Copy)]
 pub struct HbmRecord {
@@ -27,17 +25,17 @@ impl Node for HbmRecord {
             .clone();
         let v2 = version.starts_with('2');
         let trunk = if v2 {
-            raw::HBM_TRUNK_V2
+            super::hbm::HBM_TRUNK_V2
         } else {
-            raw::HBM_TRUNK
+            super::hbm::HBM_TRUNK
         };
-        let bytes = raw::read_stream(ctx, "hbm.", trunk)?;
+        let bytes = crate::stream::read_stream(ctx, "hbm.", trunk)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
         let clock = crate::time::load_sampling_clock(ctx.device_dir()?)?;
         let mut out = Vec::new();
-        for chunk in bytes.as_chunks::<{ raw::HBM_TRUNK }>().0 {
+        for chunk in bytes.as_chunks::<{ super::hbm::HBM_TRUNK }>().0 {
             let u64_at = |o: usize| {
                 u64::from_le_bytes([
                     chunk[o],
@@ -63,3 +61,12 @@ impl Node for HbmRecord {
         Ok(out)
     }
 }
+
+pub const HBM_TRUNK: usize = 24;
+
+// ---------------------------------------------------------------------------
+// PCIe (`PcieRecord`, `Q22I`, 96 bytes)
+// ---------------------------------------------------------------------------
+
+// Collection-version 2.x layouts of the versioned streams.
+pub const HBM_TRUNK_V2: usize = 32;

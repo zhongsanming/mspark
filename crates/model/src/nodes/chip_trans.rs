@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
 use crate::time::{Clock, fmt_us};
 
 use super::sources::SocProfileRecord;
@@ -41,7 +40,7 @@ impl Node for ChipTransSample {
         let mut index: HashMap<(compact_str::CompactString, ChipTransKind, u32), usize> =
             HashMap::new();
         for record in records.iter() {
-            if let raw::SocProfileRaw::ChipTrans {
+            if let super::sources::stars_soc_profile::SocProfileRaw::ChipTrans {
                 sys_cnt,
                 acc_type,
                 event_id,

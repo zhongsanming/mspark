@@ -1,8 +1,6 @@
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
-
 /// Host memory utilisation sample (`host_mem.data`, text).
 ///
 /// Mirrors `HostMemUsagePresenter._parse_mem_data`:
@@ -32,7 +30,7 @@ impl Node for HostMemUsageRow {
         if mem_total == 0 {
             return Ok(Vec::new());
         }
-        let bytes = raw::read_host_stream(ctx, "host_mem.data.", 1)?;
+        let bytes = crate::stream::read_host_stream(ctx, "host_mem.data.", 1)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }

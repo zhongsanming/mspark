@@ -1,8 +1,6 @@
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
-
 /// One `pcie.data` record (`Q22I` = 96 bytes):
 /// `timestamp, then the 21 per-window PCIe measurements`.
 ///
@@ -22,13 +20,13 @@ impl Node for PcieRecord {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = raw::read_stream(ctx, "pcie.", raw::PCIE_TRUNK)?;
+        let bytes = crate::stream::read_stream(ctx, "pcie.", super::pcie::PCIE_TRUNK)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
         let clock = crate::time::load_mono_clock(ctx.device_dir()?, 0.0)?;
         Ok(bytes
-            .as_chunks::<{ raw::PCIE_TRUNK }>()
+            .as_chunks::<{ super::pcie::PCIE_TRUNK }>()
             .0
             .iter()
             .map(|chunk| {
@@ -47,3 +45,9 @@ impl Node for PcieRecord {
             .collect())
     }
 }
+
+pub const PCIE_TRUNK: usize = 96;
+
+// ---------------------------------------------------------------------------
+// LLC (`LlcRecord` v1, `QQII`, 24 bytes)
+// ---------------------------------------------------------------------------

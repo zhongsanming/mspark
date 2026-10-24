@@ -8,7 +8,6 @@ use crate::format::{csv_field, fmt_metric};
 use crate::host::ge_task_type;
 use crate::nodes::sources::tensor_info::{format_str, join_or_na, shapes_field, take_tensors};
 use crate::pmu::{AIC_EVENTS, AIV_EVENTS, get_freq, pmu_div, pmu_ratio};
-use crate::raw;
 use crate::tables;
 use crate::time::{Clock, fmt_us};
 
@@ -88,8 +87,8 @@ impl Node for OpSummaryRow {
         DeviceTask,
         NodeBasicInfoRow,
         TensorInfoRow,
-        raw::PmuData,
-        raw::LpmInfo,
+        super::sources::ffts_profile::PmuData,
+        super::sources::lpm::LpmInfo,
     );
 
     fn compute(
@@ -98,8 +97,8 @@ impl Node for OpSummaryRow {
             std::sync::Arc<Vec<DeviceTask>>,
             std::sync::Arc<Vec<NodeBasicInfoRow>>,
             std::sync::Arc<Vec<TensorInfoRow>>,
-            std::sync::Arc<Vec<raw::PmuData>>,
-            std::sync::Arc<Vec<raw::LpmInfo>>,
+            std::sync::Arc<Vec<super::sources::ffts_profile::PmuData>>,
+            std::sync::Arc<Vec<super::sources::lpm::LpmInfo>>,
         ),
     ) -> Result<Vec<Self>> {
         let clock = ctx.require::<Clock>()?;
@@ -111,11 +110,11 @@ impl Node for OpSummaryRow {
                 .or_default()
                 .push_back(tensor_info);
         }
-        let samples: Vec<raw::LpmSample> = lpms
+        let samples: Vec<super::sources::lpm::LpmSample> = lpms
             .first()
             .map(|lpm| lpm.samples.clone())
             .unwrap_or_default();
-        let pmu_map: HashMap<(u16, u16), &raw::PmuData> = pmus
+        let pmu_map: HashMap<(u16, u16), &super::sources::ffts_profile::PmuData> = pmus
             .iter()
             .map(|pmu| ((pmu.stream_id, pmu.task_id), pmu))
             .collect();

@@ -1,7 +1,6 @@
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
 use crate::time::{Clock, fmt_us};
 
 use super::sources::SocProfileRecord;
@@ -25,7 +24,7 @@ impl Node for AccPmuSample {
         let begin_ns = clock.begin_us as i128 * 1000;
         let mut rows: Vec<(u64, u16, [u64; 4])> = Vec::new();
         for record in records.iter() {
-            if let raw::SocProfileRaw::AccPmu {
+            if let super::sources::stars_soc_profile::SocProfileRaw::AccPmu {
                 timestamp,
                 acc_id,
                 bandwidth,

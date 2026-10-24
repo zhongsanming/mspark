@@ -1,7 +1,6 @@
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
 use crate::time::load_mono_clock;
 
 /// One text network sample (`nic.data` / `roce.data`).
@@ -19,7 +18,7 @@ pub struct NetSample {
 }
 
 pub fn decode_net(ctx: &Ctx, prefix: &str) -> Result<Vec<NetSample>> {
-    let bytes = raw::read_stream(ctx, prefix, 1)?;
+    let bytes = crate::stream::read_stream(ctx, prefix, 1)?;
     if bytes.is_empty() {
         return Ok(Vec::new());
     }

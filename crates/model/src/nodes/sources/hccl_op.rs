@@ -1,8 +1,6 @@
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
-
 /// One HCCL op record (`aging.compact.hccl_op_info`, 64 B compact record).
 ///
 /// `MsprofHcclOPInfo` at data+0: `relay:1|retry:1` (byte 0), `dataType` (byte 1),
@@ -25,10 +23,10 @@ impl Node for HcclOpRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = raw::read_host_stream(ctx, "aging.compact.hccl_op_info.", 1)?;
+        let bytes = crate::stream::read_host_stream(ctx, "aging.compact.hccl_op_info.", 1)?;
         let mut out = Vec::new();
-        for chunk in bytes.as_chunks::<{ raw::COMPACT_TRUNK }>().0 {
-            if u16::from_le_bytes([chunk[0], chunk[1]]) != raw::COMPACT_MAGIC {
+        for chunk in bytes.as_chunks::<{ crate::stream::COMPACT_TRUNK }>().0 {
+            if u16::from_le_bytes([chunk[0], chunk[1]]) != crate::stream::COMPACT_MAGIC {
                 continue;
             }
             let d = &chunk[24..];

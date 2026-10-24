@@ -1,8 +1,6 @@
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
-
 /// One `llc.data` record (v1 `QQII` = 24 bytes): sampling stamp (µs), count,
 /// event id, l3t id.
 #[derive(Debug, Clone, Copy)]
@@ -24,9 +22,9 @@ impl Node for LlcRecord {
             .collection_version
             .clone();
         let v2 = version.starts_with('2');
-        let bytes = raw::read_stream(ctx, "llc.", raw::LLC_TRUNK)?;
+        let bytes = crate::stream::read_stream(ctx, "llc.", super::llc::LLC_TRUNK)?;
         let mut out = Vec::new();
-        for chunk in bytes.as_chunks::<{ raw::LLC_TRUNK }>().0 {
+        for chunk in bytes.as_chunks::<{ super::llc::LLC_TRUNK }>().0 {
             let u64_at = |o: usize| {
                 u64::from_le_bytes([
                     chunk[o],
@@ -63,3 +61,5 @@ impl Node for LlcRecord {
 
 /// Read-mode event ids in slot order (write mode uses a different table).
 pub const LLC_READ_SLOTS: [u32; 8] = [0x00, 0x01, 0x02, 0x13, 0x20, 0x22, 0x34, 0x36];
+
+pub const LLC_TRUNK: usize = 24;

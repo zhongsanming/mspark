@@ -3,8 +3,6 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
-use crate::raw;
-
 type DvppAgg = (f64, f64, f64, f64, String);
 
 #[derive(Debug, Clone)]
@@ -22,7 +20,7 @@ impl Node for DvppRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = raw::read_stream(ctx, "dvpp.data.", 1)?;
+        let bytes = crate::stream::read_stream(ctx, "dvpp.data.", 1)?;
         let text = String::from_utf8_lossy(&bytes);
         let mut agg: BTreeMap<(u32, u32, u32), DvppAgg> = BTreeMap::new();
         for line in text.lines() {
