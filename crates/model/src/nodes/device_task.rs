@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
+use super::sources::stars_soc::{Acsq, StarsSocEntry};
 use crate::ctx::DeviceInfo;
 
 // ---------------------------------------------------------------------------
@@ -40,20 +41,15 @@ pub struct DeviceTask {
 
 impl Node for DeviceTask {
     const NAME: &'static str = "DeviceTask";
-    type Deps = (super::sources::stars_soc::StarsSocEntry,);
+    type Deps = (StarsSocEntry,);
 
-    fn compute(
-        ctx: &Ctx,
-        (soc,): (std::sync::Arc<Vec<super::sources::stars_soc::StarsSocEntry>>,),
-    ) -> Result<Vec<Self>> {
+    fn compute(ctx: &Ctx, (soc,): (std::sync::Arc<Vec<StarsSocEntry>>,)) -> Result<Vec<Self>> {
         let device_id = ctx.require::<DeviceInfo>()?.device_id.unwrap_or(0) as u16;
 
         // `LogModeling::MergeStartAndEnd` groups by the full task key, not by
         // stream: two tasks on one stream must not be paired with each other.
-        let mut acsq_start: BTreeMap<(u16, u16), Vec<super::sources::stars_soc::Acsq>> =
-            BTreeMap::new();
-        let mut acsq_end: BTreeMap<(u16, u16), Vec<super::sources::stars_soc::Acsq>> =
-            BTreeMap::new();
+        let mut acsq_start: BTreeMap<(u16, u16), Vec<Acsq>> = BTreeMap::new();
+        let mut acsq_end: BTreeMap<(u16, u16), Vec<Acsq>> = BTreeMap::new();
         // FFTS+ records are AIV sub-tasks of a mix task. They annotate the ACSQ
         // task (`mix`) and provide the timing that `op_summary` reports for it.
         let mut ffts_start: BTreeMap<(u16, u16), u64> = BTreeMap::new();
@@ -61,15 +57,15 @@ impl Node for DeviceTask {
 
         for entry in soc.iter() {
             match *entry {
-                super::sources::stars_soc::StarsSocEntry::Acsq(a) if a.is_end => acsq_end
+                StarsSocEntry::Acsq(a) if a.is_end => acsq_end
                     .entry((a.stream_id, a.task_id))
                     .or_default()
                     .push(a),
-                super::sources::stars_soc::StarsSocEntry::Acsq(a) => acsq_start
+                StarsSocEntry::Acsq(a) => acsq_start
                     .entry((a.stream_id, a.task_id))
                     .or_default()
                     .push(a),
-                super::sources::stars_soc::StarsSocEntry::FftsPlus(f) if f.sub_task_id == 0 => {
+                StarsSocEntry::FftsPlus(f) if f.sub_task_id == 0 => {
                     let key = (f.stream_id, f.task_id);
                     if f.is_end {
                         ffts_end.insert(key, f.timestamp);
@@ -77,7 +73,7 @@ impl Node for DeviceTask {
                         ffts_start.insert(key, f.timestamp);
                     }
                 }
-                super::sources::stars_soc::StarsSocEntry::FftsPlus(_) => {}
+                StarsSocEntry::FftsPlus(_) => {}
             }
         }
         let mix: BTreeMap<(u16, u16), (u64, u64)> = ffts_start
@@ -92,9 +88,7 @@ impl Node for DeviceTask {
             };
             starts.sort_by_key(|a| a.timestamp);
             ends.sort_by_key(|a| a.timestamp);
-            let push = |start: &super::sources::stars_soc::Acsq,
-                        end: &super::sources::stars_soc::Acsq,
-                        tasks: &mut Vec<DeviceTask>| {
+            let push = |start: &Acsq, end: &Acsq, tasks: &mut Vec<DeviceTask>| {
                 let key = (stream, task_id);
                 let (op_start_raw, op_end_raw) = mix
                     .get(&key)

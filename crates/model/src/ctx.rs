@@ -30,7 +30,7 @@ pub enum Chip {
 }
 
 impl Chip {
-    pub fn from_platform_version(v: i64) -> Option<Self> {
+    fn from_version(v: i64) -> Option<Self> {
         match v {
             0 => Some(Self::V1_1_0),
             1 => Some(Self::V2_1_0),
@@ -118,13 +118,8 @@ pub fn load_device_info(device_dir: &Path) -> Result<DeviceInfo> {
         .get("platform_version")
         .and_then(as_i64)
         .ok_or_else(|| anyhow!("{} has no platform_version", path.display()))?;
-    let chip = Chip::from_platform_version(platform_version).ok_or_else(|| {
-        anyhow!(
-            "unknown platform_version {platform_version} in {}; known values are \
-             0,1,2,3,4,5,7,8,9,11,15,16,19",
-            path.display()
-        )
-    })?;
+    let chip = Chip::try_from(platform_version)
+        .with_context(|| format!("reading platform_version from {}", path.display()))?;
     // `info.json:version` selects the binary layout of the versioned streams
     // (`hbm`, `llc`, `npu_mem`); msprof defaults to "1.0" when absent.
     let collection_version = root
@@ -178,25 +173,49 @@ pub fn load_device_info(device_dir: &Path) -> Result<DeviceInfo> {
                     .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             })
             .unwrap_or(0) as u32,
-        expand_status: 0,
+        expand_status: load_expand_status(device_dir),
         collection_version,
     })
 }
 
-fn find_info_json(dir: &Path) -> Result<PathBuf> {
-    let mut candidates = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry?;
+/// `StreamExpandSpec.expand_status`: `1` when the capture hit the stream-expand
+/// (dynamic stream) scenario, `0` otherwise.
+///
+/// The stream holds 64-byte records laid out as `<2H3IQ4B9I`; msprof reads the
+/// seventh unpacked field, i.e. the first of the four bytes at offset 24.
+/// Absent stream → `0` (msprof's default).
+fn load_expand_status(device_dir: &Path) -> u16 {
+    let data = device_dir.join("data");
+    let mut files: Vec<(u64, PathBuf)> = Vec::new();
+    let Ok(entries) = fs::read_dir(&data) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".done") {
+        if !name.starts_with("stream_expand_spec.") || name.ends_with(".done") {
             continue;
         }
-        if name == "info.json" || name.starts_with("info.json.") {
-            candidates.push(entry.path());
+        let slice = name
+            .rsplit('_')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        files.push((slice, entry.path()));
+    }
+    files.sort_by_key(|entry| entry.0);
+    for (_, path) in files {
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        if bytes.len() >= 25 {
+            return u16::from(bytes[24]);
         }
     }
-    candidates.sort();
-    candidates
+    0
+}
+
+fn find_info_json(dir: &Path) -> Result<PathBuf> {
+    crate::stream::files_with_prefix(dir, &["info.json"])
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no info.json under {}", dir.display()))
@@ -224,4 +243,89 @@ pub fn load_sample_string(
         .get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string()))
+}
+
+impl TryFrom<i64> for Chip {
+    type Error = anyhow::Error;
+
+    /// `info.json:platform_version` → chip generation.
+    fn try_from(version: i64) -> Result<Self> {
+        Chip::from_version(version).ok_or_else(|| {
+            anyhow!(
+                "unknown platform_version {version}; known values are \
+                 0,1,2,3,4,5,7,8,9,11,15,16,19"
+            )
+        })
+    }
+}
+
+/// The `host/info.json` fields that are not part of [`DeviceInfo`].
+#[derive(Debug, Clone, Default)]
+pub struct HostInfo {
+    /// `memoryTotal` (KB) — the denominator for the memory-percentage columns.
+    pub memory_total_kb: u64,
+    /// `cpuNums` — the per-interval CPU count for the `Total` usage rows.
+    pub cpu_nums: u32,
+}
+
+impl HostInfo {
+    pub fn load(root: &Path) -> Result<Self> {
+        let path = root.join("host").join("info.json");
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            // Host mem/disk artefacts are optional: an absent file is not an error.
+            Err(_) => return Ok(Self::default()),
+        };
+        let root: Value =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let as_u64 = |key: &str| {
+            root.get(key).and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+        };
+        Ok(Self {
+            memory_total_kb: as_u64("memoryTotal").unwrap_or(0),
+            cpu_nums: as_u64("cpuNums").unwrap_or(0) as u32,
+        })
+    }
+}
+
+/// `sample.json` for a device: the collection switches and sample settings
+/// (`l2CacheTaskProfilingEvents`, `host_disk_freq`, `msproftx`, …).
+#[derive(Debug, Clone, Default)]
+pub struct SampleConfig(pub Value);
+
+impl SampleConfig {
+    pub fn load(device_dir: &Path) -> Result<Self> {
+        let path = device_dir.join("sample.json");
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(_) => return Ok(Self(Value::Null)),
+        };
+        let value =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(Self(value))
+    }
+
+    pub fn string(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(Value::as_str)
+    }
+
+    pub fn f64(&self, key: &str) -> Option<f64> {
+        self.0.get(key).and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+    }
+
+    /// A comma-separated list, trimmed and lowercased, empty entries dropped.
+    pub fn list(&self, key: &str) -> Vec<String> {
+        self.string(key)
+            .unwrap_or("")
+            .split(',')
+            .map(|item| item.trim().to_lowercase())
+            .filter(|item| !item.is_empty())
+            .collect()
+    }
 }

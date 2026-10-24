@@ -6,20 +6,19 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 use mspark_df::{Ctx, Node};
 
 use crate::ctx::DeviceInfo;
+use crate::stream::STARS_SOC_TRUNK;
+use crate::stream::{CtxStreams, Stream};
 
 impl Node for super::stars_soc::StarsSocEntry {
     const NAME: &'static str = "stars_soc";
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes =
-            crate::stream::read_stream(ctx, "stars_soc.", super::stars_soc::STARS_SOC_TRUNK)?;
+        let bytes = ctx.stream(Stream::StarsSoc)?;
         let expand = ctx.require::<DeviceInfo>()?.expand_status;
         Ok(super::stars_soc::decode_stars_soc(&bytes, expand)?.0)
     }
 }
-
-pub const STARS_SOC_TRUNK: usize = 64;
 
 /// `PARSER_ITEM_*` values (6-bit `funcType` for the stars_soc / ffts_profile streams).
 pub const FUNC_ACSQ_LOG_START: u16 = 0b000000;

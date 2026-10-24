@@ -6,11 +6,20 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 use mspark_df::{Ctx, Node};
 
 use crate::host::{HashDic, TypeDic};
+use crate::stream::API_EVENT_TRUNK;
+use crate::stream::{CtxStreams, Stream};
 
 #[derive(Debug, Clone)]
 pub struct ApiEventRow {
     pub level: u16,
+    /// Trace label: the resolved `type_info_dic` name.
     pub api_name: String,
+    /// `api_statistic` label. msprof's grouping SQL is
+    /// `CASE WHEN level = 'acl' THEN id
+    ///       WHEN level IN ('runtime','model','node') THEN struct_type
+    ///       ELSE item_id END`, so communication rows are named by their
+    /// `item_id` hash, not by the dictionary entry (`master`/`slave`).
+    pub stat_name: String,
     pub tag: String,
     pub item_name: String,
     pub thread_id: u32,
@@ -40,11 +49,7 @@ impl Node for ApiEventRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_host_stream(
-            ctx,
-            "aging.api_event.data.",
-            super::api_event::API_EVENT_TRUNK,
-        )?;
+        let bytes = ctx.stream(Stream::ApiEvent)?;
         let mut raws = super::api_event::decode_api_event(&bytes)?;
         // msprof emits the CANN track sorted by the API start timestamp.
         raws.sort_by_key(|r| r.begin);
@@ -54,6 +59,11 @@ impl Node for ApiEventRow {
             .into_iter()
             .map(|r| {
                 let api_name = types.get(r.level, r.ty as u64).unwrap_or("N/A").to_string();
+                let stat_name = if r.level == 5_500 {
+                    hash.get(r.item_id).unwrap_or("N/A").to_string()
+                } else {
+                    api_name.clone()
+                };
                 let tag = if r.level == 20_000 {
                     acl_api_tag(r.ty >> 16)
                 } else {
@@ -62,6 +72,7 @@ impl Node for ApiEventRow {
                 ApiEventRow {
                     level: r.level,
                     api_name,
+                    stat_name,
                     tag,
                     item_name: if r.level == 10_000 {
                         hash.get(r.item_id).unwrap_or("N/A").to_string()
@@ -76,8 +87,6 @@ impl Node for ApiEventRow {
             .collect())
     }
 }
-
-pub const API_EVENT_TRUNK: usize = 40;
 
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C, packed)]
@@ -119,4 +128,15 @@ pub fn decode_api_event(bytes: &[u8]) -> Result<Vec<ApiEventRaw>> {
         });
     }
     Ok(out)
+}
+
+pub fn api_level_name(level: u16) -> &'static str {
+    match level {
+        20000 => "acl",
+        15000 => "model",
+        10000 => "node",
+        5500 => "communication",
+        5000 => "runtime",
+        _ => "",
+    }
 }

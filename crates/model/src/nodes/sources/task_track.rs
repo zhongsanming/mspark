@@ -3,6 +3,7 @@ use anyhow::Result;
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
+use crate::stream::{CtxStreams, Stream};
 use mspark_df::{Ctx, Node};
 
 #[derive(Debug, Clone)]
@@ -19,11 +20,7 @@ impl Node for TaskTrackRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_host_stream(
-            ctx,
-            "aging.compact.task_track.",
-            crate::stream::COMPACT_TRUNK,
-        )?;
+        let bytes = ctx.stream(Stream::TaskTrack)?;
         let dic = ctx.require::<crate::host::HashDic>()?;
         Ok(super::task_track::decode_task_track(&bytes)?
             .into_iter()

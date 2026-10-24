@@ -1,3 +1,5 @@
+use crate::stream::STARS_SOC_PROFILE_TRUNK;
+use crate::stream::{CtxStreams, Stream};
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -10,19 +12,13 @@ impl Node for SocProfileRecord {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_stream(
-            ctx,
-            "stars_soc_profile.",
-            super::stars_soc_profile::STARS_SOC_PROFILE_TRUNK,
-        )?;
+        let bytes = ctx.stream(Stream::StarsSocProfile)?;
         Ok(super::stars_soc_profile::decode_stars_soc_profile(&bytes)?
             .into_iter()
             .map(SocProfileRecord)
             .collect())
     }
 }
-
-pub const STARS_SOC_PROFILE_TRUNK: usize = 64;
 
 pub const FUNC_SOC_PROFILE_SIO: u16 = 0b011001;
 

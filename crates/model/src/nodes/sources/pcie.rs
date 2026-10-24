@@ -1,3 +1,6 @@
+use crate::stream::PCIE_TRUNK;
+use crate::stream::{CtxStreams, Stream};
+use crate::time::DeviceStartLogs;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -20,11 +23,11 @@ impl Node for PcieRecord {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_stream(ctx, "pcie.", super::pcie::PCIE_TRUNK)?;
+        let bytes = ctx.stream(Stream::Pcie)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        let clock = crate::time::load_mono_clock(ctx.device_dir()?, 0.0)?;
+        let clock = ctx.require::<DeviceStartLogs>()?.0.mono(None)?;
         Ok(bytes
             .as_chunks::<{ super::pcie::PCIE_TRUNK }>()
             .0
@@ -45,8 +48,6 @@ impl Node for PcieRecord {
             .collect())
     }
 }
-
-pub const PCIE_TRUNK: usize = 96;
 
 // ---------------------------------------------------------------------------
 // LLC (`LlcRecord` v1, `QQII`, 24 bytes)

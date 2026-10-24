@@ -4,16 +4,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, bail};
+use mspark::text::{civil_from_days, nic_timestamp_column, parse_us_to_ns, py_float, py_round3};
+use mspark::verify::{compare_generated, gate, read_rows};
 use mspark_df::{Ctx, Store, resolve};
+use mspark_model::CtxStreams;
 use mspark_model::NetSample;
-use mspark_model::tables;
 use mspark_model::{
     AccPmuSample, ApiEventRow, ApiStatisticRow, ChipTransKind, ChipTransSample, Clock, DeviceInfo,
     DvppRow, HbmRecord, HcclInfoRow, HcclOpRow, HccsRateRow, HostCpuUsageRow, HostMemUsageRow,
     InterSocSample, L2CacheRow, LlcRecord, LpmInfo, NicRow, NpuMemRow, NpuModuleMemRow,
     OpStatisticRow, OpSummaryRow, OverlapKind, OverlapRow, PcieRecord, PmuData, QosRow, RoceRow,
     SioSample, StarsSocEntry, TaskTimeRow, TimelineTask, TrackFlip, TscpuRecord, fmt_us,
-    load_clock, load_device_info, load_dictionaries, load_host_clock, load_sample_string,
+    load_device_info, load_dictionaries, load_sample_string,
 };
 use palc::{Parser, Subcommand};
 use rayon::prelude::*;
@@ -38,6 +40,9 @@ struct Cli {
     /// Restrict to one device directory, e.g. `device_7`.
     #[arg(long)]
     device: Option<String>,
+    /// Make verification commands exit non-zero on any mismatch.
+    #[arg(long)]
+    strict: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -388,10 +393,32 @@ enum Command {
         #[arg(long)]
         golden: PathBuf,
     },
+    /// Check every artifact against the capture's goldens and the recorded
+    /// baseline, failing when any artifact gets *less* close than it was.
+    VerifyAll {
+        /// A PROF_* directory.
+        prof: PathBuf,
+        /// Restrict to one device directory, e.g. `device_7`.
+        #[arg(long)]
+        device: Option<String>,
+        /// Directory holding the golden `mindstudio_profiler_output` files.
+        #[arg(long)]
+        golden_dir: Option<PathBuf>,
+        /// Baseline file (default: `spec/baseline.txt`).
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// Write the current distances to the baseline file instead of checking.
+        #[arg(long)]
+        update_baseline: bool,
+        /// Decimal places numeric cells are compared at (default: 3).
+        #[arg(long, default_value_t = 3)]
+        places: u32,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    mspark::verify::set_strict(cli.strict);
     let Some(command) = cli.command else {
         let prof = cli.prof.as_deref().ok_or_else(|| {
             anyhow::anyhow!("missing PROF_* directory (or pass a subcommand, e.g. `verify`)")
@@ -418,13 +445,13 @@ fn main() -> Result<()> {
             prof,
             device,
             golden,
-        } => verify_op_summary(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::OpSummary, &prof, device.as_deref(), &golden),
         Command::NpuMem { prof, device, out } => npu_mem(&prof, device.as_deref(), &out),
         Command::VerifyNpuMem {
             prof,
             device,
             golden,
-        } => verify_npu_mem(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::NpuMem, &prof, device.as_deref(), &golden),
         Command::NpuModuleMem { prof, device, out } => {
             npu_module_mem(&prof, device.as_deref(), &out)
         }
@@ -432,51 +459,51 @@ fn main() -> Result<()> {
             prof,
             device,
             golden,
-        } => verify_npu_module_mem(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::NpuModuleMem, &prof, device.as_deref(), &golden),
         Command::Dvpp { prof, device, out } => dvpp(&prof, device.as_deref(), &out),
         Command::VerifyDvpp {
             prof,
             device,
             golden,
-        } => verify_dvpp(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::Dvpp, &prof, device.as_deref(), &golden),
         Command::HccsCsv { prof, device, out } => hccs_csv(&prof, device.as_deref(), &out),
         Command::VerifyHccsCsv {
             prof,
             device,
             golden,
-        } => verify_hccs_csv(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::Hccs, &prof, device.as_deref(), &golden),
         Command::HbmCsv { prof, device, out } => hbm_csv(&prof, device.as_deref(), &out),
         Command::VerifyHbmCsv {
             prof,
             device,
             golden,
-        } => verify_hbm_csv(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::Hbm, &prof, device.as_deref(), &golden),
         Command::VerifyLlcCsv {
             prof,
             device,
             golden,
-        } => verify_llc_csv(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::Llc, &prof, device.as_deref(), &golden),
         Command::VerifyNicCsv {
             prof,
             device,
             golden,
-        } => verify_net_csv(&prof, device.as_deref(), &golden, false),
+        } => verify_csv(Artifact::Nic, &prof, device.as_deref(), &golden),
         Command::VerifyRoceCsv {
             prof,
             device,
             golden,
-        } => verify_net_csv(&prof, device.as_deref(), &golden, true),
+        } => verify_csv(Artifact::Roce, &prof, device.as_deref(), &golden),
         Command::VerifyPcieCsv {
             prof,
             device,
             golden,
-        } => verify_pcie_csv(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::Pcie, &prof, device.as_deref(), &golden),
         Command::L2Cache { prof, device, out } => l2_cache(&prof, device.as_deref(), &out),
         Command::VerifyL2Cache {
             prof,
             device,
             golden,
-        } => verify_l2_cache(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::L2Cache, &prof, device.as_deref(), &golden),
         Command::TsCpuPmuEvents { prof, device, out } => {
             ts_cpu_pmu_events(&prof, device.as_deref(), &out)
         }
@@ -484,7 +511,7 @@ fn main() -> Result<()> {
             prof,
             device,
             golden,
-        } => verify_ts_cpu_pmu_events(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::TsCpuPmuEvents, &prof, device.as_deref(), &golden),
         Command::TsCpuTopFunction { prof, device, out } => {
             ts_cpu_top_function(&prof, device.as_deref(), &out)
         }
@@ -492,7 +519,12 @@ fn main() -> Result<()> {
             prof,
             device,
             golden,
-        } => verify_ts_cpu_top_function(&prof, device.as_deref(), &golden),
+        } => verify_csv(
+            Artifact::TsCpuTopFunction,
+            &prof,
+            device.as_deref(),
+            &golden,
+        ),
         Command::ApiStatistic { prof, device, out } => {
             api_statistic(&prof, device.as_deref(), &out)
         }
@@ -500,19 +532,70 @@ fn main() -> Result<()> {
             prof,
             device,
             golden,
-        } => verify_api_statistic(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::ApiStatistic, &prof, device.as_deref(), &golden),
         Command::OpStatistic { prof, device, out } => op_statistic(&prof, device.as_deref(), &out),
         Command::VerifyOpStatistic {
             prof,
             device,
             golden,
-        } => verify_op_statistic(&prof, device.as_deref(), &golden),
+        } => verify_csv(Artifact::OpStatistic, &prof, device.as_deref(), &golden),
+        Command::VerifyAll {
+            prof,
+            device,
+            golden_dir,
+            baseline,
+            update_baseline,
+            places,
+        } => verify_all(
+            &prof,
+            device.as_deref(),
+            golden_dir.as_deref(),
+            baseline.as_deref(),
+            update_baseline,
+            places,
+        ),
         Command::Timeline { prof, device, out } => timeline(&prof, device.as_deref(), &out),
         Command::VerifyTimeline {
             prof,
             device,
             golden,
         } => verify_timeline(&prof, device.as_deref(), &golden),
+    }
+}
+
+/// Track order in the msprof viewer. The value is written to
+/// `process_sort_index` *and* packed into bits 5..10 of the track pid, which is
+/// why it appears in both the writer and the verifier; naming it once removes a
+/// whole class of copy-paste mistakes.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum Track {
+    Cann = 7,
+    CpuUsage = 9,
+    Hardware = 13,
+    AiCoreFreq = 14,
+    Communication = 16,
+    AccPmu = 18,
+    Hccs = 19,
+    Nic = 20,
+    Roce = 21,
+    Pcie = 22,
+    Hbm = 23,
+    StarsSocInfo = 24,
+    ChipTrans = 25,
+    Llc = 26,
+    Sio = 27,
+    Qos = 28,
+    Overlap = 29,
+}
+
+/// Host-side tracks (CANN, CPU usage, …) live on this pseudo device id.
+const HOST_PID: u32 = 31;
+
+impl Track {
+    /// `(pid << 10) | (sort_index << 5) | device`.
+    fn pid(self, host_pid: u32, device: u32) -> u32 {
+        (host_pid << 10) | ((self as u32) << 5) | device
     }
 }
 
@@ -584,34 +667,93 @@ fn devices(prof: &Path, only: Option<&str>) -> Result<Vec<PathBuf>> {
 /// Building a context parses `info.json`, the start logs and the host
 /// dictionaries, so doing it per artifact (35 call sites) is pure waste. Like
 /// [`store_for`], the cache is keyed by the device directory.
-type CtxCache = HashMap<std::path::PathBuf, (Arc<Ctx>, DeviceInfo)>;
+/// One device's parsed context and memoised node tables.
+///
+/// A device owns its `Store`, so artifacts never share mutable state by
+/// accident and the tables are dropped when the device is done. Each
+/// `resolve` takes the lock for the duration of one node computation, which
+/// removes the old "do not let the guard outlive this call" hazard.
+struct DeviceSession {
+    ctx: Arc<Ctx>,
+    info: DeviceInfo,
+    store: Mutex<Store>,
+}
 
-fn ctx_for(device: &Path) -> Result<(Arc<Ctx>, DeviceInfo)> {
-    static CTXS: OnceLock<Mutex<CtxCache>> = OnceLock::new();
-    let registry = CTXS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(entry) = registry.lock().expect("ctx registry").get(device) {
-        return Ok(entry.clone());
+impl DeviceSession {
+    fn resolve<T: mspark_df::Node>(&self) -> Result<Arc<Vec<T>>> {
+        let mut store = self.store.lock().expect("store lock");
+        resolve::<T>(&mut store, &self.ctx)
+    }
+
+    fn ctx(&self) -> &Ctx {
+        &self.ctx
+    }
+}
+
+/// Per-device session, built at most once per process.
+///
+/// The lock is held **across** the build on purpose: artifacts run in parallel,
+/// and releasing it before `build_ctx` made every racing artifact miss the cache
+/// and rebuild (20 artifacts → 20 loads of the same start logs, visible in
+/// `strace` as 20+ opens of one `start_info`).
+fn session_for(device: &Path) -> Result<Arc<DeviceSession>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<PathBuf, Arc<DeviceSession>>>> = OnceLock::new();
+    let registry = SESSIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().expect("session registry");
+    if let Some(session) = guard.get(device) {
+        return Ok(session.clone());
     }
     let (ctx, info) = build_ctx(device)?;
-    let entry = (Arc::new(ctx), info);
-    registry
-        .lock()
-        .expect("ctx registry")
-        .insert(device.to_path_buf(), entry.clone());
-    Ok(entry)
+    let session = Arc::new(DeviceSession {
+        ctx: Arc::new(ctx),
+        info,
+        store: Mutex::new(Store::new()),
+    });
+    guard.insert(device.to_path_buf(), session.clone());
+    Ok(session)
+}
+
+/// Run `f` for every selected device, in parallel.
+fn per_session<R, F>(prof: &Path, only: Option<&str>, f: F) -> Result<Vec<R>>
+where
+    R: Send,
+    F: Fn(&DeviceSession) -> Result<R> + Sync + Send,
+{
+    devices(prof, only)?
+        .par_iter()
+        .map(|device| {
+            let session = session_for(device)?;
+            f(&session)
+        })
+        .collect()
 }
 
 fn build_ctx(device: &Path) -> Result<(Ctx, DeviceInfo)> {
     let info = load_device_info(device)
         .with_context(|| format!("loading context for {}", device.display()))?;
-    let clock = load_clock(device, info.host_freq_mhz, info.hwts_freq_mhz)
-        .with_context(|| format!("loading time logs for {}", device.display()))?;
+    // One parse of the start logs feeds both the device clock and every node
+    // that needs a different view of the same four files.
+    let device_logs = mspark_model::StartLogs::load(device)
+        .with_context(|| format!("loading start logs for {}", device.display()))?;
+    let clock = device_logs
+        .clock(info.host_freq_mhz, info.hwts_freq_mhz)
+        .with_context(|| format!("deriving the device clock for {}", device.display()))?;
     // Each device carries its own capture root, so a merged multi-process
     // profile still reads host data from the right directory.
     let root = prof_root_of(device);
     let mut ctx = Ctx::new(root).with_device(device);
     ctx.insert(info.clone());
     ctx.insert(clock);
+    // The four start logs are shared by all five clock derivations; parsing them
+    // once here keeps the nodes from re-reading the same files (a single export
+    // used to open `start_info` 20+ times per device).
+    ctx.insert(mspark_model::DeviceStartLogs(device_logs));
+    ctx.insert(mspark_model::HostStartLogs(
+        mspark_model::StartLogs::load(&root.join("host"))
+            .with_context(|| format!("loading host start logs for {}", root.display()))?,
+    ));
+    ctx.insert(mspark_model::HostInfo::load(root)?);
+    ctx.insert(mspark_model::SampleConfig::load(device)?);
     // Host id→text dictionaries are loaded before any node runs.
     let (hash, types) = load_dictionaries(&root.join("host").join("data"));
     ctx.insert(hash);
@@ -786,19 +928,6 @@ fn parse_outputs(spec: &str) -> Result<Vec<Artifact>> {
     Ok(selected)
 }
 
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if month <= 2 { year + 1 } else { year }, month, day)
-}
-
 fn timestamp_dir() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -812,6 +941,31 @@ fn timestamp_dir() -> String {
         (rem % 3600) / 60,
         rem % 60
     )
+}
+
+/// Write per-device CSV chunks straight to disk instead of building the whole
+/// file in memory first: these tables reach hundreds of MB and the extra copy
+/// used to double the peak.
+fn write_chunks(
+    out: &Path,
+    header: &str,
+    chunks: impl IntoIterator<Item = String>,
+) -> Result<usize> {
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
+    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+    writer.write_all(header.as_bytes())?;
+    writer.write_all(b"\n")?;
+    let mut total = 0usize;
+    for chunk in chunks {
+        total += chunk.lines().count();
+        writer.write_all(chunk.as_bytes())?;
+    }
+    writer.flush()?;
+    println!("wrote {total} rows to {}", out.display());
+    Ok(total)
 }
 
 fn export(
@@ -919,27 +1073,6 @@ fn find_start_info(device: &Path) -> Result<std::path::PathBuf> {
     bail!("no start_info in {}", device.display())
 }
 
-/// `format_high_precision_for_csv(trans_into_local_time(duration_ns))`.
-///
-/// msprof computes `duration/1000 + local_time_offset` in `Decimal`, where the
-/// offset is the *shortest decimal repr* of an `f64` (≈0.1 µs resolution at this
-/// magnitude). `duration` is a nanosecond count, so the sum is done in
-/// milli-microseconds; the offset is rounded to that 0.1 µs grid with
-/// ties-to-even to match the repr.
-fn nic_timestamp_column(begin_us: i128, cmr_ns: i128, duration_ns: u64) -> String {
-    let offset_milli = begin_us * 1000 - cmr_ns;
-    let q = offset_milli.div_euclid(100);
-    let r = offset_milli.rem_euclid(100);
-    let rounded = match r.cmp(&50) {
-        std::cmp::Ordering::Greater => q + 1,
-        std::cmp::Ordering::Less => q,
-        std::cmp::Ordering::Equal if q % 2 == 0 => q,
-        std::cmp::Ordering::Equal => q + 1,
-    };
-    let milli = rounded * 100 + duration_ns as i128;
-    format!("{}.{:03}\t", milli / 1000, milli % 1000)
-}
-
 fn net_summary_rows(samples: &[NetSample], device: &Path) -> Result<Vec<[String; 10]>> {
     if samples.is_empty() {
         return Ok(Vec::new());
@@ -979,20 +1112,13 @@ fn net_csv(prof: &Path, only: Option<&str>, out: &Path, roce: bool) -> Result<()
     );
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
         let samples: Vec<NetSample> = if roce {
-            resolve::<RoceRow>(&mut store, &ctx)?
-                .iter()
-                .map(|r| r.0)
-                .collect()
+            session.resolve::<RoceRow>()?.iter().map(|r| r.0).collect()
         } else {
-            resolve::<NicRow>(&mut store, &ctx)?
-                .iter()
-                .map(|r| r.0)
-                .collect()
+            session.resolve::<NicRow>()?.iter().map(|r| r.0).collect()
         };
         for row in net_summary_rows(&samples, &device)? {
             body.push_str(&format!("{dev},{},0\n", row.join(",")));
@@ -1005,51 +1131,6 @@ fn net_csv(prof: &Path, only: Option<&str>, out: &Path, roce: bool) -> Result<()
     std::fs::write(out, body)?;
     println!("wrote {total} rows to {}", out.display());
     Ok(())
-}
-
-fn verify_net_csv(prof: &Path, only: Option<&str>, golden: &Path, roce: bool) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let samples: Vec<NetSample> = if roce {
-            resolve::<RoceRow>(&mut store, &ctx)?
-                .iter()
-                .map(|r| r.0)
-                .collect()
-        } else {
-            resolve::<NicRow>(&mut store, &ctx)?
-                .iter()
-                .map(|r| r.0)
-                .collect()
-        };
-        for row in net_summary_rows(&samples, &device)? {
-            let mut cells = vec![dev.clone()];
-            cells.extend(row.iter().cloned());
-            cells.push("0".to_string());
-            produced.push(cells);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "Timestamp(us)",
-            "Bandwidth(MB/s)",
-            "Rx Bandwidth efficiency(%)",
-            "rxPacket/s",
-            "rxError rate(%)",
-            "rxDropped rate(%)",
-            "Tx Bandwidth efficiency(%)",
-            "txPacket/s",
-            "txError rate(%)",
-            "txDropped rate(%)",
-            "funcId",
-        ],
-        &produced,
-    )
 }
 
 fn nic_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
@@ -1095,7 +1176,7 @@ fn net_rows(samples: &[NetSample], ty: &str) -> Vec<CounterRow> {
                 name: compact_str::format_compact!("Port 0/{dir}"),
                 tid: 0,
                 ts: ts.clone(),
-                args: vec![
+                args: smallvec::smallvec![
                     (eff_key, Num::Float(efficiency)),
                     (pkt_key, Num::Float(counters[0] as f64)),
                     (err_key, Num::Float(0.0)),
@@ -1136,7 +1217,7 @@ fn host_cpu_rows(samples: &[HostCpuUsageRow], offset_milli: i128) -> Vec<Counter
             name: compact_str::format_compact!("CPU {}", sample.cpu_no),
             tid: 0,
             ts: host_ts_us(sample.start_ns, offset_milli),
-            args: vec![("Usage(%)", Num::Float(sample.usage))],
+            args: smallvec::smallvec![("Usage(%)", Num::Float(sample.usage))],
         })
         .collect()
 }
@@ -1156,23 +1237,24 @@ fn host_mem_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Total Memory,Peak Used Memory,Recommend Memory\n");
     let mut rows = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, _info) = ctx_for(&device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let samples = resolve::<HostMemUsageRow>(&mut store, &ctx)?;
-        let total_kb = std::fs::read_to_string(ctx.root().join("host").join("info.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .and_then(|root| root.get("memoryTotal").and_then(|v| v.as_u64()))
+        let session = session_for(&device)?;
+        let ctx = session.ctx();
+        let samples = session.resolve::<HostMemUsageRow>()?;
+        let total_kb = ctx
+            .require::<mspark_model::HostInfo>()
+            .map(|info| info.memory_total_kb)
             .unwrap_or(0);
         let peak = samples
             .iter()
             .map(|sample| sample.usage)
             .fold(0.0f64, f64::max);
-        if let Some(last) = samples.last() {
+        if !samples.is_empty() {
             let used_kb = (peak * total_kb as f64 / 100.0).round() as u64;
+            // TODO(T-host-mem): the `Device_id` column is written as `host`
+            // because no golden `host_mem_usage` file exists in any capture we
+            // have, so the literal cannot be checked. msprof may write the
+            // numeric device id here like every other host-side table.
             body.push_str(&format!("host,{total_kb},{used_kb},{used_kb}\n"));
-            let _ = last;
             rows += 1;
         }
     }
@@ -1188,12 +1270,12 @@ fn communication_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> 
     let mut body = String::from("Device_id,OP Type,Count\n");
     let mut rows = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let ctx = session.ctx();
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let ops = resolve::<HcclOpRow>(&mut store, &ctx)?;
-        let tasks = resolve::<HcclInfoRow>(&mut store, &ctx)?;
+        let ops = session.resolve::<HcclOpRow>()?;
+        let tasks = session.resolve::<HcclInfoRow>()?;
         let dic = ctx.require::<mspark_model::HashDic>()?;
 
         // Tasks belong to the last op that started before them (validated: this
@@ -1256,10 +1338,9 @@ fn host_cpu_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         String::from("Device_id,Total Cpu Numbers,Occupied Cpu Numbers,Recommend Cpu Numbers\n");
     let mut total_rows = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, _info) = ctx_for(&device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let samples = resolve::<HostCpuUsageRow>(&mut store, &ctx)?;
+        let session = session_for(&device)?;
+        let ctx = session.ctx();
+        let samples = session.resolve::<HostCpuUsageRow>()?;
         use std::collections::BTreeMap;
         let mut peak: BTreeMap<u64, f64> = BTreeMap::new();
         let mut total = 0u64;
@@ -1351,13 +1432,13 @@ fn llc_track_rows(rows: &[LlcRecord], clock: &mspark_model::SamplingClock) -> Ve
             name: compact_str::format_compact!("LLC {bank} Read/Hit Rate"),
             tid: 0,
             ts: ts.clone(),
-            args: vec![("Hit Rate(%)", Num::Float(hit))],
+            args: smallvec::smallvec![("Hit Rate(%)", Num::Float(hit))],
         });
         out.push(CounterRow {
             name: compact_str::format_compact!("LLC {bank} Read/Throughput"),
             tid: 0,
             ts,
-            args: vec![("Throughput(MB/s)", Num::Float(tp))],
+            args: smallvec::smallvec![("Throughput(MB/s)", Num::Float(tp))],
         });
     }
     out
@@ -1399,12 +1480,15 @@ fn llc_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Mode,Task,Hit Rate(%),Throughput(MB/s)\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let ctx = session.ctx();
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let rows = resolve::<LlcRecord>(&mut store, &ctx)?;
-        let clock = mspark_model::load_sampling_clock(ctx.device_dir()?)?;
+        let rows = session.resolve::<LlcRecord>()?;
+        let clock = ctx
+            .require::<mspark_model::DeviceStartLogs>()?
+            .0
+            .sampling()?;
         for [task, hit, tp] in llc_csv_table(&rows, &clock) {
             body.push_str(&format!("{dev},read,{task},{hit},{tp}\n"));
             total += 1;
@@ -1416,32 +1500,6 @@ fn llc_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     std::fs::write(out, body)?;
     println!("wrote {total} rows to {}", out.display());
     Ok(())
-}
-
-fn verify_llc_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let rows = resolve::<LlcRecord>(&mut store, &ctx)?;
-        let clock = mspark_model::load_sampling_clock(ctx.device_dir()?)?;
-        for [task, hit, tp] in llc_csv_table(&rows, &clock) {
-            produced.push(vec![dev.clone(), "read".to_string(), task, hit, tp]);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "Mode",
-            "Task",
-            "Hit Rate(%)",
-            "Throughput(MB/s)",
-        ],
-        &produced,
-    )
 }
 
 fn pcie_track_rows(rows: &[PcieRecord]) -> Vec<CounterRow> {
@@ -1471,7 +1529,10 @@ fn pcie_track_rows(rows: &[PcieRecord]) -> Vec<CounterRow> {
                 name: compact_str::CompactString::from(name),
                 tid: 0,
                 ts: ts.clone(),
-                args: vec![("Rx", Num::Float(rx_value)), ("Tx", Num::Float(value(tx)))],
+                args: smallvec::smallvec![
+                    ("Rx", Num::Float(rx_value)),
+                    ("Tx", Num::Float(value(tx)))
+                ],
             });
         }
     }
@@ -1502,11 +1563,10 @@ fn pcie_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Mode,Min,Max,Avg\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for [mode, min, max, avg] in pcie_table(&resolve::<PcieRecord>(&mut store, &ctx)?) {
+        for [mode, min, max, avg] in pcie_table(&session.resolve::<PcieRecord>()?) {
             body.push_str(&format!("{dev},{mode},{min},{max},{avg}\n"));
             total += 1;
         }
@@ -1519,51 +1579,25 @@ fn pcie_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_pcie_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for [mode, min, max, avg] in pcie_table(&resolve::<PcieRecord>(&mut store, &ctx)?) {
-            produced.push(vec![dev.clone(), mode, min, max, avg]);
-        }
-    }
-    compare_table(
-        golden,
-        &["Device_id", "Mode", "Min", "Max", "Avg"],
-        &produced,
-    )
-}
-
 fn summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Task Count,OP Count,Timeline Events,Peak Memory(KB)\n");
     let (mut tasks_total, mut ops_total, mut events_total) = (0u64, 0u64, 0u64);
     let mut peak_max = 0u64;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        // The guard must not outlive the calls below: `device_timeline` locks the
-        // same per-device store and would deadlock.
-        let tasks = {
-            let mut store = shared_store.lock().expect("store lock");
-            resolve::<TaskTimeRow>(&mut store, &ctx)?.len() as u64
-        };
-        let ops = {
-            let mut store = shared_store.lock().expect("store lock");
-            resolve::<OpSummaryRow>(&mut store, &ctx)?.len() as u64
-        };
+        // Each `resolve` takes the store lock for one computation only, so the
+        // "do not let the guard escape" hazard that used to live here is gone.
+        let tasks = session.resolve::<TaskTimeRow>()?.len() as u64;
+        let ops = session.resolve::<OpSummaryRow>()?.len() as u64;
         let (_, events) = device_timeline(&device)?;
-        let peak = {
-            let mut store = shared_store.lock().expect("store lock");
-            resolve::<NpuMemRow>(&mut store, &ctx)?
-                .iter()
-                .map(|row| (row.ddr + row.hbm) / 1024)
-                .max()
-                .unwrap_or(0)
-        };
+        let peak = session
+            .resolve::<NpuMemRow>()?
+            .iter()
+            .map(|row| (row.ddr + row.hbm) / 1024)
+            .max()
+            .unwrap_or(0);
         body.push_str(&format!("{dev},{tasks},{ops},{events},{peak}\n"));
         tasks_total += tasks;
         ops_total += ops;
@@ -1615,21 +1649,6 @@ fn graph(format: &str) -> Result<()> {
     Ok(())
 }
 
-/// One memoised [`Store`] per device directory, shared by every artifact.
-///
-/// `resolve` already memoises within a store, so a single store per device makes
-/// the whole export share one `DeviceTask` / `stars_soc` decode instead of
-/// rebuilding it once per artifact.
-fn store_for(device: &Path) -> Arc<Mutex<Store>> {
-    static STORES: OnceLock<Mutex<HashMap<std::path::PathBuf, Arc<Mutex<Store>>>>> =
-        OnceLock::new();
-    let registry = STORES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = registry.lock().expect("store registry");
-    map.entry(device.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(Store::new())))
-        .clone()
-}
-
 fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
     let devices = devices(prof, only)?;
     println!("profile: {}", prof.display());
@@ -1639,38 +1658,26 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
     }
 
     for device in &devices {
-        let (ctx, info) = ctx_for(device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let soc = resolve::<StarsSocEntry>(&mut store, &ctx)?;
-        let pmu = resolve::<PmuData>(&mut store, &ctx)?;
-        let track = resolve::<TrackFlip>(&mut store, &ctx)?;
-        let lpm = resolve::<LpmInfo>(&mut store, &ctx)?;
+        let session = session_for(device)?;
+        let ctx = session.ctx();
+        let info = &session.info;
+        let soc = session.resolve::<StarsSocEntry>()?;
+        let pmu = session.resolve::<PmuData>()?;
+        let track = session.resolve::<TrackFlip>()?;
+        let lpm = session.resolve::<LpmInfo>()?;
 
         let soc_hist = mspark_model::nodes::sources::stars_soc::decode_stars_soc(
-            &mspark_model::stream::read_stream(
-                &ctx,
-                "stars_soc.",
-                mspark_model::nodes::sources::stars_soc::STARS_SOC_TRUNK,
-            )?,
+            &ctx.stream(mspark_model::Stream::StarsSoc)?,
             info.expand_status,
         )?
         .1;
         let pmu_hist = mspark_model::nodes::sources::ffts_profile::decode_ffts_profile(
-            &mspark_model::stream::read_stream(
-                &ctx,
-                "ffts_profile.",
-                mspark_model::nodes::sources::ffts_profile::FFTS_PROFILE_TRUNK,
-            )?,
+            &ctx.stream(mspark_model::Stream::FftsProfile)?,
             info.expand_status,
         )?
         .1;
         let track_hist = mspark_model::nodes::sources::ts_track::decode_ts_track(
-            &mspark_model::stream::read_stream(
-                &ctx,
-                "ts_track.",
-                mspark_model::nodes::sources::ts_track::TS_TRACK_TRUNK,
-            )?,
+            &ctx.stream(mspark_model::Stream::TsTrack)?,
         )?
         .1;
 
@@ -1678,7 +1685,7 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
             "\n== {} ==",
             device.file_name().unwrap_or_default().to_string_lossy()
         );
-        print_info(&info);
+        print_info(info);
         println!(
             "  stars_soc   {:>6} rows  funcs={}",
             soc.len(),
@@ -1704,7 +1711,10 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
         } else {
             println!("  lpmFreqConv  absent");
         }
-        println!("  store: {} nodes memoised", store.len());
+        println!(
+            "  store: {} nodes memoised",
+            session.store.lock().expect("store lock").len()
+        );
     }
     Ok(())
 }
@@ -1714,44 +1724,20 @@ fn stats(prof: &Path, only: Option<&str>) -> Result<()> {
 fn per_device<R, F>(prof: &Path, only: Option<&str>, f: F) -> Result<Vec<R>>
 where
     R: Send,
-    F: Fn(&Ctx, &DeviceInfo) -> Result<R> + Send + Sync,
+    F: Fn(&DeviceSession) -> Result<R> + Send + Sync,
 {
-    let devices = devices(prof, only)?;
-    let chunks: Vec<R> = devices
-        .par_iter()
-        .map(|device| {
-            let (ctx, info) = ctx_for(device)?;
-            f(&ctx, &info)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(chunks)
+    per_session(prof, only, f)
 }
 
 fn task_time(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
-    let chunks = per_device(prof, only, |ctx, _info| {
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
+    let chunks = per_device(prof, only, |session| {
         let mut body = String::new();
-        for row in resolve::<TaskTimeRow>(&mut store, ctx)?.iter() {
+        for row in session.resolve::<TaskTimeRow>()?.iter() {
             body.push_str(&row.to_csv());
         }
         Ok(body)
     })?;
-
-    let mut body = String::new();
-    body.push_str(TaskTimeRow::HEADER);
-    body.push('\n');
-    let mut total = 0usize;
-    for chunk in chunks {
-        total += chunk.lines().count();
-        body.push_str(&chunk);
-    }
-
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(out, body)?;
-    println!("wrote {total} rows to {}", out.display());
+    write_chunks(out, TaskTimeRow::HEADER, chunks)?;
     Ok(())
 }
 
@@ -1767,10 +1753,8 @@ fn verify(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
 
     let mut produced: HashMap<(u32, u32), Vec<TaskTimeRow>> = HashMap::new();
     for device in devices(prof, only)? {
-        let (ctx, _) = ctx_for(&device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<TaskTimeRow>(&mut store, &ctx)?.iter() {
+        let session = session_for(&device)?;
+        for row in session.resolve::<TaskTimeRow>()?.iter() {
             produced
                 .entry((row.stream_id, row.task_id))
                 .or_default()
@@ -1844,102 +1828,30 @@ fn verify(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
     println!(
         "task_start: exact {start_exact}/{matched}, within 2ns {start_close}/{matched}, max |Δ| = {max_start_ns} ns"
     );
-    Ok(())
-}
-
-/// Parse a `us` decimal string (`123.456`) into exact integer nanoseconds.
-/// Doing this through `f64` loses ~256 ns at 1.8e18 ns.
-fn parse_us_to_ns(s: &str) -> Result<i128> {
-    let s = s.trim();
-    let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
-    let int_part: i128 = int_part.parse()?;
-    let mut frac = frac_part.to_string();
-    frac.truncate(3);
-    while frac.len() < 3 {
-        frac.push('0');
-    }
-    let frac: i128 = frac.parse()?;
-    Ok(int_part * 1000 + frac)
+    let clean = missing == 0
+        && extras == 0
+        && matched == golden_rows.len()
+        && names_ok == matched
+        && types_ok == matched
+        && dur_exact == matched
+        && start_exact == matched;
+    gate(clean, || {
+        format!(
+            "task_time is not an exact match: {matched} matched, {missing} missing, {extras} extra, \
+             {names_ok}/{matched} names, {dur_exact}/{matched} durations, {start_exact}/{matched} starts"
+        )
+    })
 }
 
 fn op_summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
-    let chunks = per_device(prof, only, |ctx, _info| {
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
+    let chunks = per_device(prof, only, |session| {
         let mut body = String::new();
-        for row in resolve::<OpSummaryRow>(&mut store, ctx)?.iter() {
+        for row in session.resolve::<OpSummaryRow>()?.iter() {
             body.push_str(&row.to_csv());
         }
         Ok(body)
     })?;
-
-    let mut body = String::new();
-    body.push_str(&OpSummaryRow::HEADER.join(","));
-    body.push('\n');
-    let mut total = 0usize;
-    for chunk in chunks {
-        total += chunk.lines().count();
-        body.push_str(&chunk);
-    }
-
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(out, body)?;
-    println!("wrote {total} rows to {}", out.display());
-    Ok(())
-}
-
-fn verify_op_summary(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let golden_rows = read_rows(golden)?;
-    let Some((header, golden_rows)) = golden_rows.split_first() else {
-        anyhow::bail!("golden file is empty");
-    };
-    let expected: Vec<&str> = OpSummaryRow::HEADER.to_vec();
-    if header.len() != expected.len() {
-        anyhow::bail!(
-            "header width mismatch: golden {} vs mspark {}",
-            header.len(),
-            expected.len()
-        );
-    }
-
-    let mut produced = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, _) = ctx_for(&device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        produced.extend(resolve::<OpSummaryRow>(&mut store, &ctx)?.iter().cloned());
-    }
-
-    let n = golden_rows.len().min(produced.len());
-    let mut exact = vec![0usize; expected.len()];
-    let mut near = vec![0usize; expected.len()];
-    for i in 0..n {
-        for (c, slot) in exact.iter_mut().enumerate() {
-            if let (Some(g), Some(p)) = (golden_rows[i].get(c), produced[i].cols.get(c)) {
-                let p = p.trim();
-                if g == p {
-                    *slot += 1;
-                    near[c] += 1;
-                } else if matches!(c, 8 | 9 | 10 | 45)
-                    && let (Ok(gv), Ok(pv)) = (g.parse::<f64>(), p.parse::<f64>())
-                    && (gv - pv).abs() <= 0.0011
-                {
-                    near[c] += 1;
-                }
-            }
-        }
-    }
-
-    println!("golden rows: {}", golden_rows.len());
-    println!("produced rows: {}", produced.len());
-    for (c, name) in expected.iter().enumerate() {
-        println!(
-            "{c:>3}  {name:<28} exact {}/{n}  near {}/{n}",
-            exact[c], near[c]
-        );
-    }
+    write_chunks(out, &OpSummaryRow::HEADER.join(","), chunks)?;
     Ok(())
 }
 
@@ -1987,8 +1899,10 @@ impl Serialize for Args {
 
 /// Argument list with static keys: the keys are literals, so this avoids a
 /// `String` allocation per argument per event.
-fn args(items: Vec<(&'static str, Num)>) -> Args {
-    Args(smallvec::SmallVec::from_vec(items))
+/// Build the ordered trace arguments without a heap allocation for the common
+/// four-argument event.
+fn args<const N: usize>(items: [(&'static str, Num); N]) -> Args {
+    Args(smallvec::SmallVec::from_iter(items))
 }
 
 /// One Chrome-trace event. Field order here is the serialized key order.
@@ -2060,7 +1974,7 @@ struct CounterRow {
     name: compact_str::CompactString,
     tid: u32,
     ts: compact_str::CompactString,
-    args: Vec<(&'static str, Num)>,
+    args: smallvec::SmallVec<[(&'static str, Num); 4]>,
 }
 
 const SIO_COUNTERS: [&str; 8] = [
@@ -2108,7 +2022,7 @@ fn acc_pmu_rows(samples: &[AccPmuSample]) -> Vec<CounterRow> {
                 name: compact_str::CompactString::from(*name),
                 tid: 0,
                 ts: sample.ts_us.clone(),
-                args: vec![("value", Num::Int(sample.values[i]))],
+                args: smallvec::smallvec![("value", Num::Int(sample.values[i]))],
             });
         }
     }
@@ -2122,7 +2036,7 @@ fn inter_soc_rows(samples: &[InterSocSample]) -> Vec<CounterRow> {
             name: compact_str::CompactString::from("L2 Buffer Bw Level"),
             tid: 0,
             ts: sample.ts_us.clone(),
-            args: vec![(
+            args: smallvec::smallvec![(
                 "L2 Buffer Bw Level",
                 Num::Int(sample.l2_buffer_bw_level as u64),
             )],
@@ -2131,7 +2045,7 @@ fn inter_soc_rows(samples: &[InterSocSample]) -> Vec<CounterRow> {
             name: compact_str::CompactString::from("Mata Bw Level"),
             tid: 0,
             ts: sample.ts_us.clone(),
-            args: vec![("Mata Bw Level", Num::Int(sample.mata_bw_level as u64))],
+            args: smallvec::smallvec![("Mata Bw Level", Num::Int(sample.mata_bw_level as u64))],
         });
     }
     rows
@@ -2163,7 +2077,7 @@ fn chip_trans_rows(samples: &[ChipTransSample]) -> Vec<CounterRow> {
                 name: compact_str::CompactString::from(name),
                 tid,
                 ts: sample.ts_us.clone(),
-                args: vec![
+                args: smallvec::smallvec![
                     (name, Num::Int(value)),
                     (id_key, Num::Int(sample.id as u64)),
                 ],
@@ -2173,13 +2087,20 @@ fn chip_trans_rows(samples: &[ChipTransSample]) -> Vec<CounterRow> {
     rows
 }
 
-fn write_counter(events: &mut Vec<TraceEvent>, pid: u32, row: &CounterRow) {
+fn write_counter(events: &mut Vec<TraceEvent>, pid: u32, row: CounterRow) {
+    let CounterRow {
+        name,
+        tid,
+        ts,
+        args,
+        ..
+    } = row;
     events.push(TraceEvent::counter(
-        row.name.clone(),
+        name,
         pid,
-        row.tid,
-        row.ts.clone(),
-        Args(smallvec::SmallVec::from_vec(row.args.clone())),
+        tid,
+        ts,
+        Args(smallvec::SmallVec::from_iter(args)),
     ));
 }
 
@@ -2265,19 +2186,19 @@ fn push_process_meta(
         "process_name",
         pid,
         0,
-        args(vec![("name", Num::Str(name.to_string()))]),
+        args([("name", Num::Str(name.to_string()))]),
     ));
     events.push(TraceEvent::meta(
         "process_labels",
         pid,
         0,
-        args(vec![("labels", Num::Str(label.to_string()))]),
+        args([("labels", Num::Str(label.to_string()))]),
     ));
     events.push(TraceEvent::meta(
         "process_sort_index",
         pid,
         0,
-        args(vec![("sort_index", Num::Int(sort_index as u64))]),
+        args([("sort_index", Num::Int(sort_index as u64))]),
     ));
 }
 
@@ -2286,13 +2207,13 @@ fn push_thread_meta(events: &mut Vec<TraceEvent>, pid: u32, tid: u32, name: &str
         "thread_name",
         pid,
         tid,
-        args(vec![("name", Num::Str(name.to_string()))]),
+        args([("name", Num::Str(name.to_string()))]),
     ));
     events.push(TraceEvent::meta(
         "thread_sort_index",
         pid,
         tid,
-        args(vec![("sort_index", Num::Int(sort_index as u64))]),
+        args([("sort_index", Num::Int(sort_index as u64))]),
     ));
 }
 
@@ -2313,7 +2234,7 @@ fn qos_rows(samples: &[QosRow], events: &[String]) -> Vec<CounterRow> {
                 name: compact_str::format_compact!("QoS {event}"),
                 tid: 0,
                 ts: sample.ts_us.clone(),
-                args: vec![("value", Num::Int(sample.values[i] as u64))],
+                args: smallvec::smallvec![("value", Num::Int(sample.values[i] as u64))],
             });
         }
     }
@@ -2332,13 +2253,13 @@ fn hccs_rows(samples: &[HccsRateRow]) -> Vec<CounterRow> {
             name: compact_str::CompactString::from("Tx"),
             tid: 0,
             ts: ts.clone(),
-            args: vec![("Tx(MB/s)", Num::Float(round3(sample.tx)))],
+            args: smallvec::smallvec![("Tx(MB/s)", Num::Float(round3(sample.tx)))],
         });
         rows.push(CounterRow {
             name: compact_str::CompactString::from("Rx"),
             tid: 0,
             ts,
-            args: vec![("Rx(MB/s)", Num::Float(round3(sample.rx)))],
+            args: smallvec::smallvec![("Rx(MB/s)", Num::Float(round3(sample.rx)))],
         });
     }
     rows
@@ -2358,7 +2279,7 @@ fn npu_mem_rows(samples: &[NpuMemRow]) -> Vec<CounterRow> {
                 name: compact_str::format_compact!("{owner}/{metric}"),
                 tid: 0,
                 ts: ts.clone(),
-                args: vec![("KB", Num::Float(value as f64 / 1024.0))],
+                args: smallvec::smallvec![("KB", Num::Float(value as f64 / 1024.0))],
             });
         }
     }
@@ -2402,18 +2323,18 @@ fn timeline(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 /// Build one device's timeline events. Devices are independent, so this runs
 /// in parallel; the caller concatenates chunks in device order.
 fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
-    let (ctx, info) = ctx_for(device)?;
+    let session = session_for(device)?;
+    let ctx = session.ctx();
+    let info = &session.info;
     let mut events: Vec<TraceEvent> = Vec::new();
     let mut total = 0usize;
     {
         let clock = ctx.require::<Clock>()?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let tasks = resolve::<TimelineTask>(&mut store, &ctx)?;
+        let tasks = session.resolve::<TimelineTask>()?;
 
         let dev = info.device_id.unwrap_or(0);
-        let hw_pid = (info.pid << 10) | (13 << 5) | dev;
-        let freq_pid = (info.pid << 10) | (14 << 5) | dev;
+        let hw_pid = Track::Hardware.pid(info.pid, dev);
+        let freq_pid = Track::AiCoreFreq.pid(info.pid, dev);
 
         for ts in [clock.begin_us, clock.end_us] {
             events.push(TraceEvent::counter(
@@ -2421,7 +2342,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
                 freq_pid,
                 0,
                 fmt_us(ts * 1000, false),
-                args(vec![("MHz", Num::Int(info.aic_freq_mhz as u64))]),
+                args([("MHz", Num::Int(info.aic_freq_mhz as u64))]),
             ));
         }
 
@@ -2447,7 +2368,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
                 task.tid,
                 task.ts_us.clone(),
                 task.dur_us,
-                args(vec![
+                args([
                     ("Model Id", Num::Int(task.model_id as u64)),
                     ("Task Type", Num::Str(task.task_type.clone())),
                     ("Physic Stream Id", Num::Int(task.stream_id as u64)),
@@ -2460,9 +2381,12 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         }
 
         // --- CANN host track ---
-        let api_events = resolve::<ApiEventRow>(&mut store, &ctx)?;
-        let host_clock = load_host_clock(prof_root_of(device))?;
-        let cann_pid = (info.pid << 10) | (7 << 5) | 31;
+        let api_events = session.resolve::<ApiEventRow>()?;
+        let host_clock = ctx
+            .require::<mspark_model::HostStartLogs>()?
+            .0
+            .host_clock(ctx.require::<mspark_model::DeviceInfo>()?.host_freq_mhz)?;
+        let cann_pid = Track::Cann.pid(info.pid, HOST_PID);
         push_process_meta(&mut events, cann_pid, "CANN", "CPU", 7);
         let mut api_tids: Vec<u32> = api_events.iter().map(|e| e.thread_id).collect();
         api_tids.sort_unstable();
@@ -2493,7 +2417,7 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
                 event.thread_id,
                 ts,
                 dur,
-                args(vec![
+                args([
                     ("Thread Id", Num::Int(event.thread_id as u64)),
                     ("Mode", Num::Str(mode)),
                     ("level", Num::Str(level_name.to_string())),
@@ -2505,39 +2429,39 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
 
         // --- SOC profile tracks ---
         let label = format!("NPU {dev}");
-        let sio = resolve::<SioSample>(&mut store, &ctx)?;
-        let acc = resolve::<AccPmuSample>(&mut store, &ctx)?;
-        let inter = resolve::<InterSocSample>(&mut store, &ctx)?;
-        let chip = resolve::<ChipTransSample>(&mut store, &ctx)?;
-        let track_pid = |sort: u32| (info.pid << 10) | (sort << 5) | dev;
-        for (sort, name) in [
-            (27u32, "SIO"),
-            (18u32, "Acc PMU"),
-            (24u32, "Stars Soc Info"),
-            (25u32, "Stars Chip Trans"),
+        let sio = session.resolve::<SioSample>()?;
+        let acc = session.resolve::<AccPmuSample>()?;
+        let inter = session.resolve::<InterSocSample>()?;
+        let chip = session.resolve::<ChipTransSample>()?;
+        let track_pid = |track: Track| track.pid(info.pid, dev);
+        for (track, name) in [
+            (Track::Sio, "SIO"),
+            (Track::AccPmu, "Acc PMU"),
+            (Track::StarsSocInfo, "Stars Soc Info"),
+            (Track::ChipTrans, "Stars Chip Trans"),
         ] {
-            push_process_meta(&mut events, track_pid(sort), name, &label, sort);
+            push_process_meta(&mut events, track_pid(track), name, &label, track as u32);
         }
         for row in sio_rows(&sio) {
-            write_counter(&mut events, track_pid(27), &row);
+            write_counter(&mut events, track_pid(Track::Sio), row);
             total += 1;
         }
         for row in acc_pmu_rows(&acc) {
-            write_counter(&mut events, track_pid(18), &row);
+            write_counter(&mut events, track_pid(Track::AccPmu), row);
             total += 1;
         }
         for row in inter_soc_rows(&inter) {
-            write_counter(&mut events, track_pid(24), &row);
+            write_counter(&mut events, track_pid(Track::StarsSocInfo), row);
             total += 1;
         }
         for row in chip_trans_rows(&chip) {
-            write_counter(&mut events, track_pid(25), &row);
+            write_counter(&mut events, track_pid(Track::ChipTrans), row);
             total += 1;
         }
 
         // --- Overlap Analysis ---
-        let overlap = resolve::<OverlapRow>(&mut store, &ctx)?;
-        let overlap_pid = track_pid(29);
+        let overlap = session.resolve::<OverlapRow>()?;
+        let overlap_pid = track_pid(Track::Overlap);
         push_process_meta(&mut events, overlap_pid, "Overlap Analysis", &label, 29);
         for (tid, name) in [
             (0u32, "Communication"),
@@ -2564,99 +2488,104 @@ fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         }
 
         // --- QoS ---
-        let qos = resolve::<QosRow>(&mut store, &ctx)?;
+        let qos = session.resolve::<QosRow>()?;
         let qos_events = sample_csv_list(ctx.device_dir()?, "qosEvents")?;
-        let qos_pid = track_pid(28);
+        let qos_pid = track_pid(Track::Qos);
         push_process_meta(&mut events, qos_pid, "QoS", &label, 28);
         for row in qos_rows(&qos, &qos_events) {
-            write_counter(&mut events, qos_pid, &row);
+            write_counter(&mut events, qos_pid, row);
             total += 1;
         }
 
         // --- NPU MEM ---
-        let npu_mem = resolve::<NpuMemRow>(&mut store, &ctx)?;
-        let npu_mem_pid = track_pid(16);
+        let npu_mem = session.resolve::<NpuMemRow>()?;
+        let npu_mem_pid = track_pid(Track::Communication);
         // --- CPU Usage (host track) ---
-        let cpu_usage = resolve::<HostCpuUsageRow>(&mut store, &ctx)?;
-        let cpu_pid = (info.pid << 10) | (9 << 5) | 31;
+        let cpu_usage = session.resolve::<HostCpuUsageRow>()?;
+        let cpu_pid = Track::CpuUsage.pid(info.pid, HOST_PID);
         events.push(TraceEvent::meta(
             "process_name",
             cpu_pid,
             0,
-            args(vec![("name", Num::Str("CPU Usage".to_string()))]),
+            args([("name", Num::Str("CPU Usage".to_string()))]),
         ));
         events.push(TraceEvent::meta(
             "process_labels",
             cpu_pid,
             0,
-            args(vec![("labels", Num::Str("CPU".to_string()))]),
+            args([("labels", Num::Str("CPU".to_string()))]),
         ));
         events.push(TraceEvent::meta(
             "process_sort_index",
             cpu_pid,
             0,
-            args(vec![("sort_index", Num::Int(9))]),
+            args([("sort_index", Num::Int(9))]),
         ));
         let cpu_offset = host_local_offset_milli(ctx.root())?;
         for row in host_cpu_rows(&cpu_usage, cpu_offset) {
-            write_counter(&mut events, cpu_pid, &row);
+            write_counter(&mut events, cpu_pid, row);
             total += 1;
         }
 
         // --- HCCS ---
-        let hccs = resolve::<HccsRateRow>(&mut store, &ctx)?;
-        let hccs_pid = track_pid(19);
+        let hccs = session.resolve::<HccsRateRow>()?;
+        let hccs_pid = track_pid(Track::Hccs);
         push_process_meta(&mut events, hccs_pid, "HCCS", &label, 19);
-        let nic: Vec<NetSample> = resolve::<NicRow>(&mut store, &ctx)?
+        let nic: Vec<NetSample> = session
+            .resolve::<NicRow>()?
             .iter()
             .map(|row| row.0)
             .collect();
-        let nic_pid = track_pid(20);
+        let nic_pid = track_pid(Track::Nic);
         push_process_meta(&mut events, nic_pid, "NIC", &label, 20);
         for row in net_rows(&nic, "NIC") {
-            write_counter(&mut events, nic_pid, &row);
+            write_counter(&mut events, nic_pid, row);
             total += 1;
         }
-        let roce: Vec<NetSample> = resolve::<RoceRow>(&mut store, &ctx)?
+        let roce: Vec<NetSample> = session
+            .resolve::<RoceRow>()?
             .iter()
             .map(|row| row.0)
             .collect();
-        let roce_pid = track_pid(21);
+        let roce_pid = track_pid(Track::Roce);
         push_process_meta(&mut events, roce_pid, "RoCE", &label, 21);
         for row in net_rows(&roce, "RoCE") {
-            write_counter(&mut events, roce_pid, &row);
+            write_counter(&mut events, roce_pid, row);
             total += 1;
         }
-        let llc = resolve::<LlcRecord>(&mut store, &ctx)?;
-        let llc_clock = mspark_model::load_sampling_clock(ctx.device_dir()?)?;
-        let llc_pid = track_pid(26);
+        let llc = session.resolve::<LlcRecord>()?;
+        let llc_clock = ctx
+            .require::<mspark_model::DeviceStartLogs>()?
+            .0
+            .sampling()?;
+        let llc_pid = track_pid(Track::Llc);
         push_process_meta(&mut events, llc_pid, "LLC", &label, 26);
         for row in llc_track_rows(&llc, &llc_clock) {
-            write_counter(&mut events, llc_pid, &row);
+            write_counter(&mut events, llc_pid, row);
             total += 1;
         }
-        let hbm = resolve::<HbmRecord>(&mut store, &ctx)?;
-        let hbm_pid = track_pid(23);
+        let hbm = session.resolve::<HbmRecord>()?;
+        let hbm_pid = track_pid(Track::Hbm);
         push_process_meta(&mut events, hbm_pid, "HBM", &label, 23);
         for row in hbm_track_rows(&hbm) {
-            write_counter(&mut events, hbm_pid, &row);
+            write_counter(&mut events, hbm_pid, row);
             total += 1;
         }
-        let pcie = resolve::<PcieRecord>(&mut store, &ctx)?;
-        let pcie_pid = track_pid(22);
+        let pcie = session.resolve::<PcieRecord>()?;
+        let pcie_pid = track_pid(Track::Pcie);
         push_process_meta(&mut events, pcie_pid, "PCIe", &label, 22);
         for row in pcie_track_rows(&pcie) {
-            write_counter(&mut events, pcie_pid, &row);
+            write_counter(&mut events, pcie_pid, row);
             total += 1;
         }
         for row in hccs_rows(&hccs) {
-            write_counter(&mut events, hccs_pid, &row);
+            write_counter(&mut events, hccs_pid, row);
             total += 1;
         }
 
         push_process_meta(&mut events, npu_mem_pid, "NPU MEM", &label, 16);
         for row in npu_mem_rows(&npu_mem) {
-            write_counter(&mut events, npu_mem_pid, &row);
+            write_counter(&mut events, npu_mem_pid, row);
             total += 1;
         }
     }
@@ -2744,9 +2673,11 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
     let mut overlap_max_dur = 0.0f64;
 
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let ctx = session.ctx();
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let hw_pid = ((info.pid << 10) | (13 << 5) | dev) as u64;
+        let hw_pid = Track::Hardware.pid(info.pid, dev) as u64;
         let expected: Vec<&serde_json::Value> = array
             .iter()
             .filter(|event| {
@@ -2754,9 +2685,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                     && event.get("ph").and_then(|p| p.as_str()) == Some("X")
             })
             .collect();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let produced = resolve::<TimelineTask>(&mut store, &ctx)?;
+        let produced = session.resolve::<TimelineTask>()?;
 
         golden_rows += expected.len();
         produced_rows += produced.len();
@@ -2796,8 +2725,11 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
         }
 
         // CANN host track
-        let host_clock = load_host_clock(prof)?;
-        let cann_pid = ((info.pid << 10) | (7 << 5) | 31) as u64;
+        let host_clock = ctx
+            .require::<mspark_model::HostStartLogs>()?
+            .0
+            .host_clock(ctx.require::<mspark_model::DeviceInfo>()?.host_freq_mhz)?;
+        let cann_pid = Track::Cann.pid(info.pid, HOST_PID) as u64;
         let expected_api: Vec<&serde_json::Value> = array
             .iter()
             .filter(|event| {
@@ -2805,7 +2737,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                     && event.get("ph").and_then(|p| p.as_str()) == Some("X")
             })
             .collect();
-        let produced_api = resolve::<ApiEventRow>(&mut store, &ctx)?;
+        let produced_api = session.resolve::<ApiEventRow>()?;
         api_golden += expected_api.len();
         api_produced += produced_api.len();
         for (golden, ours) in expected_api.iter().zip(produced_api.iter()) {
@@ -2857,35 +2789,36 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
         }
 
         // SOC profile counter tracks
-        let sio_rows_v = sio_rows(&resolve::<SioSample>(&mut store, &ctx)?);
-        let acc_rows_v = acc_pmu_rows(&resolve::<AccPmuSample>(&mut store, &ctx)?);
-        let inter_rows_v = inter_soc_rows(&resolve::<InterSocSample>(&mut store, &ctx)?);
-        let chip_rows_v = chip_trans_rows(&resolve::<ChipTransSample>(&mut store, &ctx)?);
+        let sio_rows_v = sio_rows(&session.resolve::<SioSample>()?);
+        let acc_rows_v = acc_pmu_rows(&session.resolve::<AccPmuSample>()?);
+        let inter_rows_v = inter_soc_rows(&session.resolve::<InterSocSample>()?);
+        let chip_rows_v = chip_trans_rows(&session.resolve::<ChipTransSample>()?);
         let qos_events = sample_csv_list(ctx.device_dir()?, "qosEvents")?;
-        let qos_rows_v = qos_rows(&resolve::<QosRow>(&mut store, &ctx)?, &qos_events);
-        let npu_mem_rows_v = npu_mem_rows(&resolve::<NpuMemRow>(&mut store, &ctx)?);
-        let hccs_rows_v = hccs_rows(&resolve::<HccsRateRow>(&mut store, &ctx)?);
+        let qos_rows_v = qos_rows(&session.resolve::<QosRow>()?, &qos_events);
+        let npu_mem_rows_v = npu_mem_rows(&session.resolve::<NpuMemRow>()?);
+        let hccs_rows_v = hccs_rows(&session.resolve::<HccsRateRow>()?);
         for (sort, name, rows) in [
-            (27u32, "SIO", sio_rows_v),
-            (18u32, "Acc PMU", acc_rows_v),
-            (24u32, "Stars Soc Info", inter_rows_v),
-            (25u32, "Stars Chip Trans", chip_rows_v),
-            (28u32, "QoS", qos_rows_v),
-            (16u32, "NPU MEM", npu_mem_rows_v),
-            (19u32, "HCCS", hccs_rows_v),
+            (Track::Sio, "SIO", sio_rows_v),
+            (Track::AccPmu, "Acc PMU", acc_rows_v),
+            (Track::StarsSocInfo, "Stars Soc Info", inter_rows_v),
+            (Track::ChipTrans, "Stars Chip Trans", chip_rows_v),
+            (Track::Qos, "QoS", qos_rows_v),
+            (Track::Communication, "NPU MEM", npu_mem_rows_v),
+            (Track::Hccs, "HCCS", hccs_rows_v),
             (
-                9u32,
+                Track::CpuUsage,
                 "CPU Usage",
                 host_cpu_rows(
-                    &resolve::<HostCpuUsageRow>(&mut store, &ctx)?,
+                    &session.resolve::<HostCpuUsageRow>()?,
                     host_local_offset_milli(ctx.root())?,
                 ),
             ),
             (
-                20u32,
+                Track::Nic,
                 "NIC",
                 net_rows(
-                    &resolve::<NicRow>(&mut store, &ctx)?
+                    &session
+                        .resolve::<NicRow>()?
                         .iter()
                         .map(|row| row.0)
                         .collect::<Vec<_>>(),
@@ -2893,10 +2826,11 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                 ),
             ),
             (
-                21u32,
+                Track::Roce,
                 "RoCE",
                 net_rows(
-                    &resolve::<RoceRow>(&mut store, &ctx)?
+                    &session
+                        .resolve::<RoceRow>()?
                         .iter()
                         .map(|row| row.0)
                         .collect::<Vec<_>>(),
@@ -2904,26 +2838,28 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                 ),
             ),
             (
-                26u32,
+                Track::Llc,
                 "LLC",
                 llc_track_rows(
-                    &resolve::<LlcRecord>(&mut store, &ctx)?,
-                    &mspark_model::load_sampling_clock(ctx.device_dir()?)?,
+                    &session.resolve::<LlcRecord>()?,
+                    &ctx.require::<mspark_model::DeviceStartLogs>()?
+                        .0
+                        .sampling()?,
                 ),
             ),
             (
-                23u32,
+                Track::Hbm,
                 "HBM",
-                hbm_track_rows(&resolve::<HbmRecord>(&mut store, &ctx)?),
+                hbm_track_rows(&session.resolve::<HbmRecord>()?),
             ),
             (
-                22u32,
+                Track::Pcie,
                 "PCIe",
-                pcie_track_rows(&resolve::<PcieRecord>(&mut store, &ctx)?),
+                pcie_track_rows(&session.resolve::<PcieRecord>()?),
             ),
         ] {
-            let pid = golden_pid_for(&golden_meta, name, dev)
-                .unwrap_or(((info.pid << 10) | (sort << 5) | dev) as u64);
+            let pid =
+                golden_pid_for(&golden_meta, name, dev).unwrap_or(sort.pid(info.pid, dev) as u64);
             let golden = golden_counter_signatures(array, pid);
             let produced = produced_signatures(&rows);
             let matched = multiset_match(&golden, &produced);
@@ -2932,7 +2868,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
 
         // Overlap Analysis
         let overlap_pid = golden_pid_for(&golden_meta, "Overlap Analysis", dev)
-            .unwrap_or(((info.pid << 10) | (29 << 5) | dev) as u64);
+            .unwrap_or(Track::Overlap.pid(info.pid, dev) as u64);
         let mut golden_overlap: Vec<(String, u32, compact_str::CompactString, f64)> = array
             .iter()
             .filter(|event| {
@@ -2954,7 +2890,7 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
                 )
             })
             .collect();
-        let produced_overlap = resolve::<OverlapRow>(&mut store, &ctx)?;
+        let produced_overlap = session.resolve::<OverlapRow>()?;
         let mut produced_rows: Vec<(String, u32, compact_str::CompactString, f64)> =
             produced_overlap
                 .iter()
@@ -3007,13 +2943,41 @@ fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()>
     println!("CANN level:     {api_level_ok}");
     println!("CANN id:        {api_id_ok}");
     println!("CANN item_id:   {api_item_ok}");
-    for (name, golden, produced, matched) in track_stats {
+    for &(name, golden, produced, matched) in &track_stats {
         println!("track {name:<16} golden={golden:<6} produced={produced:<6} matched={matched}");
     }
     println!(
         "overlap golden={overlap_golden} produced={overlap_produced} matched={overlap_matched} max_dur={overlap_max_dur:.6}"
     );
-    Ok(())
+    let mut clean = produced_rows == golden_rows
+        && name_ok == produced_rows
+        && tid_ok == produced_rows
+        && ts_ok == produced_rows
+        && dur_ok == produced_rows
+        && type_ok == produced_rows
+        && stream_ok == produced_rows
+        && task_ok == produced_rows
+        && subtask_ok == produced_rows
+        && api_produced == api_golden
+        && api_name_ok == api_produced
+        && api_tid_ok == api_produced
+        && api_ts_ok == api_produced
+        && api_dur_ok == api_produced
+        && api_mode_ok == api_produced
+        && api_level_ok == api_produced
+        && api_id_ok == api_produced
+        && api_item_ok == api_produced
+        && overlap_golden == overlap_produced
+        && overlap_matched == overlap_golden;
+    for &(name, golden, produced, matched) in &track_stats {
+        if golden != produced || matched != golden {
+            clean = false;
+            eprintln!("strict: track {name} is not an exact match");
+        }
+    }
+    gate(clean, || {
+        "timeline is not an exact match (see the counters above)".to_string()
+    })
 }
 
 fn ts_cpu_event_name(event: u64) -> &'static str {
@@ -3042,11 +3006,10 @@ fn ts_cpu_event_ids(device: &Path) -> Result<Vec<u64>> {
 fn ts_cpu_pmu_events(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Event,Name,Count\n");
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let records = resolve::<TscpuRecord>(&mut store, &ctx)?;
+        let records = session.resolve::<TscpuRecord>()?;
         let mut rows: Vec<(u64, u64)> = ts_cpu_event_ids(&device)?
             .into_iter()
             .map(|event| {
@@ -3075,47 +3038,13 @@ fn ts_cpu_pmu_events(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> 
     Ok(())
 }
 
-fn verify_ts_cpu_pmu_events(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let records = resolve::<TscpuRecord>(&mut store, &ctx)?;
-        let mut rows: Vec<(u64, u64)> = ts_cpu_event_ids(&device)?
-            .into_iter()
-            .map(|event| {
-                let total = records
-                    .iter()
-                    .flat_map(|record| record.0.events.iter().zip(record.0.counts.iter()))
-                    .filter(|(value, _)| **value == event)
-                    .map(|(_, count)| *count)
-                    .sum();
-                (event, total)
-            })
-            .collect();
-        rows.sort_by_key(|row| std::cmp::Reverse(row.1.to_string()));
-        for (event, total) in rows {
-            produced.push(vec![
-                dev.clone(),
-                format!("0x{event:x}"),
-                ts_cpu_event_name(event).to_string(),
-                total.to_string(),
-            ]);
-        }
-    }
-    compare_table(golden, &["Device_id", "Event", "Name", "Count"], &produced)
-}
-
 fn ts_cpu_top_function(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Function,Cycles,Cycles(%)\n");
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let records = resolve::<TscpuRecord>(&mut store, &ctx)?;
+        let records = session.resolve::<TscpuRecord>()?;
         let mut counts: Vec<(u64, u64)> = Vec::new();
         let mut index: HashMap<u64, usize> = HashMap::new();
         for record in records.iter() {
@@ -3152,65 +3081,15 @@ fn ts_cpu_top_function(prof: &Path, only: Option<&str>, out: &Path) -> Result<()
     Ok(())
 }
 
-fn verify_ts_cpu_top_function(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let records = resolve::<TscpuRecord>(&mut store, &ctx)?;
-        let mut counts: Vec<(u64, u64)> = Vec::new();
-        let mut index: HashMap<u64, usize> = HashMap::new();
-        for record in records.iter() {
-            for (&event, &count) in record.0.events.iter().zip(record.0.counts.iter()) {
-                if event == 0x11 {
-                    match index.get(&record.0.pc) {
-                        Some(&i) => counts[i].1 += count,
-                        None => {
-                            index.insert(record.0.pc, counts.len());
-                            counts.push((record.0.pc, count));
-                        }
-                    }
-                }
-            }
-        }
-        let total: u64 = counts.iter().map(|(_, count)| *count).sum();
-        if total == 0 {
-            continue;
-        }
-        let mut items = counts;
-        items.sort_by_key(|item| std::cmp::Reverse(item.1));
-        for (pc, cycles) in items.into_iter().take(5) {
-            let rate: f64 = format!("{:.3}", cycles as f64 * 100.0 / total as f64)
-                .parse()
-                .unwrap_or(0.0);
-            produced.push(vec![
-                dev.clone(),
-                format!("0x{pc:x}"),
-                cycles.to_string(),
-                format!("{rate}"),
-            ]);
-        }
-    }
-    compare_table(
-        golden,
-        &["Device_id", "Function", "Cycles", "Cycles(%)"],
-        &produced,
-    )
-}
-
 fn api_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body =
         String::from("Device_id,Level,API Name,Time(us),Count,Avg(us),Min(us),Max(us),Variance\n");
     if let Some(device) = devices(prof, only)?.first() {
-        let (ctx, _) = ctx_for(device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<ApiStatisticRow>(&mut store, &ctx)?.iter() {
+        let session = session_for(device)?;
+        for row in session.resolve::<ApiStatisticRow>()?.iter() {
             body.push_str(&format!(
                 "host,{},{},{},{},{},{},{},{}\n",
-                tables::api_level_name(row.level),
+                mspark_model::api_level_name(row.level),
                 row.api_name,
                 row.time,
                 row.count,
@@ -3229,52 +3108,13 @@ fn api_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_api_statistic(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    if let Some(device) = devices(prof, only)?.first() {
-        let (ctx, _) = ctx_for(device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<ApiStatisticRow>(&mut store, &ctx)?.iter() {
-            produced.push(vec![
-                "host".to_string(),
-                tables::api_level_name(row.level).to_string(),
-                row.api_name.clone(),
-                row.time.clone(),
-                row.count.to_string(),
-                row.avg.clone(),
-                row.min.clone(),
-                row.max.clone(),
-                row.variance.clone(),
-            ]);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "Level",
-            "API Name",
-            "Time(us)",
-            "Count",
-            "Avg(us)",
-            "Min(us)",
-            "Max(us)",
-            "Variance",
-        ],
-        &produced,
-    )
-}
-
 fn op_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from(
         "Device_id,OP Type,Core Type,Count,Total Time(us),Min Time(us),Avg Time(us),Max Time(us),Ratio(%)\n",
     );
     for device in devices(prof, only)? {
-        let (ctx, _) = ctx_for(&device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<OpStatisticRow>(&mut store, &ctx)?.iter() {
+        let session = session_for(&device)?;
+        for row in session.resolve::<OpStatisticRow>()?.iter() {
             body.push_str(&format!(
                 "{},{},{},{},{},{},{},{},{}\n",
                 row.device_id,
@@ -3297,120 +3137,12 @@ fn op_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_op_statistic(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, _) = ctx_for(&device)?;
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<OpStatisticRow>(&mut store, &ctx)?.iter() {
-            produced.push(vec![
-                row.device_id.to_string(),
-                row.op_type.clone(),
-                row.core_type.clone(),
-                row.count.clone(),
-                row.total_time.clone(),
-                row.min.clone(),
-                row.avg.clone(),
-                row.max.clone(),
-                row.ratio.clone(),
-            ]);
-        }
-    }
-    compare_table_relaxed(
-        golden,
-        &[
-            "Device_id",
-            "OP Type",
-            "Core Type",
-            "Count",
-            "Total Time(us)",
-            "Min Time(us)",
-            "Avg Time(us)",
-            "Max Time(us)",
-            "Ratio(%)",
-        ],
-        &produced,
-        &[4, 5, 6, 7, 8],
-        0.05,
-    )
-}
-
-fn compare_table_relaxed(
-    golden: &Path,
-    header: &[&str],
-    produced: &[Vec<String>],
-    tolerance_cols: &[usize],
-    tolerance: f64,
-) -> Result<()> {
-    let rows = read_rows(golden)?;
-    let Some((golden_header, body)) = rows.split_first() else {
-        anyhow::bail!("golden file is empty");
-    };
-    if golden_header.len() != header.len() {
-        anyhow::bail!(
-            "header width mismatch: golden {} vs mspark {}",
-            golden_header.len(),
-            header.len()
-        );
-    }
-    let n = body.len().min(produced.len());
-    let mut exact = vec![0usize; header.len()];
-    let mut near = vec![0usize; header.len()];
-    for i in 0..n {
-        for (c, slot) in exact.iter_mut().enumerate() {
-            let (Some(g), Some(p)) = (body[i].get(c), produced[i].get(c)) else {
-                continue;
-            };
-            if g == p {
-                *slot += 1;
-                near[c] += 1;
-            } else if tolerance_cols.contains(&c)
-                && let (Ok(gv), Ok(pv)) = (g.parse::<f64>(), p.parse::<f64>())
-                && (gv - pv).abs() <= tolerance
-            {
-                near[c] += 1;
-            }
-        }
-    }
-    println!("golden rows: {}", body.len());
-    println!("produced rows: {}", produced.len());
-    for (c, name) in header.iter().enumerate() {
-        println!(
-            "{c:>2}  {name:<22} exact {}/{n}  near {}/{n}",
-            exact[c], near[c]
-        );
-    }
-    Ok(())
-}
-
-fn py_float(value: f64) -> String {
-    if value == 0.0 {
-        return "0.0".to_string();
-    }
-    let abs = value.abs();
-    if abs < 1e-4 || abs >= 1e16 {
-        let text = format!("{value:e}");
-        if let Some((mantissa, exponent)) = text.split_once('e') {
-            let (sign, digits) = match exponent.strip_prefix('-') {
-                Some(digits) => ("-", digits),
-                None => ("+", exponent),
-            };
-            return format!("{mantissa}e{sign}{digits:0>2}");
-        }
-        text
-    } else {
-        format!("{value}")
-    }
-}
-
 fn l2_cache(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
-    let chunks = per_device(prof, only, |ctx, info| {
+    let chunks = per_device(prof, only, |session| {
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let rows = resolve::<L2CacheRow>(&mut store, ctx)?;
-        let tasks = resolve::<TimelineTask>(&mut store, ctx)?;
+        let rows = session.resolve::<L2CacheRow>()?;
+        let tasks = session.resolve::<TimelineTask>()?;
         let op_map: HashMap<(u32, u32), String> = tasks
             .iter()
             .map(|task| ((task.stream_id, task.task_id), task.name.clone()))
@@ -3446,63 +3178,20 @@ fn l2_cache(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_l2_cache(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let rows = resolve::<L2CacheRow>(&mut store, &ctx)?;
-        let tasks = resolve::<TimelineTask>(&mut store, &ctx)?;
-        let op_map: HashMap<(u32, u32), String> = tasks
-            .iter()
-            .map(|task| ((task.stream_id, task.task_id), task.name.clone()))
-            .collect();
-        for row in rows.iter() {
-            let op_name = op_map
-                .get(&(row.stream_id as u32, row.task_id as u32))
-                .cloned()
-                .unwrap_or_else(|| "N/A".to_string());
-            produced.push(vec![
-                dev.clone(),
-                row.stream_id.to_string(),
-                row.task_id.to_string(),
-                "N/A".to_string(),
-                py_float(row.victim_rate),
-                op_name,
-            ]);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "Stream Id",
-            "Task Id",
-            "Hit Rate",
-            "Victim Rate",
-            "Op Name",
-        ],
-        &produced,
-    )
-}
-
 fn dvpp(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from(
         "Device_id,Dvpp Id,Engine Type,Engine ID,All Time(us),All Frame,All Utilization(%)\n",
     );
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<DvppRow>(&mut store, &ctx)?.iter() {
+        for row in session.resolve::<DvppRow>()?.iter() {
             body.push_str(&format!(
                 "{dev},{},{},{},{:?},{:?},{}\n",
                 row.dvpp_id,
-                tables::dvpp_engine_name(row.engine_type),
+                mspark_model::dvpp_engine_name(row.engine_type),
                 row.engine_id,
                 row.all_time,
                 row.all_frame,
@@ -3517,44 +3206,6 @@ fn dvpp(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     std::fs::write(out, body)?;
     println!("wrote {total} rows to {}", out.display());
     Ok(())
-}
-
-fn verify_dvpp(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<DvppRow>(&mut store, &ctx)?.iter() {
-            produced.push(vec![
-                dev.clone(),
-                row.dvpp_id.to_string(),
-                tables::dvpp_engine_name(row.engine_type).to_string(),
-                row.engine_id.to_string(),
-                format!("{:?}", row.all_time),
-                format!("{:?}", row.all_frame),
-                row.all_utilization.clone(),
-            ]);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "Dvpp Id",
-            "Engine Type",
-            "Engine ID",
-            "All Time(us)",
-            "All Frame",
-            "All Utilization(%)",
-        ],
-        &produced,
-    )
-}
-
-fn py_round3(value: f64) -> String {
-    format!("{:?}", (value * 1000.0).round_ties_even() / 1000.0)
 }
 
 fn hccs_table(rows: &[HccsRateRow]) -> Vec<[String; 4]> {
@@ -3591,11 +3242,10 @@ fn hccs_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Mode,Max,Min,Average\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        let rows = resolve::<HccsRateRow>(&mut store, &ctx)?;
+        let rows = session.resolve::<HccsRateRow>()?;
         for [mode, max, min, avg] in hccs_table(&rows) {
             body.push_str(&format!("{dev},{mode},{max},{min},{avg}\n"));
             total += 1;
@@ -3607,24 +3257,6 @@ fn hccs_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     std::fs::write(out, body)?;
     println!("wrote {total} rows to {}", out.display());
     Ok(())
-}
-
-fn verify_hccs_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for [mode, max, min, avg] in hccs_table(&resolve::<HccsRateRow>(&mut store, &ctx)?) {
-            produced.push(vec![dev.clone(), mode, max, min, avg]);
-        }
-    }
-    compare_table(
-        golden,
-        &["Device_id", "Mode", "Max", "Min", "Average"],
-        &produced,
-    )
 }
 
 fn hbm_track_rows(rows: &[HbmRecord]) -> Vec<CounterRow> {
@@ -3657,7 +3289,7 @@ fn hbm_track_rows(rows: &[HbmRecord]) -> Vec<CounterRow> {
                 name: compact_str::format_compact!("HBM {hbm_id}/{kind}"),
                 tid: 0,
                 ts: fmt_us(ts_ns as u64, false),
-                args: vec![(key, Num::Float(value))],
+                args: smallvec::smallvec![(key, Num::Float(value))],
             });
         }
         prev = Some(ts_ns);
@@ -3728,11 +3360,10 @@ fn hbm_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,Metric,Read(MB/s),Write(MB/s)\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for [metric, read, write] in hbm_table(&resolve::<HbmRecord>(&mut store, &ctx)?) {
+        for [metric, read, write] in hbm_table(&session.resolve::<HbmRecord>()?) {
             body.push_str(&format!("{dev},{metric},{read},{write}\n"));
             total += 1;
         }
@@ -3745,36 +3376,17 @@ fn hbm_csv(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_hbm_csv(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for [metric, read, write] in hbm_table(&resolve::<HbmRecord>(&mut store, &ctx)?) {
-            produced.push(vec![dev.clone(), metric, read, write]);
-        }
-    }
-    compare_table(
-        golden,
-        &["Device_id", "Metric", "Read(MB/s)", "Write(MB/s)"],
-        &produced,
-    )
-}
-
 fn npu_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let mut body = String::from("Device_id,event,ddr(KB),hbm(KB),memory(KB),timestamp(us)\n");
     let mut total = 0usize;
     for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
+        let session = session_for(&device)?;
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<NpuMemRow>(&mut store, &ctx)?.iter() {
+        for row in session.resolve::<NpuMemRow>()?.iter() {
             body.push_str(&format!(
                 "{dev},{},{},{},{},{}\n",
-                tables::npu_mem_event(row.event),
+                mspark_model::npu_mem_event(row.event),
                 row.ddr / 1024,
                 row.hbm / 1024,
                 (row.ddr + row.hbm) / 1024,
@@ -3791,162 +3403,281 @@ fn npu_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_npu_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0).to_string();
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<NpuMemRow>(&mut store, &ctx)?.iter() {
-            produced.push(vec![
-                dev.clone(),
-                tables::npu_mem_event(row.event).to_string(),
-                (row.ddr / 1024).to_string(),
-                (row.hbm / 1024).to_string(),
-                ((row.ddr + row.hbm) / 1024).to_string(),
-                fmt_us(row.ts_ns, false).to_string(),
-            ]);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "event",
-            "ddr(KB)",
-            "hbm(KB)",
-            "memory(KB)",
-            "timestamp(us)",
-        ],
-        &produced,
-    )
-}
-
 fn npu_module_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
-    let chunks = per_device(prof, only, |ctx, info| {
+    let chunks = per_device(prof, only, |session| {
+        let info = &session.info;
         let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
         let mut body = String::new();
-        for row in resolve::<NpuModuleMemRow>(&mut store, ctx)?.iter() {
+        for row in session.resolve::<NpuModuleMemRow>()?.iter() {
             body.push_str(&format!(
                 "{dev},{},{},{},NPU:{dev}\n",
-                tables::module_name(row.module_id),
+                mspark_model::module_name(row.module_id),
                 fmt_us(row.ts_ns, true),
                 row.total_size / 1024
             ));
         }
         Ok(body)
     })?;
-
-    let mut body = String::from("Device_id,Component,Timestamp(us),Total Reserved(KB),Device\n");
-    let mut total = 0usize;
-    for chunk in chunks {
-        total += chunk.lines().count();
-        body.push_str(&chunk);
-    }
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(out, body)?;
-    println!("wrote {total} rows to {}", out.display());
+    write_chunks(
+        out,
+        "Device_id,Component,Timestamp(us),Total Reserved(KB),Device",
+        chunks,
+    )?;
     Ok(())
 }
 
-fn verify_npu_module_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let mut produced: Vec<Vec<String>> = Vec::new();
-    for device in devices(prof, only)? {
-        let (ctx, info) = ctx_for(&device)?;
-        let dev = info.device_id.unwrap_or(0);
-        let shared_store = store_for(ctx.device_dir()?);
-        let mut store = shared_store.lock().expect("store lock");
-        for row in resolve::<NpuModuleMemRow>(&mut store, &ctx)?.iter() {
-            produced.push(vec![
-                dev.to_string(),
-                tables::module_name(row.module_id).to_string(),
-                fmt_us(row.ts_ns, false).to_string(),
-                (row.total_size / 1024).to_string(),
-                format!("NPU:{dev}"),
-            ]);
-        }
-    }
-    compare_table(
-        golden,
-        &[
-            "Device_id",
-            "Component",
-            "Timestamp(us)",
-            "Total Reserved(KB)",
-            "Device",
-        ],
-        &produced,
-    )
-}
-
-fn compare_table(golden: &Path, header: &[&str], produced: &[Vec<String>]) -> Result<()> {
-    let rows = read_rows(golden)?;
-    let Some((golden_header, body)) = rows.split_first() else {
-        anyhow::bail!("golden file is empty");
+/// Comparison strictness for the `--strict` flag: verifiers always print their
+/// per-column statistics, but only a strict run turns a mismatch into a non-zero
+/// exit status (so CI can gate on regressions while interactive use still shows
+/// partial matches).
+/// Golden file for an artifact inside `mindstudio_profiler_output`.
+fn find_golden(dir: &Path, artifact: Artifact) -> Option<PathBuf> {
+    let (prefix, extension) = match artifact {
+        Artifact::Timeline => ("msprof_", "json"),
+        other => (other.name(), "csv"),
     };
-    if golden_header.len() != header.len() {
-        anyhow::bail!(
-            "header width mismatch: golden {} vs mspark {}",
-            golden_header.len(),
-            header.len()
-        );
-    }
-    let n = body.len().min(produced.len());
-    let mut exact = vec![0usize; header.len()];
-    for i in 0..n {
-        for (c, slot) in exact.iter_mut().enumerate() {
-            if body[i].get(c) == produced[i].get(c) {
-                *slot += 1;
-            }
-        }
-    }
-    println!("golden rows: {}", body.len());
-    println!("produced rows: {}", produced.len());
-    for (c, name) in header.iter().enumerate() {
-        println!("{c:>2}  {name:<22} {}/{n}", exact[c]);
-    }
-    Ok(())
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            name.starts_with(prefix)
+                && name.ends_with(&format!(".{extension}"))
+                // `op_summary_…` must not match `op_summary_x_…`
+                && (name.starts_with(&format!("{prefix}_")) || name.starts_with(prefix))
+        })
+        .collect();
+    candidates.sort();
+    candidates.pop()
 }
 
-fn read_rows(path: &Path) -> Result<Vec<Vec<String>>> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut rows = Vec::new();
-    for line in text.lines() {
-        if line.is_empty() {
+/// One artifact's per-column distance from its golden file.
+struct ArtifactCheck {
+    name: &'static str,
+    header: Vec<String>,
+    columns: Vec<mspark::verify::ColumnMatch>,
+    note: String,
+}
+
+impl ArtifactCheck {
+    fn mean_ratio(&self) -> f64 {
+        if self.columns.is_empty() {
+            return 1.0;
+        }
+        self.columns
+            .iter()
+            .map(|column| column.ratio())
+            .sum::<f64>()
+            / self.columns.len() as f64
+    }
+}
+
+/// Compare every artifact against the capture's goldens and the checked-in
+/// baseline.
+///
+/// Byte-exactness is not the goal: the baseline records how close each *column*
+/// currently is, and this command fails when one gets worse — a dropped row, a
+/// broken column, a stream that stopped decoding. Numeric cells are compared on
+/// a fixed grid (`--places`), so float noise is not a regression.
+fn verify_all(
+    prof: &Path,
+    only: Option<&str>,
+    golden_dir: Option<&Path>,
+    baseline: Option<&Path>,
+    update_baseline: bool,
+    places: u32,
+) -> Result<()> {
+    let golden_dir = golden_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| prof.join("mindstudio_profiler_output"));
+    let baseline_path = baseline
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("spec/baseline.txt"));
+    let previous = read_baseline(&baseline_path)?;
+
+    let dir = std::env::temp_dir().join(format!("mspark-verify-all-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+
+    let mut checks: Vec<ArtifactCheck> = Vec::new();
+    for artifact in ALL_ARTIFACTS {
+        if matches!(artifact, Artifact::Timeline | Artifact::Summary) {
+            // The timeline is compared structurally by `verify-timeline`; the
+            // summary has no msprof counterpart.
             continue;
         }
-        let mut fields = Vec::new();
-        let mut current = String::new();
-        let mut in_quotes = false;
-        let mut chars = line.chars().peekable();
-        while let Some(ch) = chars.next() {
-            match ch {
-                '"' if in_quotes => {
-                    if chars.peek() == Some(&'"') {
-                        current.push('"');
-                        chars.next();
-                    } else {
-                        in_quotes = false;
-                    }
-                }
-                '"' => in_quotes = true,
-                ',' if !in_quotes => {
-                    fields.push(current.trim().to_string());
-                    current.clear();
-                }
-                _ => current.push(ch),
+        let Some(golden) = find_golden(&golden_dir, artifact) else {
+            continue;
+        };
+        let golden_rows = read_rows(&golden)?;
+        let Some(golden_header) = golden_rows.first() else {
+            continue;
+        };
+        let golden_header = golden_header.clone();
+        write_artifact(artifact, prof, only, &dir)?;
+        let produced = read_rows(&dir.join(artifact.file()))?;
+        let (produced_header, produced_body) = match produced.split_first() {
+            Some((header, body)) => (header, body),
+            None => (&golden_header, &[][..]),
+        };
+        if produced_header.len() != golden_header.len() {
+            checks.push(ArtifactCheck {
+                name: artifact.name(),
+                header: golden_header.clone(),
+                columns: Vec::new(),
+                note: format!(
+                    "header width {} vs {}",
+                    golden_header.len(),
+                    produced_header.len()
+                ),
+            });
+            continue;
+        }
+        let columns = mspark::verify::compare_columns(&golden_rows[1..], produced_body, places);
+        checks.push(ArtifactCheck {
+            name: artifact.name(),
+            header: golden_header,
+            columns,
+            note: String::new(),
+        });
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    println!(
+        "{:<24} {:>8} {:>8}  closeness",
+        "artifact", "golden", "produced"
+    );
+    let mut regressions = Vec::new();
+    for check in &checks {
+        let key = |column: usize| format!("{}.{}", check.name, check.header[column]);
+        let mut worst = 1.0f64;
+        for (index, column) in check.columns.iter().enumerate() {
+            let ratio = column.ratio();
+            worst = worst.min(ratio);
+            if let Some(recorded) = previous.get(&key(index))
+                && !update_baseline
+                && ratio + 1e-9 < *recorded
+            {
+                regressions.push((key(index), *recorded, ratio));
             }
         }
-        fields.push(current.trim().to_string());
-        rows.push(fields);
+        if !check.note.is_empty() {
+            println!("{:<24} {:>8} {:>8}  GAP: {}", check.name, 0, 0, check.note);
+            continue;
+        }
+        println!(
+            "{:<24} {:>8} {:>8}  mean {:>6.2}%  worst {:>6.2}%",
+            check.name,
+            check.columns.first().map(|c| c.golden).unwrap_or(0),
+            check.columns.first().map(|c| c.produced).unwrap_or(0),
+            check.mean_ratio() * 100.0,
+            worst * 100.0
+        );
     }
-    Ok(rows)
+
+    if update_baseline {
+        write_baseline(&baseline_path, &checks)?;
+        println!("\nbaseline written to {}", baseline_path.display());
+        return Ok(());
+    }
+    if regressions.is_empty() {
+        println!("\nno column regressed against {}", baseline_path.display());
+        return Ok(());
+    }
+    for (key, recorded, ratio) in &regressions {
+        eprintln!(
+            "regression: {key} {:.2}% < baseline {:.2}%",
+            ratio * 100.0,
+            recorded * 100.0
+        );
+    }
+    anyhow::bail!("{} column(s) regressed", regressions.len())
+}
+
+fn read_baseline(path: &Path) -> Result<std::collections::HashMap<String, f64>> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(map);
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // `<artifact>.<column>  <matched>/<denominator>  <ratio%>`
+        // The counts are authoritative: recomputing the ratio from two integers
+        // avoids comparing two rounded percentages (which made a clean run look
+        // like a regression, and a stale baseline look fine).
+        let mut fields = line.split_whitespace();
+        let (Some(name), Some(counts)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Some((matched, total)) = counts.split_once('/') else {
+            continue;
+        };
+        let (Ok(matched), Ok(total)) = (matched.parse::<f64>(), total.parse::<f64>()) else {
+            continue;
+        };
+        map.insert(
+            name.to_string(),
+            if total > 0.0 { matched / total } else { 1.0 },
+        );
+    }
+    Ok(map)
+}
+
+fn write_baseline(path: &Path, checks: &[ArtifactCheck]) -> Result<()> {
+    let mut text = String::from(
+        "# Closeness baseline, one line per artifact column.\n\
+         # `mspark verify-all` fails when a column drops below its recorded value;\n\
+         # regenerate with `mspark verify-all PROF --update-baseline`.\n\
+         # Values are the fraction of values matching the golden file at 3 decimals.\n",
+    );
+    for check in checks {
+        if !check.note.is_empty() {
+            text.push_str(&format!("# gap: {} — {}\n", check.name, check.note));
+            continue;
+        }
+        for (index, column) in check.columns.iter().enumerate() {
+            let denominator = column.golden.max(column.produced);
+            text.push_str(&format!(
+                "{}.{:<24} {:>8}/{}  {:>7.2}%\n",
+                check.name,
+                check.header[index],
+                column.matched,
+                denominator,
+                column.ratio() * 100.0
+            ));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+/// Verify any CSV artifact by exporting it exactly as production does and
+/// comparing the result against the golden file. Replaces the per-artifact
+/// verifiers, which were copy-paste twins of the exporters and could drift.
+fn verify_csv(artifact: Artifact, prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
+    let dir = std::env::temp_dir().join(format!(
+        "mspark-verify-{}-{}",
+        std::process::id(),
+        artifact.name()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    write_artifact(artifact, prof, only, &dir)?;
+    let produced = read_rows(&dir.join(artifact.file()))?;
+    let _ = std::fs::remove_dir_all(&dir);
+    // Columns that only need to agree within an HPFloat residual.
+    match artifact {
+        Artifact::OpSummary => compare_generated(golden, &produced, Some((&[8, 9, 10], 0.001))),
+        Artifact::ApiStatistic | Artifact::OpStatistic => {
+            compare_generated(golden, &produced, Some((&[3, 4, 5, 6, 7, 8], 0.05)))
+        }
+        _ => compare_generated(golden, &produced, None),
+    }
 }
 
 fn print_info(info: &DeviceInfo) {

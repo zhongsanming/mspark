@@ -1,3 +1,4 @@
+use crate::format::round6;
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -23,10 +24,6 @@ struct ProcTimes {
     cpu_no: i64,
 }
 
-fn round6(value: f64) -> f64 {
-    (value * 1e6).round_ties_even() / 1e6
-}
-
 impl Node for HostCpuUsageRow {
     const NAME: &'static str = "host_cpu_usage";
     type Deps = ();
@@ -35,15 +32,8 @@ impl Node for HostCpuUsageRow {
         // msprof parses each `slice_*` file independently, so no interval spans
         // a slice boundary (the first block of a slice has no predecessor).
         let dir = ctx.host_data_dir();
-        let mut files: Vec<std::path::PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("host_cpu.data.") && !name.ends_with(".done") {
-                files.push(entry.path());
-            }
-        }
-        files.sort();
+        // `files_with_prefix` already returns slice order.
+        let files = crate::stream::files_with_prefix(&dir, &["host_cpu.data"]);
         let mut out = Vec::new();
         for file in files {
             let bytes = std::fs::read(&file)?;
@@ -118,18 +108,20 @@ impl HostCpuUsageRow {
             if delta <= 0 {
                 continue;
             }
-            let mut per_cpu: Vec<(i64, i64)> = Vec::new();
+            // O(procs) instead of the previous O(procs^2): index the previous
+            // block by pid and accumulate per CPU in a map keyed by CPU number.
+            let previous: std::collections::HashMap<i64, &ProcTimes> =
+                last_data.iter().map(|(pid, times)| (*pid, times)).collect();
+            let mut per_cpu: std::collections::BTreeMap<i64, i64> =
+                std::collections::BTreeMap::new();
             let mut total = 0i64;
             for (pid, cur_times) in curr_data {
-                let Some(prev) = last_data.iter().find(|(p, _)| p == pid).map(|(_, t)| t) else {
+                let Some(prev) = previous.get(pid) else {
                     continue;
                 };
                 let raw = (cur_times.utime - prev.utime) + (cur_times.stime - prev.stime);
                 let jiffies = raw.min(delta);
-                match per_cpu.iter_mut().find(|(cpu, _)| *cpu == cur_times.cpu_no) {
-                    Some(entry) => entry.1 += jiffies,
-                    None => per_cpu.push((cur_times.cpu_no, jiffies)),
-                }
+                *per_cpu.entry(cur_times.cpu_no).or_insert(0) += jiffies;
                 total += jiffies;
             }
             for (cpu, jiffies) in per_cpu {

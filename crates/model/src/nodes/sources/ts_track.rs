@@ -4,6 +4,8 @@ use zerocopy::byteorder::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 use super::stars_soc::FUNC_TASK_FLIP;
+use crate::stream::TS_TRACK_TRUNK;
+use crate::stream::{CtxStreams, Stream};
 use mspark_df::{Ctx, Node};
 
 impl Node for super::ts_track::TrackFlip {
@@ -11,12 +13,10 @@ impl Node for super::ts_track::TrackFlip {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_stream(ctx, "ts_track.", super::ts_track::TS_TRACK_TRUNK)?;
+        let bytes = ctx.stream(Stream::TsTrack)?;
         Ok(super::ts_track::decode_ts_track(&bytes)?.0)
     }
 }
-
-pub const TS_TRACK_TRUNK: usize = 40;
 
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C, packed)]

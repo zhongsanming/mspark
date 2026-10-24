@@ -1,3 +1,5 @@
+use crate::stream::TSCPU_TRUNK;
+use crate::stream::{CtxStreams, Stream};
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -9,15 +11,13 @@ impl Node for TscpuRecord {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_stream(ctx, "tscpu.", super::tscpu::TSCPU_TRUNK)?;
+        let bytes = ctx.stream(Stream::Tscpu)?;
         Ok(super::tscpu::decode_tscpu(&bytes)?
             .into_iter()
             .map(TscpuRecord)
             .collect())
     }
 }
-
-pub const TSCPU_TRUNK: usize = 304;
 
 pub const TSCPU_HEADER: u32 = 0xabab_abab;
 

@@ -8,23 +8,26 @@ pub mod ctx;
 pub(crate) mod format;
 pub mod host;
 pub mod nodes;
-pub(crate) mod pmu;
 pub mod stream;
-pub mod tables;
 pub mod time;
 
-pub use ctx::{Chip, DeviceInfo, load_device_info, load_sample_string};
+pub use ctx::{Chip, DeviceInfo, HostInfo, SampleConfig, load_device_info, load_sample_string};
 pub use host::{HashDic, TypeDic, ge_task_type, load_dictionaries};
+pub use nodes::sources::api_event::api_level_name;
+pub use nodes::sources::dvpp::dvpp_engine_name;
+pub use nodes::sources::npu_mem::npu_mem_event;
+pub use nodes::sources::npu_module_mem::module_name;
 pub use nodes::sources::{LLC_READ_SLOTS, NetSample};
 pub use nodes::*;
+pub use stream::{CtxStreams, Location, Stream, Trunk};
 
 pub use nodes::sources::ffts_profile::PmuData;
 pub use nodes::sources::lpm::{LpmInfo, LpmSample};
 pub use nodes::sources::stars_soc::{Acsq, FftsPlus, StarsSocEntry};
 pub use nodes::sources::ts_track::TrackFlip;
 pub use time::{
-    Clock, MonoClock, SamplingClock, fmt_us, load_clock, load_host_clock, load_host_syscnt_clock,
-    load_mono_clock, load_sampling_clock,
+    Clock, DeviceStartLogs, HostStartLogs, MonoClock, SamplingClock, StartLogs, fmt_us, load_clock,
+    load_host_clock, load_host_syscnt_clock, load_mono_clock, load_sampling_clock,
 };
 
 // The node graph is declared once, here. Edges come from each `impl Node`'s
@@ -38,8 +41,6 @@ mspark_df::graph!(
     DeviceTask,
     DvppRow,
     HbmRecord,
-    HcclInfoRow,
-    HcclOpRow,
     HcclInfoRow,
     HcclOpRow,
     HccsRateRow,
@@ -71,3 +72,17 @@ mspark_df::graph!(
     TimelineTask,
     TscpuRecord,
 );
+
+#[cfg(test)]
+mod tests {
+    /// `mspark graph` renders `NODE_GRAPH`; a duplicate entry would render a
+    /// duplicate node and its edges twice.
+    #[test]
+    fn node_graph_has_unique_names() {
+        let mut names: Vec<&str> = super::NODE_GRAPH.iter().map(|(name, _)| *name).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "duplicate node in NODE_GRAPH");
+    }
+}

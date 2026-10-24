@@ -3,6 +3,8 @@ use anyhow::Result;
 use zerocopy::byteorder::little_endian::{U32, U64};
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
+use crate::stream::LPM_TRUNK;
+use crate::stream::{CtxStreams, Stream};
 use mspark_df::{Ctx, Node};
 
 impl Node for super::lpm::LpmInfo {
@@ -10,15 +12,13 @@ impl Node for super::lpm::LpmInfo {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_stream(ctx, "lpmFreqConv.", super::lpm::LPM_TRUNK)?;
+        let bytes = ctx.stream(Stream::LpmFreq)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
         Ok(vec![super::lpm::decode_lpm(&bytes)?])
     }
 }
-
-pub const LPM_TRUNK: usize = 888;
 
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C, packed)]

@@ -1,3 +1,4 @@
+use crate::stream::{CtxStreams, Stream};
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -36,7 +37,7 @@ impl Node for HostDiskUsageRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_host_stream(ctx, "host_disk.data.", 1)?;
+        let bytes = ctx.stream(Stream::HostDiskData)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -83,15 +84,9 @@ impl Node for HostDiskUsageRow {
 
 /// `sample.json: host_disk_freq` — samples per second.
 fn disk_interval_ns(ctx: &Ctx) -> Option<f64> {
-    let text = std::fs::read_to_string(ctx.device_dir().ok()?.join("sample.json")).ok()?;
-    let root: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let freq = root.get("host_disk_freq").and_then(|v| {
-        v.as_f64()
-            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-    })?;
-    if freq > 0.0 {
-        Some(1.0 / freq * 1e9)
-    } else {
-        None
-    }
+    let freq = ctx
+        .require::<crate::ctx::SampleConfig>()
+        .ok()?
+        .f64("host_disk_freq")?;
+    if freq > 0.0 { Some(1e9 / freq) } else { None }
 }

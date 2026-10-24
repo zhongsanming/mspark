@@ -1,3 +1,4 @@
+use crate::stream::{CtxStreams, Stream};
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -23,7 +24,7 @@ impl Node for HcclOpRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_host_stream(ctx, "aging.compact.hccl_op_info.", 1)?;
+        let bytes = ctx.stream(Stream::HcclOpInfo)?;
         let mut out = Vec::new();
         for chunk in bytes.as_chunks::<{ crate::stream::COMPACT_TRUNK }>().0 {
             if u16::from_le_bytes([chunk[0], chunk[1]]) != crate::stream::COMPACT_MAGIC {

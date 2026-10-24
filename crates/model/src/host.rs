@@ -104,31 +104,23 @@ pub fn load_dictionaries(host_data: &Path) -> (HashDic, TypeDic) {
         }
     }
 
+    if hash.is_empty() {
+        eprintln!(
+            "warning: no hash_dic slices under {}; names will render as N/A",
+            host_data.display()
+        );
+    }
+    if types.is_empty() {
+        eprintln!(
+            "warning: no type_info_dic slices under {}; kernel types will render as N/A",
+            host_data.display()
+        );
+    }
     (HashDic(hash), TypeDic(types))
 }
 
 fn files_with_prefix(dir: &Path, prefixes: &[&str]) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<(u64, PathBuf)> = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !prefixes.iter().any(|p| name.starts_with(p))
-            || name.ends_with(".done")
-            || name.ends_with(".complete")
-        {
-            continue;
-        }
-        let slice = name
-            .rsplit('_')
-            .next()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        files.push((slice, entry.path()));
-    }
-    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    files.into_iter().map(|(_, path)| path).collect()
+    crate::stream::files_with_prefix(dir, prefixes)
 }
 
 #[cfg(test)]

@@ -76,7 +76,7 @@ impl Ctx {
     pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
         self.data
             .get(&TypeId::of::<T>())
-            .and_then(|boxed| boxed.downcast_ref::<T>())
+            .map(|boxed| boxed.downcast_ref::<T>().expect("TypeId collision"))
     }
 
     pub fn require<T: Send + Sync + 'static>(&self) -> Result<&T> {
@@ -125,11 +125,12 @@ impl Store {
     }
 
     fn get<T: Node>(&self) -> Option<Arc<Vec<T>>> {
-        self.data
-            .get(&TypeId::of::<T>())?
-            .clone()
-            .downcast::<Vec<T>>()
-            .ok()
+        self.data.get(&TypeId::of::<T>()).map(|boxed| {
+            boxed
+                .clone()
+                .downcast::<Vec<T>>()
+                .expect("TypeId collision")
+        })
     }
 
     fn put<T: Node>(&mut self, value: Arc<Vec<T>>) {
@@ -263,6 +264,18 @@ const fn str_eq(a: &str, b: &str) -> bool {
 pub const fn check_acyclic(graph: &[(&str, &[&str])]) {
     let n = graph.len();
     assert!(n <= MAX_NODES, "node graph exceeds MAX_NODES");
+    let mut a = 0;
+    while a < n {
+        let mut b = a + 1;
+        while b < n {
+            assert!(
+                !str_eq(graph[a].0, graph[b].0),
+                "duplicate node name in NODE_GRAPH"
+            );
+            b += 1;
+        }
+        a += 1;
+    }
     let mut start = 0;
     while start < n {
         let mut seen = [false; MAX_NODES];

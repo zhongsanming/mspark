@@ -1,3 +1,5 @@
+use crate::format::round6;
+use crate::stream::{CtxStreams, Stream};
 use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
@@ -17,10 +19,6 @@ pub struct HostMemUsageRow {
     pub usage: f64,
 }
 
-fn round6(value: f64) -> f64 {
-    (value * 1e6).round_ties_even() / 1e6
-}
-
 impl Node for HostMemUsageRow {
     const NAME: &'static str = "host_mem_usage";
     type Deps = ();
@@ -30,7 +28,7 @@ impl Node for HostMemUsageRow {
         if mem_total == 0 {
             return Ok(Vec::new());
         }
-        let bytes = crate::stream::read_host_stream(ctx, "host_mem.data.", 1)?;
+        let bytes = ctx.stream(Stream::HostMemData)?;
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -64,10 +62,6 @@ impl Node for HostMemUsageRow {
 
 /// `info.json: memoryTotal` (KB), used as the denominator.
 fn host_mem_total(ctx: &Ctx) -> Option<u64> {
-    let text = std::fs::read_to_string(ctx.root().join("host").join("info.json")).ok()?;
-    let root: serde_json::Value = serde_json::from_str(&text).ok()?;
-    root.get("memoryTotal").and_then(|v| {
-        v.as_u64()
-            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-    })
+    let total = ctx.require::<crate::ctx::HostInfo>().ok()?.memory_total_kb;
+    (total > 0).then_some(total)
 }

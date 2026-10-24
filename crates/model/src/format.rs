@@ -1,10 +1,20 @@
 //! Output formatting helpers shared by the CSV/JSON exporters.
 
-pub(crate) fn csv_field(field: &str) -> String {
-    if field.contains(',') || field.contains('"') || field.contains('\n') {
-        format!("\"{}\"", field.replace('"', "\"\""))
+/// Append `field` to `out`, quoting it the way msprof does (RFC 4180) when it
+/// contains a comma, a quote or a newline. Avoids the per-cell allocation of a
+/// `csv_field` returning `String`.
+pub fn push_csv_field(out: &mut String, field: &str) {
+    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
+        out.push('"');
+        for ch in field.chars() {
+            if ch == '"' {
+                out.push('"');
+            }
+            out.push(ch);
+        }
+        out.push('"');
     } else {
-        field.to_string()
+        out.push_str(field);
     }
 }
 
@@ -64,4 +74,10 @@ pub(crate) fn double_to_str(value: f64) -> String {
     let text = text.trim_end_matches('0');
     let text = text.trim_end_matches('.');
     text.to_string()
+}
+
+/// `Utils::RoundToDecimalPlaces(v, 6)`: round-half-to-even, no float→string
+/// round trip (three copies of `format!("{v:.6}").parse()` had drifted apart).
+pub fn round6(value: f64) -> f64 {
+    (value * 1e6).round_ties_even() / 1e6
 }

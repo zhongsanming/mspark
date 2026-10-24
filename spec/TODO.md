@@ -127,6 +127,23 @@ Note also that this capture is much larger than the one used for the earlier
 54 981-row measurements (85 241 tasks), so cross-capture percentages are not
 comparable; always re-measure on the capture being discussed.
 
+### T1k. `op_summary` row count on the multi-device capture — same root cause
+Golden 66 455 rows against our 54 422. Breakdown of the difference:
+
+```
+              rows    keys    extra rows from duplicate (stream, task) keys
+golden       66 455  55 761  10 694
+ours         54 422  54 259     163
+keys only in golden: 1 502        keys only in ours: 0
+```
+
+So the gap is almost entirely **duplicate-key rows** plus 1 502 keys we never emit,
+and we never invent a key. That is the same `(stream, task, batch)` pairing
+problem as `kernel_type` (T1i): msprof emits one row per task *instance*, we emit
+roughly one per key because the second instance has no distinct key.
+
+Not a separate bug, and not fixable in `op_summary` — it needs the batch key.
+
 ### T1j. `task_time` residual on the multi-device capture
 Reported as 6 327 rows beyond 2 ns with `max |Δ| = 24.9 ms`. Investigated:
 
@@ -459,6 +476,51 @@ Event kinds come from `MsprofTxParser.EVENT_DICT` — `marker`, `push/pop`,
 To implement: parse the stream, resolve `mark_id`/`domain` in the hash dic, emit
 `ph: X`/`i` events per event_type. Blocked only on a capture with mstx data.
 
+### T22b. `communication_statistic` time columns — investigated, blocked on the CANN call stack
+The report is a plain aggregate (msprof `hccl_op_report.py`): group by `op_type`,
+`total/min/avg/max` of `end - start` over merged op instances, ns → µs, ROUND_THREE,
+`ratio = total * 100 / sum(total)`, sorted by total desc, warmup ops
+(`end <= start_time_raw_timestamp`) dropped. Our `Count` column already matches
+for two of the three types (415 broadcast, 410 allReduce); the single `allGather`
+op has no attributed task and is skipped, so we emit 825 of 826 ops.
+
+The missing input is the **op window**, which msprof takes from device master
+tasks, not from the host event:
+
+- `hccl_calculator._merge_hccl_ops_and_tasks` groups HCCL tasks per
+  `(thread_id, op_id)`, starts a new round when `op_id` changes or the
+  `(stream, task, context, batch)` tuple repeats, and takes
+  `start = min(task.timestamp)`, `end = max(task.timestamp + task.duration)`
+  over **master** tasks only.
+- `task.duration` does not exist in the `HCCLTask` table: `hccl_model.get_hccl_task_data`
+  joins it to `ASCEND_TASK` on
+  `(stream_id, task_id, batch_id, context_id, device_id)` — our `DeviceTask` —
+  which is the same `batch_id` blocker as T1i.
+- `is_master` comes from the **api event** (`struct_type == 'master'`), `op_id`
+  from the node-level event's `connection_id`, and the task↔op association from
+  the CANN analyzer's open-event stack (`cann_analysis_gear.add_hccl_task` reads
+  `event.additional_record` of the api event that is open when the task arrives).
+
+What the streams themselves can offer was measured on the multi-device capture:
+
+```
+hccl_info records            43 223  (per HCCL-internal task, not per op)
+their item names             Notify_Record 15 225, Notify_Wait 15 225,
+                             Memcpy 8 666, Reduce_Inline 4 107
+their timestamp field        identical (515400224347) on every record
+duration_estimated          0.6–1.29 (µs-scale; golden totals are ~5.3 s)
+stream_id / task_id         absent from the record
+task_track names             71 distinct in the merged capture's hash_dic
+```
+
+So there is no per-task timing in the HCCL streams, and the `role`/`stage` fields
+do not carry the ids needed to join. Reproducing the columns means implementing the
+event call-stack analyzer, which is the same subsystem that would unlock the
+4-thread Overlap (T26) and possibly the `kernel_type` permutation (T1i).
+
+Verdict: not a step, a project. The `Count` column is kept; the time columns stay
+omitted rather than approximated (`duration_estimated` is not the op duration).
+
 ### T22. `Communication` track + `communication_statistic.csv`
 The multi-device capture adds both. Shapes, from the golden and from
 `prof_struct.h`:
@@ -762,7 +824,97 @@ still loop sequentially.
 
 ## Quality
 
-### T15. Golden-fixture test harness
+### T18. Residuals the honest verifiers now report
+`verify-*` compares the real exporter output, which surfaced these (all
+pre-existing, none caused by the review work):
+
+- `op_statistic`: 31/31 rows agree but the row *order* differs from golden, so
+  only 4/31 `OP Type` cells match positionally. Needs msprof's ordering rule.
+- `npu_mem`: `timestamp(us)` 0/2238 (every other column exact).
+- `hbm`: `Read(MB/s)` 4/5.
+- `hccs`: `Average` 0/2 on this capture (was 5/5 on the older one).
+- `SIO`/`HCCS` tracks: we emit 8 and 2 events more than golden. **Diagnosed
+  (SIO)**: the difference is exactly one extra *sample per die* (8 metrics ×
+  2 dies would be 16, so it is one sample) carrying all-zero counters at
+  `…288191127480` ns, i.e. 20.5 µs *earlier* than the first row msprof stores in
+  its own `SIO` table (`…288211607749`; 1098 rows per die). `SESSION_TIME_INFO`
+  starts even earlier (`…287139823000`), so this is not a start-time filter —
+  msprof's SIO parser drops its first record per die, most likely because its
+  rate/delta conversion has no predecessor for it. Drop the first sample per die
+  and compare again.
+- `op_summary`: still the duplicate-key row-alignment problem (T1k).
+
+### T20. Per-device session and I/O in `Ctx` (done)
+`strace` on one full export showed 23 opens of a single device `start_info` and
+20 of `dev_start.log`. Three causes, all fixed:
+
+1. **Five clock loaders re-read the same four files.** They now share one
+   `StartLogs` parse (`StartLogs::clock/host_clock/sampling/mono`), inserted into
+   `Ctx` as `DeviceStartLogs`/`HostStartLogs`. `sample.json` (`SampleConfig`) and
+   `host/info.json` (`HostInfo`) moved into `Ctx` too.
+2. **The `Ctx` cache had a race.** `ctx_for` released the registry lock before
+   `build_ctx`, so the ~20 artifacts running in parallel all missed and rebuilt.
+   The lock is now held across the build — this alone was 20 of the 23 opens.
+3. **Two registries (`Ctx`, `Store`) and 25 `.lock().expect("store lock")`
+   sites** collapsed into one `DeviceSession { ctx, info, store }` with
+   `session.resolve::<T>()`, which takes the lock for exactly one computation.
+   The "the guard must not outlive this call" deadlock hazard in `summary` is
+   structurally gone.
+
+Measured on one capture, `--outputs all`: `openat` 657 → 251, per-device
+`start_info` 23 → 3, `host_start.log` 21 → 1. Output is byte-identical (same
+task_time numbers, same track matches).
+
+The `Mutex` itself is not removable: artifacts fan out over devices in parallel
+and share one memoised `Store` per device. The worthwhile part was shrinking the
+critical section and the number of owners, not deleting the lock.
+
+### T21. Stream identity instead of path+record-size at call sites (done)
+The 25 read sites each spelled out `read_stream(ctx, "stars_soc.", 64)`; the
+prefix, directory and record size now live in `stream::Stream` and nodes ask for
+`ctx.stream(Stream::StarsSoc)`. Bytes are returned, never cached — the parsed
+table is what `Store` memoises and the streams reach hundreds of MB.
+
+Deliberately **not** done: a `pattern` string API (`ctx.read("stars_soc.*")`).
+That only relocates the string, keeps the silent-empty-table failure mode, and
+loses the compile-time check; the enum is the same idea made checkable. Also not
+done: routing *decoding* through `Ctx` — decoders stay pure `&[u8] -> Vec<Row>`.
+
+### T19. Review items deliberately not taken
+Recorded so the next pass does not re-litigate them:
+
+
+- **`Weak` entries in `Store`**: frees intermediate tables once no artifact holds
+  them, but every artifact would then recompute upstream nodes (re-reading
+  streams), which is slower than the memory it saves at these sizes. The session
+  refactor now lets a device's tables be dropped when that device finishes, which
+  covers the common case.
+- **(done)** All clock/config I/O into `Ctx`, and the per-device session — see
+  T20. Data streams (`host_cpu.data`, `stars_soc`, …) stay in the nodes: they
+  *are* the node inputs, not configuration.
+- **One file per artifact behind a `Report` trait** (§1): partially done — the
+  duplication that mattered (20 verifier twins) is gone and the pure helpers are
+  in the library, but the exporters still live in `main.rs`.
+- **`next_nbi` extraction, `StartLogs`, decoder `read_*_at` helpers, trybuild
+  cycle test**: mechanical cleanups with no behavioural effect; deferred.
+
+### T15. Fidelity ratchet (done)
+Byte-exactness is not a goal, so the gate is `mspark verify-all`: it compares each
+artifact column against its golden file as a **multiset** with numeric cells on a
+3-decimal grid (order-insensitive, float-noise tolerant) and fails when any column
+drops below the value recorded in `spec/baseline.txt`. Two lessons from building it:
+
+- Whole-row equality is the wrong metric: one nanosecond in one cell made a 99.9 %
+  correct table report 0 %. Per-column matching reports what actually broke.
+- Storing a *rounded percentage* in the baseline made both a clean run (looked like
+  a regression) and a stale baseline (looked fine) misreport. The file stores the
+  matched/denominator counts and recomputes the ratio.
+
+Artifacts whose header does not match the golden one are reported as `GAP` and are
+never recorded, so `communication_statistic` (still missing its time columns, T22)
+cannot be mistaken for a passing table.
+
+### T15 (old). Golden-fixture test harness
 Move the verifiers into `cargo test` with checked-in golden CSVs/timelines so
 `cargo test` gates regressions.
 

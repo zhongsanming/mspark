@@ -113,6 +113,51 @@ mspark verify-op-statistic PROF_… --golden …/op_statistic_*.csv
 `process_name`/`process_labels` metadata (the pid encoding changes between
 chips), then compares counter events as multisets.
 
+CSV verification runs the **production exporter** into a temporary directory and
+compares that file against the golden one, so a verifier can never drift from
+the writer. Columns are matched by header name (a reordered golden file is an
+error, not a silent mismatch) and fields are read with a real RFC 4180 parser.
+
+Byte-exactness is **not** a goal. What matters is that nothing gets *worse*, so
+the fidelity gate is a ratchet over per-column closeness:
+
+```bash
+mspark verify-all PROF_…            # compare every artifact, fail on any regression
+mspark verify-all PROF_… --update-baseline   # after a deliberate improvement
+```
+
+`spec/baseline.txt` records, for every artifact column, how many of its values
+match the golden file (compared as multisets, numeric cells on a 3-decimal grid,
+so ordering and float noise do not count). Any column that drops below its
+recorded value fails the run — that catches a dropped row, a broken column or a
+stream that stopped decoding, without demanding bit-identical output.
+
+`--strict` on the individual verifiers still gives an exact match when you want
+one:
+
+```bash
+mspark --strict verify-llc-csv PROF_… --golden …/llc_read_write_*.csv
+```
+
+### Project layout of the binary
+
+Raw input is requested by **stream identity**, never by path: a node calls
+`ctx.stream(Stream::StarsSoc)` and gets the bytes of that stream. The prefix, the
+directory (device vs host) and the record size live once in `stream::Stream`, so a
+node cannot disagree with the file it needs and a typo is a compile error instead
+of an empty table. `Stream::trunk` also owns the versioned layouts (`hbm` v1/v2),
+and a unit test keeps every prefix unique and non-overlapping per directory.
+
+Each device is a `DeviceSession { ctx, info, store }`: the context (including the
+parsed `StartLogs`, `sample.json` and host `info.json`) is built once per process
+and the store memoises node tables for that device only.
+
+`src/main.rs` holds the CLI and the artifact exporters; `src/lib.rs` holds the
+parts that are worth unit-testing — `text` (Python-compatible float/rounding
+helpers, the NIC timestamp column, µs parsing, civil dates) and `verify` (CSV
+reader, comparison, strict gate). `cargo test` covers those plus the node graph
+and the dataflow framework.
+
 ---
 
 ## Status

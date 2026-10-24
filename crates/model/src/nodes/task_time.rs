@@ -25,17 +25,23 @@ impl TaskTimeRow {
     pub const HEADER: &'static str = "Device_id,kernel_name,kernel_type,stream_id,task_id,task_time(us),task_start(us),task_stop(us)";
 
     pub fn to_csv(&self) -> String {
-        format!(
-            "{},{},{},{},{},{},{},{}\n",
-            self.device_id,
-            self.kernel_name,
-            self.kernel_type,
+        let mut out = String::with_capacity(96);
+        out.push_str(&self.device_id.to_string());
+        out.push(',');
+        // Kernel names come from the host dictionary and may contain commas or
+        // quotes; msprof quotes them like any other field.
+        crate::format::push_csv_field(&mut out, &self.kernel_name);
+        out.push(',');
+        crate::format::push_csv_field(&mut out, &self.kernel_type);
+        out.push_str(&format!(
+            ",{},{},{},{},{}\n",
             self.stream_id,
             self.task_id,
             fmt_us(self.duration_ns, false),
             fmt_us(self.start_ns, true),
             fmt_us(self.stop_ns, true),
-        )
+        ));
+        out
     }
 }
 

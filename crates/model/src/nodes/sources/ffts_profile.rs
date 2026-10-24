@@ -9,23 +9,19 @@ use super::stars_soc::FUNC_CONTEXT_PMU;
 use super::stars_soc::normalize_stream_id;
 use super::stars_soc::normalize_task_id;
 use crate::ctx::DeviceInfo;
+use crate::stream::FFTS_PROFILE_TRUNK;
+use crate::stream::{CtxStreams, Stream};
 
 impl Node for super::ffts_profile::PmuData {
     const NAME: &'static str = "ffts_profile";
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = crate::stream::read_stream(
-            ctx,
-            "ffts_profile.",
-            super::ffts_profile::FFTS_PROFILE_TRUNK,
-        )?;
+        let bytes = ctx.stream(Stream::FftsProfile)?;
         let expand = ctx.require::<DeviceInfo>()?.expand_status;
         Ok(super::ffts_profile::decode_ffts_profile(&bytes, expand)?.0)
     }
 }
-
-pub const FFTS_PROFILE_TRUNK: usize = 128;
 
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C, packed)]

@@ -4,14 +4,14 @@ use anyhow::Result;
 use mspark_df::{Ctx, Node};
 
 use crate::ctx::DeviceInfo;
-use crate::format::{csv_field, fmt_metric};
+use crate::format::{fmt_metric, push_csv_field};
 use crate::host::ge_task_type;
 use crate::nodes::sources::tensor_info::{format_str, join_or_na, shapes_field, take_tensors};
-use crate::pmu::{AIC_EVENTS, AIV_EVENTS, get_freq, pmu_div, pmu_ratio};
-use crate::tables;
 use crate::time::{Clock, fmt_us};
 
 use super::device_task::DeviceTask;
+use super::sources::ffts_profile::PmuData;
+use super::sources::lpm::LpmSample;
 use super::sources::{NodeBasicInfoRow, TensorInfoRow};
 
 #[derive(Debug, Clone)]
@@ -32,8 +32,8 @@ impl OpSummaryRow {
         "Task Start Time(us)",
         "Task Duration(us)",
         "Task Wait Time(us)",
-        "Block Dim",
-        "Mix Block Dim",
+        "Block Num",
+        "Mix Block Num",
         "HF32 Eligible",
         "Input Shapes",
         "Input Data Types",
@@ -70,12 +70,14 @@ impl OpSummaryRow {
     ];
 
     pub fn to_csv(&self) -> String {
-        let mut s = self
-            .cols
-            .iter()
-            .map(|field| csv_field(field))
-            .collect::<Vec<_>>()
-            .join(",");
+        debug_assert_eq!(self.cols.len(), Self::HEADER.len(), "column count drifted");
+        let mut s = String::with_capacity(256);
+        for (i, field) in self.cols.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            push_csv_field(&mut s, field);
+        }
         s.push('\n');
         s
     }
@@ -87,7 +89,7 @@ impl Node for OpSummaryRow {
         DeviceTask,
         NodeBasicInfoRow,
         TensorInfoRow,
-        super::sources::ffts_profile::PmuData,
+        PmuData,
         super::sources::lpm::LpmInfo,
     );
 
@@ -97,7 +99,7 @@ impl Node for OpSummaryRow {
             std::sync::Arc<Vec<DeviceTask>>,
             std::sync::Arc<Vec<NodeBasicInfoRow>>,
             std::sync::Arc<Vec<TensorInfoRow>>,
-            std::sync::Arc<Vec<super::sources::ffts_profile::PmuData>>,
+            std::sync::Arc<Vec<PmuData>>,
             std::sync::Arc<Vec<super::sources::lpm::LpmInfo>>,
         ),
     ) -> Result<Vec<Self>> {
@@ -114,7 +116,7 @@ impl Node for OpSummaryRow {
             .first()
             .map(|lpm| lpm.samples.clone())
             .unwrap_or_default();
-        let pmu_map: HashMap<(u16, u16), &super::sources::ffts_profile::PmuData> = pmus
+        let pmu_map: HashMap<(u16, u16), &PmuData> = pmus
             .iter()
             .map(|pmu| ((pmu.stream_id, pmu.task_id), pmu))
             .collect();
@@ -173,10 +175,7 @@ impl Node for OpSummaryRow {
                 .unwrap_or_default();
             cols.push(shapes_field(&inputs));
             cols.push(join_or_na(
-                inputs
-                    .iter()
-                    .map(|t| tables::data_type_name(t.data_type))
-                    .collect(),
+                inputs.iter().map(|t| data_type_name(t.data_type)).collect(),
             ));
             cols.push(join_or_na(
                 inputs.iter().map(|t| format_str(t.format)).collect(),
@@ -185,7 +184,7 @@ impl Node for OpSummaryRow {
             cols.push(join_or_na(
                 outputs
                     .iter()
-                    .map(|t| tables::data_type_name(t.data_type))
+                    .map(|t| data_type_name(t.data_type))
                     .collect(),
             ));
             cols.push(join_or_na(
@@ -252,6 +251,13 @@ impl Node for OpSummaryRow {
             };
             cols.push(format!("{cube:.3}"));
 
+            assert_eq!(
+                cols.len(),
+                Self::HEADER.len(),
+                "op_summary row has {} columns, header has {}",
+                cols.len(),
+                Self::HEADER.len()
+            );
             rows.push(OpSummaryRow { cols });
         }
 
@@ -270,5 +276,126 @@ impl Node for OpSummaryRow {
             rows[i].cols[10] = format!("{wait:.6}");
         }
         Ok(rows)
+    }
+}
+
+pub fn data_type_name(id: u32) -> std::borrow::Cow<'static, str> {
+    match id {
+        0 => "FLOAT".into(),
+        1 => "FLOAT16".into(),
+        2 => "INT8".into(),
+        3 => "INT32".into(),
+        4 => "UINT8".into(),
+        6 => "INT16".into(),
+        7 => "UINT16".into(),
+        8 => "UINT32".into(),
+        9 => "INT64".into(),
+        10 => "UINT64".into(),
+        11 => "DOUBLE".into(),
+        12 => "BOOL".into(),
+        13 => "STRING".into(),
+        14 => "DUAL_SUB_INT8".into(),
+        15 => "DUAL_SUB_UINT8".into(),
+        16 => "COMPLEX64".into(),
+        17 => "COMPLEX128".into(),
+        18 => "QINT8".into(),
+        19 => "QINT16".into(),
+        20 => "QINT32".into(),
+        21 => "QUINT8".into(),
+        22 => "QUINT16".into(),
+        23 => "RESOURCE".into(),
+        24 => "STRING_REF".into(),
+        25 => "DUAL".into(),
+        26 => "DT_VARIANT".into(),
+        27 => "DT_BF16".into(),
+        28 => "DT_UNDEFINED".into(),
+        29 => "DT_INT4".into(),
+        30 => "DT_UINT1".into(),
+        31 => "DT_INT2".into(),
+        32 => "DT_UINT2".into(),
+        33 => "DT_COMPLEX32".into(),
+        34 => "DT_HIFLOAT8".into(),
+        35 => "DT_FLOAT8_E5M2".into(),
+        36 => "DT_FLOAT8_E4M3FN".into(),
+        37 => "DT_FLOAT8_E8M0".into(),
+        38 => "DT_FLOAT6_E3M2".into(),
+        39 => "DT_FLOAT6_E2M3".into(),
+        40 => "DT_FLOAT4_E2M1".into(),
+        41 => "DT_FLOAT4_E1M2".into(),
+        42 => "DT_HIFLOAT4".into(),
+        43 => "DT_MAX".into(),
+        229 => "NUMBER_TYPE_BEGIN_".into(),
+        230 => "BOOL_".into(),
+        231 => "INT_".into(),
+        232 => "INT8_".into(),
+        233 => "INT16_".into(),
+        234 => "INT32_".into(),
+        235 => "INT64_".into(),
+        236 => "UINT_".into(),
+        237 => "UINT8_".into(),
+        238 => "UINT16_".into(),
+        239 => "UINT32_".into(),
+        240 => "UINT64_".into(),
+        241 => "FLOAT_".into(),
+        242 => "FLOAT16_".into(),
+        243 => "FLOAT32_".into(),
+        244 => "FLOAT64_".into(),
+        245 => "COMPLEX_".into(),
+        246 => "NUMBER_TYPE_END_".into(),
+        _ => std::borrow::Cow::Owned(id.to_string()),
+    }
+}
+
+// PMU event tables (moved from `pmu.rs`).
+pub(crate) const AIC_EVENTS: [u32; 8] = [0x416, 0x417, 0x9, 0x302, 0xc, 0x303, 0x54, 0x55];
+pub(crate) const AIV_EVENTS: [u32; 8] = [0x8, 0xa, 0x9, 0xb, 0xc, 0xd, 0x54, 0x55];
+
+pub(crate) fn get_freq(samples: &[LpmSample], base_hz: f64, end: u64) -> f64 {
+    if samples.iter().any(|s| s.value == 0) {
+        return base_hz;
+    }
+    let mut freq = base_hz;
+    for sample in samples {
+        if end < sample.sys_cnt {
+            break;
+        }
+        freq = sample.value as f64 * 1_000_000.0;
+    }
+    freq
+}
+
+pub(crate) fn pmu_ratio(total: u64, pmu_list: &[u64; 8], events: &[u32; 8], regs: &[u32]) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let mut sum = 0u64;
+    for reg in regs {
+        if let Some(pos) = events.iter().position(|event| event == reg) {
+            sum += pmu_list[pos];
+        }
+    }
+    sum as f64 / total as f64
+}
+
+pub(crate) fn pmu_div(
+    total: u64,
+    pmu_list: &[u64; 8],
+    events: &[u32; 8],
+    num: u32,
+    den: u32,
+) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let Some(n) = events.iter().position(|event| *event == num) else {
+        return 0.0;
+    };
+    let Some(d) = events.iter().position(|event| *event == den) else {
+        return 0.0;
+    };
+    if pmu_list[d] == 0 {
+        0.0
+    } else {
+        pmu_list[n] as f64 / pmu_list[d] as f64
     }
 }
