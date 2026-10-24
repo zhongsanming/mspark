@@ -7,8 +7,6 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 use mspark_df::{Ctx, Node};
 
-use crate::tables;
-
 // Tensor descriptors (input/output shapes, data types, formats)
 // ---------------------------------------------------------------------------
 
@@ -67,7 +65,7 @@ pub(crate) fn shape_str(tensor: &super::tensor_info::TensorDescRaw) -> String {
 pub(crate) fn format_str(format: u32) -> String {
     let id = format & 0xff;
     let sub = (format & 0xffff00) >> 8;
-    let name = tables::format_name(id);
+    let name = format_name(id);
     if sub > 0 {
         format!("{name}:{sub}")
     } else {
@@ -177,4 +175,88 @@ pub fn decode_tensor_info(bytes: &[u8]) -> Result<Vec<TensorInfoRaw>> {
         });
     }
     Ok(out)
+}
+
+pub fn format_name(id: u32) -> String {
+    match id {
+        0 => "NCHW".to_string(),
+        1 => "NHWC".to_string(),
+        2 => "ND".to_string(),
+        3 => "NC1HWC0".to_string(),
+        4 => "FRACTAL_Z".to_string(),
+        5 => "NC1C0HWPAD".to_string(),
+        6 => "NHWC1C0".to_string(),
+        7 => "FSR_NCHW".to_string(),
+        8 => "FRACTAL_DECONV".to_string(),
+        9 => "C1HWNC0".to_string(),
+        10 => "FRACTAL_DECONV_TRANSPOSE".to_string(),
+        11 => "FRACTAL_DECONV_SP_STRIDE_TRANS".to_string(),
+        12 => "NC1HWC0_C04".to_string(),
+        13 => "FRACTAL_Z_C04".to_string(),
+        14 => "CHWN".to_string(),
+        15 => "FRACTAL_DECONV_SP_STRIDE8_TRANS".to_string(),
+        16 => "HWCN".to_string(),
+        17 => "NC1KHKWHWC0".to_string(),
+        18 => "BN_WEIGHT".to_string(),
+        19 => "FILTER_HWCK".to_string(),
+        20 => "HASHTABLE_LOOKUP_LOOKUPS".to_string(),
+        21 => "HASHTABLE_LOOKUP_KEYS".to_string(),
+        22 => "HASHTABLE_LOOKUP_VALUE".to_string(),
+        23 => "HASHTABLE_LOOKUP_OUTPUT".to_string(),
+        24 => "HASHTABLE_LOOKUP_HITS".to_string(),
+        25 => "C1HWNCoC0".to_string(),
+        26 => "MD".to_string(),
+        27 => "NDHWC".to_string(),
+        28 => "FRACTAL_ZZ".to_string(),
+        29 => "FRACTAL_NZ".to_string(),
+        30 => "NCDHW".to_string(),
+        31 => "DHWCN".to_string(),
+        32 => "NDC1HWC0".to_string(),
+        33 => "FRACTAL_Z_3D".to_string(),
+        34 => "CN".to_string(),
+        35 => "NC".to_string(),
+        36 => "DHWNC".to_string(),
+        37 => "FRACTAL_Z_3D_TRANSPOSE".to_string(),
+        38 => "FRACTAL_ZN_LSTM".to_string(),
+        39 => "FRACTAL_Z_G".to_string(),
+        40 => "RESERVED".to_string(),
+        41 => "ALL".to_string(),
+        42 => "NULL".to_string(),
+        43 => "ND_RNN_BIAS".to_string(),
+        44 => "FRACTAL_ZN_RNN".to_string(),
+        45 => "NYUV".to_string(),
+        46 => "NYUV_A".to_string(),
+        47 => "NCL".to_string(),
+        48 => "FRACTAL_Z_WINO".to_string(),
+        49 => "C1HWC0".to_string(),
+        50 => "FRACTAL_NZ_C0_16".to_string(),
+        51 => "FRACTAL_NZ_C0_32".to_string(),
+        52 => "FRACTAL_NZ_C0_2".to_string(),
+        53 => "FRACTAL_NZ_C0_4".to_string(),
+        54 => "FRACTAL_NZ_C0_8".to_string(),
+        55 => "END".to_string(),
+        200 => "UNKNOWN_".to_string(),
+        201 => "DEFAULT_".to_string(),
+        202 => "NC1KHKWHWC0_".to_string(),
+        203 => "ND_".to_string(),
+        204 => "NCHW_".to_string(),
+        205 => "NHWC_".to_string(),
+        206 => "HWCN_".to_string(),
+        207 => "NC1HWC0_".to_string(),
+        208 => "FRAC_Z_".to_string(),
+        209 => "C1HWNCOC0_".to_string(),
+        210 => "FRAC_NZ_".to_string(),
+        211 => "NC1HWC0_C04_".to_string(),
+        212 => "FRACTAL_Z_C04_".to_string(),
+        213 => "NDHWC_".to_string(),
+        214 => "FRACTAL_ZN_LSTM_".to_string(),
+        215 => "FRACTAL_ZN_RNN_".to_string(),
+        216 => "ND_RNN_BIAS_".to_string(),
+        217 => "NDC1HWC0_".to_string(),
+        218 => "NCDHW_".to_string(),
+        219 => "FRACTAL_Z_3D_".to_string(),
+        220 => "DHWNC_".to_string(),
+        221 => "DHWCN_".to_string(),
+        _ => id.to_string(),
+    }
 }

@@ -78,3 +78,11 @@ pub fn decode_npu_mem(bytes: &[u8]) -> Result<Vec<NpuMemRaw>> {
     }
     Ok(out)
 }
+
+pub fn npu_mem_event(event: u32) -> &'static str {
+    match event {
+        0 => "APP",
+        1 => "Device",
+        _ => "UNKNOWN",
+    }
+}

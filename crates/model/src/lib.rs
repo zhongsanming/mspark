@@ -8,13 +8,15 @@ pub mod ctx;
 pub(crate) mod format;
 pub mod host;
 pub mod nodes;
-pub(crate) mod pmu;
 pub mod stream;
-pub mod tables;
 pub mod time;
 
 pub use ctx::{Chip, DeviceInfo, load_device_info, load_sample_string};
 pub use host::{HashDic, TypeDic, ge_task_type, load_dictionaries};
+pub use nodes::sources::api_event::api_level_name;
+pub use nodes::sources::dvpp::dvpp_engine_name;
+pub use nodes::sources::npu_mem::npu_mem_event;
+pub use nodes::sources::npu_module_mem::module_name;
 pub use nodes::sources::{LLC_READ_SLOTS, NetSample};
 pub use nodes::*;
 

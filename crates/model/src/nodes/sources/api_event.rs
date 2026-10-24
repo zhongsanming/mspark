@@ -120,3 +120,14 @@ pub fn decode_api_event(bytes: &[u8]) -> Result<Vec<ApiEventRaw>> {
     }
     Ok(out)
 }
+
+pub fn api_level_name(level: u16) -> &'static str {
+    match level {
+        20000 => "acl",
+        15000 => "model",
+        10000 => "node",
+        5500 => "communication",
+        5000 => "runtime",
+        _ => "",
+    }
+}

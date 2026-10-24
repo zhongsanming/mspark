@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context as _, Result, bail};
 use mspark_df::{Ctx, Store, resolve};
 use mspark_model::NetSample;
-use mspark_model::tables;
 use mspark_model::{
     AccPmuSample, ApiEventRow, ApiStatisticRow, ChipTransKind, ChipTransSample, Clock, DeviceInfo,
     DvppRow, HbmRecord, HcclInfoRow, HcclOpRow, HccsRateRow, HostCpuUsageRow, HostMemUsageRow,
@@ -3210,7 +3209,7 @@ fn api_statistic(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         for row in resolve::<ApiStatisticRow>(&mut store, &ctx)?.iter() {
             body.push_str(&format!(
                 "host,{},{},{},{},{},{},{},{}\n",
-                tables::api_level_name(row.level),
+                mspark_model::api_level_name(row.level),
                 row.api_name,
                 row.time,
                 row.count,
@@ -3238,7 +3237,7 @@ fn verify_api_statistic(prof: &Path, only: Option<&str>, golden: &Path) -> Resul
         for row in resolve::<ApiStatisticRow>(&mut store, &ctx)?.iter() {
             produced.push(vec![
                 "host".to_string(),
-                tables::api_level_name(row.level).to_string(),
+                mspark_model::api_level_name(row.level).to_string(),
                 row.api_name.clone(),
                 row.time.clone(),
                 row.count.to_string(),
@@ -3502,7 +3501,7 @@ fn dvpp(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
             body.push_str(&format!(
                 "{dev},{},{},{},{:?},{:?},{}\n",
                 row.dvpp_id,
-                tables::dvpp_engine_name(row.engine_type),
+                mspark_model::dvpp_engine_name(row.engine_type),
                 row.engine_id,
                 row.all_time,
                 row.all_frame,
@@ -3530,7 +3529,7 @@ fn verify_dvpp(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
             produced.push(vec![
                 dev.clone(),
                 row.dvpp_id.to_string(),
-                tables::dvpp_engine_name(row.engine_type).to_string(),
+                mspark_model::dvpp_engine_name(row.engine_type).to_string(),
                 row.engine_id.to_string(),
                 format!("{:?}", row.all_time),
                 format!("{:?}", row.all_frame),
@@ -3774,7 +3773,7 @@ fn npu_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         for row in resolve::<NpuMemRow>(&mut store, &ctx)?.iter() {
             body.push_str(&format!(
                 "{dev},{},{},{},{},{}\n",
-                tables::npu_mem_event(row.event),
+                mspark_model::npu_mem_event(row.event),
                 row.ddr / 1024,
                 row.hbm / 1024,
                 (row.ddr + row.hbm) / 1024,
@@ -3801,7 +3800,7 @@ fn verify_npu_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> 
         for row in resolve::<NpuMemRow>(&mut store, &ctx)?.iter() {
             produced.push(vec![
                 dev.clone(),
-                tables::npu_mem_event(row.event).to_string(),
+                mspark_model::npu_mem_event(row.event).to_string(),
                 (row.ddr / 1024).to_string(),
                 (row.hbm / 1024).to_string(),
                 ((row.ddr + row.hbm) / 1024).to_string(),
@@ -3832,7 +3831,7 @@ fn npu_module_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         for row in resolve::<NpuModuleMemRow>(&mut store, ctx)?.iter() {
             body.push_str(&format!(
                 "{dev},{},{},{},NPU:{dev}\n",
-                tables::module_name(row.module_id),
+                mspark_model::module_name(row.module_id),
                 fmt_us(row.ts_ns, true),
                 row.total_size / 1024
             ));
@@ -3864,7 +3863,7 @@ fn verify_npu_module_mem(prof: &Path, only: Option<&str>, golden: &Path) -> Resu
         for row in resolve::<NpuModuleMemRow>(&mut store, &ctx)?.iter() {
             produced.push(vec![
                 dev.to_string(),
-                tables::module_name(row.module_id).to_string(),
+                mspark_model::module_name(row.module_id).to_string(),
                 fmt_us(row.ts_ns, false).to_string(),
                 (row.total_size / 1024).to_string(),
                 format!("NPU:{dev}"),

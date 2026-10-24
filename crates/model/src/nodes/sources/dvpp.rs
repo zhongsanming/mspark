@@ -63,3 +63,16 @@ impl Node for DvppRow {
             .collect())
     }
 }
+
+pub fn dvpp_engine_name(engine_type: u32) -> &'static str {
+    match engine_type {
+        0 => "VDEC",
+        1 => "JPEGD",
+        2 => "PNGD",
+        3 => "JPEGE",
+        4 => "VPC",
+        5 => "VENC",
+        6 => "SCD",
+        _ => "UNKNOWN",
+    }
+}

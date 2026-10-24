@@ -7,8 +7,6 @@ use crate::ctx::DeviceInfo;
 use crate::format::{csv_field, fmt_metric};
 use crate::host::ge_task_type;
 use crate::nodes::sources::tensor_info::{format_str, join_or_na, shapes_field, take_tensors};
-use crate::pmu::{AIC_EVENTS, AIV_EVENTS, get_freq, pmu_div, pmu_ratio};
-use crate::tables;
 use crate::time::{Clock, fmt_us};
 
 use super::device_task::DeviceTask;
@@ -173,10 +171,7 @@ impl Node for OpSummaryRow {
                 .unwrap_or_default();
             cols.push(shapes_field(&inputs));
             cols.push(join_or_na(
-                inputs
-                    .iter()
-                    .map(|t| tables::data_type_name(t.data_type))
-                    .collect(),
+                inputs.iter().map(|t| data_type_name(t.data_type)).collect(),
             ));
             cols.push(join_or_na(
                 inputs.iter().map(|t| format_str(t.format)).collect(),
@@ -185,7 +180,7 @@ impl Node for OpSummaryRow {
             cols.push(join_or_na(
                 outputs
                     .iter()
-                    .map(|t| tables::data_type_name(t.data_type))
+                    .map(|t| data_type_name(t.data_type))
                     .collect(),
             ));
             cols.push(join_or_na(
@@ -270,5 +265,130 @@ impl Node for OpSummaryRow {
             rows[i].cols[10] = format!("{wait:.6}");
         }
         Ok(rows)
+    }
+}
+
+pub fn data_type_name(id: u32) -> String {
+    match id {
+        0 => "FLOAT".to_string(),
+        1 => "FLOAT16".to_string(),
+        2 => "INT8".to_string(),
+        3 => "INT32".to_string(),
+        4 => "UINT8".to_string(),
+        6 => "INT16".to_string(),
+        7 => "UINT16".to_string(),
+        8 => "UINT32".to_string(),
+        9 => "INT64".to_string(),
+        10 => "UINT64".to_string(),
+        11 => "DOUBLE".to_string(),
+        12 => "BOOL".to_string(),
+        13 => "STRING".to_string(),
+        14 => "DUAL_SUB_INT8".to_string(),
+        15 => "DUAL_SUB_UINT8".to_string(),
+        16 => "COMPLEX64".to_string(),
+        17 => "COMPLEX128".to_string(),
+        18 => "QINT8".to_string(),
+        19 => "QINT16".to_string(),
+        20 => "QINT32".to_string(),
+        21 => "QUINT8".to_string(),
+        22 => "QUINT16".to_string(),
+        23 => "RESOURCE".to_string(),
+        24 => "STRING_REF".to_string(),
+        25 => "DUAL".to_string(),
+        26 => "DT_VARIANT".to_string(),
+        27 => "DT_BF16".to_string(),
+        28 => "DT_UNDEFINED".to_string(),
+        29 => "DT_INT4".to_string(),
+        30 => "DT_UINT1".to_string(),
+        31 => "DT_INT2".to_string(),
+        32 => "DT_UINT2".to_string(),
+        33 => "DT_COMPLEX32".to_string(),
+        34 => "DT_HIFLOAT8".to_string(),
+        35 => "DT_FLOAT8_E5M2".to_string(),
+        36 => "DT_FLOAT8_E4M3FN".to_string(),
+        37 => "DT_FLOAT8_E8M0".to_string(),
+        38 => "DT_FLOAT6_E3M2".to_string(),
+        39 => "DT_FLOAT6_E2M3".to_string(),
+        40 => "DT_FLOAT4_E2M1".to_string(),
+        41 => "DT_FLOAT4_E1M2".to_string(),
+        42 => "DT_HIFLOAT4".to_string(),
+        43 => "DT_MAX".to_string(),
+        229 => "NUMBER_TYPE_BEGIN_".to_string(),
+        230 => "BOOL_".to_string(),
+        231 => "INT_".to_string(),
+        232 => "INT8_".to_string(),
+        233 => "INT16_".to_string(),
+        234 => "INT32_".to_string(),
+        235 => "INT64_".to_string(),
+        236 => "UINT_".to_string(),
+        237 => "UINT8_".to_string(),
+        238 => "UINT16_".to_string(),
+        239 => "UINT32_".to_string(),
+        240 => "UINT64_".to_string(),
+        241 => "FLOAT_".to_string(),
+        242 => "FLOAT16_".to_string(),
+        243 => "FLOAT32_".to_string(),
+        244 => "FLOAT64_".to_string(),
+        245 => "COMPLEX_".to_string(),
+        246 => "NUMBER_TYPE_END_".to_string(),
+        _ => id.to_string(),
+    }
+}
+
+// PMU event tables (moved from `pmu.rs`).
+pub(crate) const AIC_EVENTS: [u32; 8] = [0x416, 0x417, 0x9, 0x302, 0xc, 0x303, 0x54, 0x55];
+pub(crate) const AIV_EVENTS: [u32; 8] = [0x8, 0xa, 0x9, 0xb, 0xc, 0xd, 0x54, 0x55];
+
+pub(crate) fn get_freq(
+    samples: &[crate::nodes::sources::lpm::LpmSample],
+    base_hz: f64,
+    end: u64,
+) -> f64 {
+    if samples.iter().any(|s| s.value == 0) {
+        return base_hz;
+    }
+    let mut freq = base_hz;
+    for sample in samples {
+        if end < sample.sys_cnt {
+            break;
+        }
+        freq = sample.value as f64 * 1_000_000.0;
+    }
+    freq
+}
+
+pub(crate) fn pmu_ratio(total: u64, pmu_list: &[u64; 8], events: &[u32; 8], regs: &[u32]) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let mut sum = 0u64;
+    for reg in regs {
+        if let Some(pos) = events.iter().position(|event| event == reg) {
+            sum += pmu_list[pos];
+        }
+    }
+    sum as f64 / total as f64
+}
+
+pub(crate) fn pmu_div(
+    total: u64,
+    pmu_list: &[u64; 8],
+    events: &[u32; 8],
+    num: u32,
+    den: u32,
+) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let Some(n) = events.iter().position(|event| *event == num) else {
+        return 0.0;
+    };
+    let Some(d) = events.iter().position(|event| *event == den) else {
+        return 0.0;
+    };
+    if pmu_list[d] == 0 {
+        0.0
+    } else {
+        pmu_list[n] as f64 / pmu_list[d] as f64
     }
 }
