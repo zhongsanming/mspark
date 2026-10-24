@@ -51,6 +51,14 @@ jobs:
     - name: Test
       run: cargo test --verbose
 
+    # Byte-exactness is not required; the closeness baseline in
+    # `spec/baseline.txt` is. This step needs a profiling capture, which CI does
+    # not ship, so it is skipped unless one is provided (self-hosted runs or a
+    # downloaded artefact) via MSPARK_PROFILE.
+    - name: Verify against goldens (ratchet)
+      if: ${{ env.MSPARK_PROFILE != '' }}
+      run: cargo run --release -- verify-all "$MSPARK_PROFILE"
+
   nix-build:
     name: Nix Build
     runs-on: ubuntu-latest

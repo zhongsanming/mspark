@@ -118,8 +118,22 @@ compares that file against the golden one, so a verifier can never drift from
 the writer. Columns are matched by header name (a reordered golden file is an
 error, not a silent mismatch) and fields are read with a real RFC 4180 parser.
 
-Verification is informational by default; `--strict` turns any mismatch into a
-non-zero exit status so CI can gate on regressions:
+Byte-exactness is **not** a goal. What matters is that nothing gets *worse*, so
+the fidelity gate is a ratchet over per-column closeness:
+
+```bash
+mspark verify-all PROF_…            # compare every artifact, fail on any regression
+mspark verify-all PROF_… --update-baseline   # after a deliberate improvement
+```
+
+`spec/baseline.txt` records, for every artifact column, how many of its values
+match the golden file (compared as multisets, numeric cells on a 3-decimal grid,
+so ordering and float noise do not count). Any column that drops below its
+recorded value fails the run — that catches a dropped row, a broken column or a
+stream that stopped decoding, without demanding bit-identical output.
+
+`--strict` on the individual verifiers still gives an exact match when you want
+one:
 
 ```bash
 mspark --strict verify-llc-csv PROF_… --golden …/llc_read_write_*.csv

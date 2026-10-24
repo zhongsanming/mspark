@@ -170,3 +170,136 @@ pub fn read_rows(path: &Path) -> Result<Vec<Vec<String>>> {
     }
     Ok(rows)
 }
+
+/// How close a produced table is to the golden one, when "exact" is not the bar.
+///
+/// Whole-row equality is too coarse: a single cell that is a nanosecond off makes
+/// the row "different", so a table that is 99.9 % right reports 0 %. Instead each
+/// **column** is compared as a multiset of values, with numeric cells rounded to
+/// `places` decimals. That is order-insensitive (msprof's `ORDER BY` is not always
+/// reproducible), tolerates float noise, and still drops measurably when a row or
+/// a column breaks.
+#[derive(Debug, Clone, Copy)]
+pub struct ColumnMatch {
+    pub matched: usize,
+    pub golden: usize,
+    pub produced: usize,
+}
+
+impl ColumnMatch {
+    /// Fraction of this column's values that matched, relative to the longer side.
+    pub fn ratio(&self) -> f64 {
+        let denominator = self.golden.max(self.produced);
+        if denominator == 0 {
+            return 1.0;
+        }
+        self.matched as f64 / denominator as f64
+    }
+}
+
+/// Per-column closeness of `produced` against `golden`.
+pub fn compare_columns(
+    golden_rows: &[Vec<String>],
+    produced_rows: &[Vec<String>],
+    places: u32,
+) -> Vec<ColumnMatch> {
+    use std::collections::HashMap;
+
+    let width = golden_rows
+        .iter()
+        .chain(produced_rows)
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(width);
+    for column in 0..width {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for row in golden_rows {
+            if let Some(cell) = row.get(column) {
+                *counts.entry(normalize(cell, places)).or_default() += 1;
+            }
+        }
+        let mut matched = 0usize;
+        for row in produced_rows {
+            if let Some(cell) = row.get(column) {
+                let key = normalize(cell, places);
+                if let Some(count) = counts.get_mut(&key)
+                    && *count > 0
+                {
+                    *count -= 1;
+                    matched += 1;
+                }
+            }
+        }
+        out.push(ColumnMatch {
+            matched,
+            golden: golden_rows.len(),
+            produced: produced_rows.len(),
+        });
+    }
+    out
+}
+
+/// Normalise a cell for tolerance-aware comparison: numeric cells are rounded to
+/// `places` decimals, everything else is compared verbatim.
+fn normalize(cell: &str, places: u32) -> String {
+    match cell.trim().parse::<f64>() {
+        Ok(value) if value.is_finite() => format!("{value:.places$}", places = places as usize),
+        _ => cell.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(cells: &[&[&str]]) -> Vec<Vec<String>> {
+        cells
+            .iter()
+            .map(|row| row.iter().map(|c| c.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn order_does_not_matter() {
+        let golden = rows(&[&["a", "1.0"], &["b", "2.0"]]);
+        let produced = rows(&[&["b", "2.0"], &["a", "1.0"]]);
+        let columns = compare_columns(&golden, &produced, 3);
+        assert_eq!(columns.len(), 2);
+        assert!(columns.iter().all(|column| column.ratio() == 1.0));
+    }
+
+    #[test]
+    fn numeric_noise_is_tolerated() {
+        let golden = rows(&[&["sio", "1.480"]]);
+        let produced = rows(&[&["sio", "1.48036"]]);
+        assert_eq!(compare_columns(&golden, &produced, 3)[1].matched, 1);
+        // At full precision the same pair differs, which is why `places` exists.
+        assert_eq!(compare_columns(&golden, &produced, 9)[1].matched, 0);
+    }
+
+    #[test]
+    fn one_bad_cell_does_not_zero_the_row() {
+        let golden = rows(&[&["a", "1", "x"]]);
+        let produced = rows(&[&["b", "1", "x"]]);
+        let columns = compare_columns(&golden, &produced, 3);
+        assert_eq!(columns[0].ratio(), 0.0);
+        assert_eq!(columns[1].ratio(), 1.0);
+    }
+
+    #[test]
+    fn missing_rows_lower_only_the_affected_columns() {
+        let golden = rows(&[&["a", "1"], &["b", "2"], &["c", "3"], &["d", "4"]]);
+        let produced = rows(&[&["a", "1"], &["b", "2"], &["c", "3"]]);
+        let columns = compare_columns(&golden, &produced, 3);
+        assert_eq!(columns[0].matched, 3);
+        assert!((columns[0].ratio() - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn duplicate_values_are_counted_once_each() {
+        let golden = rows(&[&["a"], &["a"]]);
+        let produced = rows(&[&["a"]]);
+        assert_eq!(compare_columns(&golden, &produced, 3)[0].matched, 1);
+    }
+}

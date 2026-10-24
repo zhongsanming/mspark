@@ -853,7 +853,23 @@ Recorded so the next pass does not re-litigate them:
 - **`next_nbi` extraction, `StartLogs`, decoder `read_*_at` helpers, trybuild
   cycle test**: mechanical cleanups with no behavioural effect; deferred.
 
-### T15. Golden-fixture test harness
+### T15. Fidelity ratchet (done)
+Byte-exactness is not a goal, so the gate is `mspark verify-all`: it compares each
+artifact column against its golden file as a **multiset** with numeric cells on a
+3-decimal grid (order-insensitive, float-noise tolerant) and fails when any column
+drops below the value recorded in `spec/baseline.txt`. Two lessons from building it:
+
+- Whole-row equality is the wrong metric: one nanosecond in one cell made a 99.9 %
+  correct table report 0 %. Per-column matching reports what actually broke.
+- Storing a *rounded percentage* in the baseline made both a clean run (looked like
+  a regression) and a stale baseline (looked fine) misreport. The file stores the
+  matched/denominator counts and recomputes the ratio.
+
+Artifacts whose header does not match the golden one are reported as `GAP` and are
+never recorded, so `communication_statistic` (still missing its time columns, T22)
+cannot be mistaken for a passing table.
+
+### T15 (old). Golden-fixture test harness
 Move the verifiers into `cargo test` with checked-in golden CSVs/timelines so
 `cargo test` gates regressions.
 

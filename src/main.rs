@@ -393,6 +393,27 @@ enum Command {
         #[arg(long)]
         golden: PathBuf,
     },
+    /// Check every artifact against the capture's goldens and the recorded
+    /// baseline, failing when any artifact gets *less* close than it was.
+    VerifyAll {
+        /// A PROF_* directory.
+        prof: PathBuf,
+        /// Restrict to one device directory, e.g. `device_7`.
+        #[arg(long)]
+        device: Option<String>,
+        /// Directory holding the golden `mindstudio_profiler_output` files.
+        #[arg(long)]
+        golden_dir: Option<PathBuf>,
+        /// Baseline file (default: `spec/baseline.txt`).
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// Write the current distances to the baseline file instead of checking.
+        #[arg(long)]
+        update_baseline: bool,
+        /// Decimal places numeric cells are compared at (default: 3).
+        #[arg(long, default_value_t = 3)]
+        places: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -518,6 +539,21 @@ fn main() -> Result<()> {
             device,
             golden,
         } => verify_csv(Artifact::OpStatistic, &prof, device.as_deref(), &golden),
+        Command::VerifyAll {
+            prof,
+            device,
+            golden_dir,
+            baseline,
+            update_baseline,
+            places,
+        } => verify_all(
+            &prof,
+            device.as_deref(),
+            golden_dir.as_deref(),
+            baseline.as_deref(),
+            update_baseline,
+            places,
+        ),
         Command::Timeline { prof, device, out } => timeline(&prof, device.as_deref(), &out),
         Command::VerifyTimeline {
             prof,
@@ -3394,6 +3430,233 @@ fn npu_module_mem(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
 /// per-column statistics, but only a strict run turns a mismatch into a non-zero
 /// exit status (so CI can gate on regressions while interactive use still shows
 /// partial matches).
+/// Golden file for an artifact inside `mindstudio_profiler_output`.
+fn find_golden(dir: &Path, artifact: Artifact) -> Option<PathBuf> {
+    let (prefix, extension) = match artifact {
+        Artifact::Timeline => ("msprof_", "json"),
+        other => (other.name(), "csv"),
+    };
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            name.starts_with(prefix)
+                && name.ends_with(&format!(".{extension}"))
+                // `op_summary_…` must not match `op_summary_x_…`
+                && (name.starts_with(&format!("{prefix}_")) || name.starts_with(prefix))
+        })
+        .collect();
+    candidates.sort();
+    candidates.pop()
+}
+
+/// One artifact's per-column distance from its golden file.
+struct ArtifactCheck {
+    name: &'static str,
+    header: Vec<String>,
+    columns: Vec<mspark::verify::ColumnMatch>,
+    note: String,
+}
+
+impl ArtifactCheck {
+    fn mean_ratio(&self) -> f64 {
+        if self.columns.is_empty() {
+            return 1.0;
+        }
+        self.columns
+            .iter()
+            .map(|column| column.ratio())
+            .sum::<f64>()
+            / self.columns.len() as f64
+    }
+}
+
+/// Compare every artifact against the capture's goldens and the checked-in
+/// baseline.
+///
+/// Byte-exactness is not the goal: the baseline records how close each *column*
+/// currently is, and this command fails when one gets worse — a dropped row, a
+/// broken column, a stream that stopped decoding. Numeric cells are compared on
+/// a fixed grid (`--places`), so float noise is not a regression.
+fn verify_all(
+    prof: &Path,
+    only: Option<&str>,
+    golden_dir: Option<&Path>,
+    baseline: Option<&Path>,
+    update_baseline: bool,
+    places: u32,
+) -> Result<()> {
+    let golden_dir = golden_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| prof.join("mindstudio_profiler_output"));
+    let baseline_path = baseline
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("spec/baseline.txt"));
+    let previous = read_baseline(&baseline_path)?;
+
+    let dir = std::env::temp_dir().join(format!("mspark-verify-all-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+
+    let mut checks: Vec<ArtifactCheck> = Vec::new();
+    for artifact in ALL_ARTIFACTS {
+        if matches!(artifact, Artifact::Timeline | Artifact::Summary) {
+            // The timeline is compared structurally by `verify-timeline`; the
+            // summary has no msprof counterpart.
+            continue;
+        }
+        let Some(golden) = find_golden(&golden_dir, artifact) else {
+            continue;
+        };
+        let golden_rows = read_rows(&golden)?;
+        let Some(golden_header) = golden_rows.first() else {
+            continue;
+        };
+        let golden_header = golden_header.clone();
+        write_artifact(artifact, prof, only, &dir)?;
+        let produced = read_rows(&dir.join(artifact.file()))?;
+        let (produced_header, produced_body) = match produced.split_first() {
+            Some((header, body)) => (header, body),
+            None => (&golden_header, &[][..]),
+        };
+        if produced_header.len() != golden_header.len() {
+            checks.push(ArtifactCheck {
+                name: artifact.name(),
+                header: golden_header.clone(),
+                columns: Vec::new(),
+                note: format!(
+                    "header width {} vs {}",
+                    golden_header.len(),
+                    produced_header.len()
+                ),
+            });
+            continue;
+        }
+        let columns = mspark::verify::compare_columns(&golden_rows[1..], produced_body, places);
+        checks.push(ArtifactCheck {
+            name: artifact.name(),
+            header: golden_header,
+            columns,
+            note: String::new(),
+        });
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    println!(
+        "{:<24} {:>8} {:>8}  closeness",
+        "artifact", "golden", "produced"
+    );
+    let mut regressions = Vec::new();
+    for check in &checks {
+        let key = |column: usize| format!("{}.{}", check.name, check.header[column]);
+        let mut worst = 1.0f64;
+        for (index, column) in check.columns.iter().enumerate() {
+            let ratio = column.ratio();
+            worst = worst.min(ratio);
+            if let Some(recorded) = previous.get(&key(index))
+                && !update_baseline
+                && ratio + 1e-9 < *recorded
+            {
+                regressions.push((key(index), *recorded, ratio));
+            }
+        }
+        if !check.note.is_empty() {
+            println!("{:<24} {:>8} {:>8}  GAP: {}", check.name, 0, 0, check.note);
+            continue;
+        }
+        println!(
+            "{:<24} {:>8} {:>8}  mean {:>6.2}%  worst {:>6.2}%",
+            check.name,
+            check.columns.first().map(|c| c.golden).unwrap_or(0),
+            check.columns.first().map(|c| c.produced).unwrap_or(0),
+            check.mean_ratio() * 100.0,
+            worst * 100.0
+        );
+    }
+
+    if update_baseline {
+        write_baseline(&baseline_path, &checks)?;
+        println!("\nbaseline written to {}", baseline_path.display());
+        return Ok(());
+    }
+    if regressions.is_empty() {
+        println!("\nno column regressed against {}", baseline_path.display());
+        return Ok(());
+    }
+    for (key, recorded, ratio) in &regressions {
+        eprintln!(
+            "regression: {key} {:.2}% < baseline {:.2}%",
+            ratio * 100.0,
+            recorded * 100.0
+        );
+    }
+    anyhow::bail!("{} column(s) regressed", regressions.len())
+}
+
+fn read_baseline(path: &Path) -> Result<std::collections::HashMap<String, f64>> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(map);
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // `<artifact>.<column>  <matched>/<denominator>  <ratio%>`
+        // The counts are authoritative: recomputing the ratio from two integers
+        // avoids comparing two rounded percentages (which made a clean run look
+        // like a regression, and a stale baseline look fine).
+        let mut fields = line.split_whitespace();
+        let (Some(name), Some(counts)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Some((matched, total)) = counts.split_once('/') else {
+            continue;
+        };
+        let (Ok(matched), Ok(total)) = (matched.parse::<f64>(), total.parse::<f64>()) else {
+            continue;
+        };
+        map.insert(
+            name.to_string(),
+            if total > 0.0 { matched / total } else { 1.0 },
+        );
+    }
+    Ok(map)
+}
+
+fn write_baseline(path: &Path, checks: &[ArtifactCheck]) -> Result<()> {
+    let mut text = String::from(
+        "# Closeness baseline, one line per artifact column.\n\
+         # `mspark verify-all` fails when a column drops below its recorded value;\n\
+         # regenerate with `mspark verify-all PROF --update-baseline`.\n\
+         # Values are the fraction of values matching the golden file at 3 decimals.\n",
+    );
+    for check in checks {
+        if !check.note.is_empty() {
+            text.push_str(&format!("# gap: {} — {}\n", check.name, check.note));
+            continue;
+        }
+        for (index, column) in check.columns.iter().enumerate() {
+            let denominator = column.golden.max(column.produced);
+            text.push_str(&format!(
+                "{}.{:<24} {:>8}/{}  {:>7.2}%\n",
+                check.name,
+                check.header[index],
+                column.matched,
+                denominator,
+                column.ratio() * 100.0
+            ));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
 /// Verify any CSV artifact by exporting it exactly as production does and
 /// comparing the result against the golden file. Replaces the per-artifact
 /// verifiers, which were copy-paste twins of the exporters and could drift.
