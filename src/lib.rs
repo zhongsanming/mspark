@@ -1,8 +1,14 @@
-//! Library half of `mspark`.
+//! `mspark`: reimplementation of the MindStudio Profiler analysis pipeline.
 //!
-//! The binary owns the CLI and the artifact exporters; everything here is pure
-//! and unit-tested, so the golden-critical formatting and comparison rules can
-//! be checked without a profile capture.
+//! The library holds everything worth testing: raw decoding and nodes
+//! (`mspark-model`), sessions, report builders and the verifiers. The binary
+//! only parses the command line and dispatches.
 
+pub mod artifacts;
+pub mod commands;
+pub mod reports;
+pub mod session;
 pub mod text;
+pub mod trace;
+pub mod verification;
 pub mod verify;

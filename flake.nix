@@ -38,7 +38,7 @@
         naersk' = pkgs.callPackage naersk { };
       in
       {
-        defaultPackage = naersk'.buildPackage ./.;
+        packages.default = naersk'.buildPackage ./.;
         devShell =
           with pkgs;
           mkShell {

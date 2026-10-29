@@ -264,3 +264,79 @@ pub fn decode_stars_soc(bytes: &[u8], expand: u16) -> Result<(Vec<StarsSocEntry>
     }
     Ok((rows, hist))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 64-byte ACSQ log record. `w0` packs
+    /// `funcType:6 | cnt:4 | taskType:6` in the low 16 bits.
+    fn acsq(func: u16, task_type: u16, stream_id: u16, task_id: u16, timestamp: u64) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        let w0 = func | (task_type << 10);
+        bytes[0..2].copy_from_slice(&w0.to_le_bytes());
+        bytes[4..6].copy_from_slice(&stream_id.to_le_bytes());
+        bytes[6..8].copy_from_slice(&task_id.to_le_bytes());
+        bytes[8..16].copy_from_slice(&timestamp.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn decodes_acsq_start_and_end_records() {
+        let bytes = [
+            acsq(FUNC_ACSQ_LOG_START, 35, 5, 7, 100),
+            acsq(FUNC_ACSQ_LOG_END, 35, 5, 7, 250),
+        ]
+        .concat();
+        let (rows, hist) = decode_stars_soc(&bytes, 0).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(hist[FUNC_ACSQ_LOG_START as usize], 1);
+        assert_eq!(hist[FUNC_ACSQ_LOG_END as usize], 1);
+        let acsq_rows: Vec<Acsq> = rows
+            .into_iter()
+            .map(|row| match row {
+                StarsSocEntry::Acsq(row) => row,
+                StarsSocEntry::FftsPlus(_) => panic!("expected ACSQ"),
+            })
+            .collect();
+        assert!(!acsq_rows[0].is_end);
+        assert!(acsq_rows[1].is_end);
+        assert_eq!(acsq_rows[0].task_type, 35);
+        assert_eq!(acsq_rows[0].stream_id, 5);
+        assert_eq!(acsq_rows[0].task_id, 7);
+        assert_eq!(acsq_rows[1].timestamp, 250);
+    }
+
+    #[test]
+    fn histogram_keeps_unsupported_item_types() {
+        let mut bytes = acsq(0x3f, 0, 0, 0, 0);
+        bytes[0] = 0x3f;
+        let (rows, hist) = decode_stars_soc(&bytes, 0).unwrap();
+        assert!(rows.is_empty(), "unknown func types are not decoded");
+        assert_eq!(hist[0x3f], 1, "but they remain visible in the histogram");
+    }
+
+    #[test]
+    fn expand_status_1_uses_the_dynamic_stream_rules() {
+        // Event-record SQE (4) keeps the raw ids; the low 15 bits are masked for
+        // other SQE types.
+        assert_eq!(normalize_stream_id(0x8005, 0x1234, 1, 4), 0x0005);
+        assert_eq!(normalize_task_id(0x8005, 0x1234, 1, 4), 0x1234);
+        assert_eq!(normalize_stream_id(0x8005, 0x1234, 1, 0), 0x1234);
+        assert_eq!(normalize_task_id(0x8005, 0x1234, 1, 0), 0x0005);
+    }
+
+    #[test]
+    fn non_expanded_rule_carries_high_task_bits_into_the_stream() {
+        // bit 12 set: the stream id is taken modulo 2^11.
+        assert_eq!(normalize_stream_id(0x1005, 0x0123, 0, 0), 0x0005);
+        assert_eq!(normalize_task_id(0x1005, 0x0123, 0, 0), 0x0123);
+        // bit 13 set: task id low 12 bits replace the stream id, and its high
+        // bits are supplied by task_id.
+        assert_eq!(normalize_stream_id(0x2005, 0x0abc, 0, 0), 0x02bc);
+        assert_eq!(normalize_task_id(0x2005, 0x0abc, 0, 0), 0x0005);
+        // neither: ids pass through.
+        assert_eq!(normalize_stream_id(0x0005, 0x0007, 0, 0), 0x0005);
+        assert_eq!(normalize_task_id(0x0005, 0x0007, 0, 0), 0x0007);
+    }
+}

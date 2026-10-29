@@ -68,3 +68,42 @@ impl Node for HccsRateRow {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nodes::sources::testing::FakeDevice;
+
+    #[test]
+    fn computes_mib_per_second_from_cumulative_counters() {
+        let device = FakeDevice::new();
+        device.write(
+            "hccs.slice_0",
+            b"0:1000000000 1000 2000\n0:2000000000 3000 6000\n",
+        );
+        let ctx = device.ctx();
+        let rows = HccsRateRow::compute(&ctx, ()).unwrap();
+        assert_eq!(rows.len(), 1);
+        let expected = 2000.0 / (1e9 / NS_PER_MB_S);
+        assert!((rows[0].tx - expected).abs() < 1e-9);
+        assert!((rows[0].rx - 2.0 * expected).abs() < 1e-9);
+        let clock = device
+            .ctx()
+            .require::<DeviceStartLogs>()
+            .unwrap()
+            .0
+            .mono(None)
+            .unwrap();
+        assert_eq!(rows[0].ts_ns, clock.to_ns(2_000_000_000));
+    }
+
+    #[test]
+    fn a_counter_reset_is_skipped() {
+        let device = FakeDevice::new();
+        device.write(
+            "hccs.slice_0",
+            b"0:1000000000 1000 2000\n0:2000000000 10 20\n",
+        );
+        assert!(HccsRateRow::compute(&device.ctx(), ()).unwrap().is_empty());
+    }
+}

@@ -52,3 +52,39 @@ impl Node for PcieRecord {
 // ---------------------------------------------------------------------------
 // LLC (`LlcRecord` v1, `QQII`, 24 bytes)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nodes::sources::testing::FakeDevice;
+
+    fn record(ts: u64, fields: [u32; 22]) -> [u8; 96] {
+        let mut bytes = [0u8; 96];
+        bytes[0..8].copy_from_slice(&ts.to_le_bytes());
+        for (i, field) in fields.iter().enumerate() {
+            let offset = 8 + i * 4;
+            bytes[offset..offset + 4].copy_from_slice(&field.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn decodes_the_timestamp_and_all_22_fields() {
+        let device = FakeDevice::new();
+        let fields: [u32; 22] = core::array::from_fn(|i| i as u32 + 1);
+        device.write("pcie.slice_0", &record(500, fields));
+        let ctx = device.ctx();
+        let rows = PcieRecord::compute(&ctx, ()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts, 500);
+        assert_eq!(rows[0].fields, fields);
+        let clock = device
+            .ctx()
+            .require::<DeviceStartLogs>()
+            .unwrap()
+            .0
+            .mono(None)
+            .unwrap();
+        assert_eq!(rows[0].ts_ns, clock.to_ns(500));
+    }
+}
