@@ -79,3 +79,45 @@ impl Node for RoceRow {
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nodes::sources::testing::FakeDevice;
+
+    #[test]
+    fn decodes_the_15_field_text_row() {
+        let device = FakeDevice::new();
+        // time(s):time(ns) bandwidth rx{packetRate,byteRate,packets,bytes,errors,dropped}
+        // tx{…} plus the trailing field msprof ignores.
+        device.write(
+            "nic.slice_0",
+            b"0:1000000000 500 10 20 30 40 1 2 11 21 31 41 3 4 0\n",
+        );
+        let ctx = device.ctx();
+        let rows = NicRow::compute(&ctx, ()).unwrap();
+        assert_eq!(rows.len(), 1);
+        let sample = rows[0].0;
+        assert_eq!(sample.bandwidth, 500);
+        assert_eq!(sample.rx, [10, 20, 30, 40, 1, 2]);
+        assert_eq!(sample.tx, [11, 21, 31, 41, 3, 4]);
+        let clock = device
+            .ctx()
+            .require::<DeviceStartLogs>()
+            .unwrap()
+            .0
+            .mono(None)
+            .unwrap();
+        assert_eq!(sample.ts_ns, clock.to_ns(1_000_000_000));
+    }
+
+    #[test]
+    fn skips_headers_and_short_rows() {
+        let device = FakeDevice::new();
+        device.write(
+            "nic.slice_0",
+            b"timestamp bandwidth\n0:1 2 3\nnot-a-stamp 1 2 3 4 5 6 7 8 9 10 11 12 13 14\n",
+        );
+        assert!(NicRow::compute(&device.ctx(), ()).unwrap().is_empty());
+    }
+}

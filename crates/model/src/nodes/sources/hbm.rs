@@ -60,3 +60,50 @@ impl Node for HbmRecord {
 // ---------------------------------------------------------------------------
 
 // Collection-version 2.x layouts of the versioned streams.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nodes::sources::testing::FakeDevice;
+
+    fn v1(ts_us: u64, count: u64, event: u32, hbm_id: u32) -> [u8; 24] {
+        let mut bytes = [0u8; 24];
+        bytes[0..8].copy_from_slice(&ts_us.to_le_bytes());
+        bytes[8..16].copy_from_slice(&count.to_le_bytes());
+        bytes[16..20].copy_from_slice(&event.to_le_bytes());
+        bytes[20..24].copy_from_slice(&hbm_id.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn decodes_v1_records_and_converts_the_sampling_stamp() {
+        let device = FakeDevice::new();
+        device.write(
+            "hbm.slice_0",
+            &[v1(100, 42, 1, 3), v1(200, 84, 0, 2)].concat(),
+        );
+        let ctx = device.ctx();
+        let rows = HbmRecord::compute(&ctx, ()).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].ts_us, rows[0].count, rows[0].event, rows[0].hbm_id),
+            (100, 42, 1, 3)
+        );
+        assert_eq!((rows[1].ts_us, rows[1].count), (200, 84));
+        let clock = device
+            .ctx()
+            .require::<DeviceStartLogs>()
+            .unwrap()
+            .0
+            .sampling()
+            .unwrap();
+        assert_eq!(rows[0].ts_ns, clock.to_ns(100));
+        assert_eq!(rows[1].ts_ns, clock.to_ns(200));
+    }
+
+    #[test]
+    fn missing_stream_decodes_to_an_empty_table() {
+        let device = FakeDevice::new();
+        assert!(HbmRecord::compute(&device.ctx(), ()).unwrap().is_empty());
+    }
+}

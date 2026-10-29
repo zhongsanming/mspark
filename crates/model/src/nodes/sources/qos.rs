@@ -71,3 +71,44 @@ pub fn decode_qos(bytes: &[u8]) -> Result<Vec<QosRaw>> {
 // ---------------------------------------------------------------------------
 // HBM bandwidth (`HbmRecord` v1, `QQII`, 24 bytes)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(syscnt: u64, metrics: [u32; 10]) -> [u8; QOS_TRUNK] {
+        let mut bytes = [0u8; QOS_TRUNK];
+        bytes[16..24].copy_from_slice(&syscnt.to_le_bytes());
+        for (i, metric) in metrics.iter().enumerate() {
+            let offset = 24 + i * 4;
+            bytes[offset..offset + 4].copy_from_slice(&metric.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn decodes_syscnt_and_all_ten_metrics() {
+        let bytes = record(
+            0x1234_5678_9abc_def0,
+            core::array::from_fn(|i| i as u32 + 1),
+        );
+        let rows = decode_qos(&bytes).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].syscnt, 0x1234_5678_9abc_def0);
+        assert_eq!(rows[0].metrics, core::array::from_fn(|i| i as u32 + 1));
+    }
+
+    #[test]
+    fn drops_a_trailing_partial_record() {
+        let mut bytes = record(1, [0; 10]).to_vec();
+        bytes.extend_from_slice(&[0xff; QOS_TRUNK - 1]);
+        let rows = decode_qos(&bytes).unwrap();
+        assert_eq!(rows.len(), 1, "a partial trailing record must be ignored");
+        assert_eq!(rows[0].syscnt, 1);
+    }
+
+    #[test]
+    fn empty_stream_decodes_to_no_rows() {
+        assert!(decode_qos(&[]).unwrap().is_empty());
+    }
+}

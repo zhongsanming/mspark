@@ -49,14 +49,22 @@ Two invariants keep nodes honest:
 ### Layout
 
 ```
-src/main.rs                 CLI (palc) + the artifact writers
+src/main.rs                 CLI (palc): verbs and dispatch only
+src/lib.rs                  library root (everything testable)
+src/session.rs              device discovery + per-device DeviceSession
+src/artifacts.rs            artifact list, --outputs parsing, export fan-out
+src/reports/                one module per artifact family (pure builders + writers)
+src/trace.rs                Chrome-trace event types and track pids
+src/verification.rs         verify-* commands and the fidelity ratchet
+src/text.rs, src/verify.rs  formatting and CSV comparison helpers
 crates/df/                  the framework: Ctx, Node, DepList, Store, resolve, graph!
 crates/model/
-  raw/                      zerocopy decoders for the packed device/host records
+  ctx.rs, stream.rs         parsed context and stream identity/record framing
   time.rs                   the three clock conversions (see below)
-  tables.rs, format.rs, pmu.rs, host.rs, ctx.rs
-  nodes/                    one module per node (+ nodes/sources/ for graph roots)
-spec/                       per-milestone notes + TODO backlog
+  format.rs, host.rs        row formatting and host-stream helpers
+  nodes/                    one module per node
+  nodes/sources/            raw zerocopy decoders and graph roots
+spec/                       per-milestone notes, TODO backlog, verification log
 ```
 
 ### Clocks
@@ -76,7 +84,7 @@ plausible-looking but wrong output:
 ## Usage
 
 ```bash
-nix develop          # or put a Rust toolchain on PATH
+nix develop          # uses rust-toolchain.toml; or put a Rust toolchain on PATH
 cargo build --release
 ```
 
@@ -87,27 +95,39 @@ mspark /path/to/PROF_000001_…                       # → ./mspark_YYYYMMDD_HH
 mspark /path/to/PROF_… --out-dir ./out --outputs task_time,timeline
 mspark /path/to/PROF_… --out-dir ./out --flat       # no timestamp dir (CI/diffing)
 mspark /path/to/PROF_… --device device_7            # single device only
+mspark --version                                    # print the crate version
 ```
 
-`--outputs` accepts `all` (default), `csv`, `timeline`, or any report name
-(`task_time`, `op_summary`, `api_statistic`, `op_statistic`, `npu_mem`,
-`npu_module_mem`, `dvpp`, `l2_cache`, `ts_cpu_pmu_events`, `ts_cpu_top_function`,
-`hccs`, `hbm`, `llc_read_write`, `pcie`, `summary`). Unknown names fail with the
-valid list.
+`--outputs` accepts `all` (default), `csv`, `timeline`, or any report name.
+The report names are:
 
-Artifacts are written concurrently, and devices are processed in parallel with
-the chunks joined in device order, so output is deterministic.
+```
+task_time, op_summary, api_statistic, op_statistic, npu_mem,
+npu_module_mem, dvpp, l2_cache, ts_cpu_pmu_events,
+ts_cpu_top_function, hccs, hbm, communication_statistic,
+host_cpu_usage, host_mem_usage, llc_read_write, nic, pcie, roce,
+summary, timeline
+```
+
+Unknown names fail with the valid list.
+
+Each artifact writes its own file, and all of them run concurrently. Devices are
+processed in parallel too, with the chunks joined in device order, so the output
+is deterministic.
 
 ### Verification
 
-Every artifact has a `verify-*` subcommand that compares against a golden file
+Most tables have a `verify-*` subcommand that compares against a golden file
 produced by `msprof --export=on`:
 
 ```bash
-mspark verify        PROF_… --golden …/task_time_*.csv
+mspark verify          PROF_… --golden …/task_time_*.csv
 mspark verify-timeline PROF_… --golden …/msprof_*.json
 mspark verify-op-statistic PROF_… --golden …/op_statistic_*.csv
 ```
+
+`verify-all` covers every artifact, including the ones without a dedicated
+verb (host usage, `communication_statistic`, `summary`, …).
 
 `verify-timeline` resolves each golden track's pid from its own
 `process_name`/`process_labels` metadata (the pid encoding changes between
@@ -139,7 +159,7 @@ one:
 mspark --strict verify-llc-csv PROF_… --golden …/llc_read_write_*.csv
 ```
 
-### Project layout of the binary
+### Project layout
 
 Raw input is requested by **stream identity**, never by path: a node calls
 `ctx.stream(Stream::StarsSoc)` and gets the bytes of that stream. The prefix, the
@@ -150,13 +170,21 @@ and a unit test keeps every prefix unique and non-overlapping per directory.
 
 Each device is a `DeviceSession { ctx, info, store }`: the context (including the
 parsed `StartLogs`, `sample.json` and host `info.json`) is built once per process
-and the store memoises node tables for that device only.
+and the store memoises node tables for that device only. The session (and its
+memoised tables) lives for the process, so a full export trades memory for not
+decoding the same stream twice; `resolve` holds the store lock for one node
+computation, which serialises conflicting work on the same device but still
+deduplicates shared upstream nodes.
 
-`src/main.rs` holds the CLI and the artifact exporters; `src/lib.rs` holds the
-parts that are worth unit-testing — `text` (Python-compatible float/rounding
-helpers, the NIC timestamp column, µs parsing, civil dates) and `verify` (CSV
-reader, comparison, strict gate). `cargo test` covers those plus the node graph
-and the dataflow framework.
+`src/main.rs` is CLI parsing and dispatch; the implementation lives in the
+library. `src/reports/` holds one module per artifact family with pure row
+builders (`hbm_table`, `llc_samples`, `pcie_table`, …) separated from the file
+writers, so the formatting logic is unit-testable. `src/session.rs` owns device
+discovery and the per-device session, `src/artifacts.rs` owns artifact selection
+and the parallel export, and `src/verification.rs` owns the verifiers.
+`cargo test` covers the decoders, the pure builders, the trace serialisation
+contract, the dataflow framework and the node graph.
+
 
 ---
 
@@ -191,14 +219,13 @@ Verified against a fresh V4 (910B) capture with the current `msprof`:
 | `kernel_type` | distribution exact, ~16 k rows assigned a neighbour's type |
 | `op_statistic.csv` | counts exact on B, durations differ on the fresh capture |
 
-**Not implemented**
+**Not exercised**
 
-- `host_cpu_usage.csv` (`host_cpu.data`)
-- `nic.csv` / `roce.csv` (tracks are done; the one-row CSVs need a different
-  timestamp domain)
-- multi-device aggregation is implemented but only exercised single-device
+- multi-device aggregation is implemented but only exercised single-device.
+- the host-usage family (`host_mem_usage`, `host_disk_usage`, …) needs
+  `--host-sys` captures that we do not have; see `spec/TODO.md` (T25).
 
-`spec/TODO.md` tracks each of these with the evidence gathered, including the
+`spec/TODO.md` tracks each remaining gap with the evidence gathered, including the
 dead ends — several were investigated to the point of proving they are *not* the
 cause, which is usually the expensive part.
 
@@ -259,8 +286,10 @@ msprof's `VersionedStructParser`:
 | `hbm` | `QQII` (24 B), µs stamp first | `IIIIQQ` (32 B), absolute-ns stamp last |
 | `llc` | `QQII` (24 B), µs stamp first | `IIIIQ` (24 B), absolute-ns stamp last |
 
-Collection version 1.x is what both of our captures use, so the 2.x layouts are
-implemented but likewise **unverified**.
+Collection version 1.x is what both of our captures use. The LLC v2 layout is
+decoded (and unit-tested); HBM v2 is framed but still decoded with the v1 field
+offsets, so treat it as unsupported. Neither has been checked against real 2.x
+output.
 
 > **`nic.csv` / `roce.csv` `Timestamp(us)` quirk:** msprof's
 > `peripheral_report.format_nic_summary` writes the *sample duration*
@@ -281,7 +310,9 @@ fields (`version`, `edition`, `rust-version`, `license`, `repository`, `readme`,
 `keywords`, `categories`) live in `[workspace.package]`; every crate opts in
 with `field.workspace = true`.
 
-MSRV is **1.88** (`slice::as_chunks`).
+MSRV is **1.88** (`slice::as_chunks`). `rust-toolchain.toml` pins **1.88.0**
+with `clippy` and `rustfmt`; the build CI job and `nix develop` both consume
+that file, so the toolchain is not duplicated in the workflows.
 
 The internal crates are referenced with both `path` and `version`, so publish in
 dependency order — each step must be on crates.io before the next resolves:

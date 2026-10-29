@@ -192,6 +192,14 @@ Values exact (816/816), timestamps differ in the sub-µs digits
 
 ## Not started
 
+### T28. HBM v2 record layout — framed but not decoded
+`Stream::Hbm` frames 32-byte records when `info.json:version` starts with `2`,
+but `HbmRecord::compute` still reads the v1 `QQII` offsets; the field order of
+msprof's `IIIIQQ` record has not been confirmed against a 2.x capture. LLC v2
+was fixed from the documented `IIIIQ` layout (`reserved, count:u32, event,
+l3t_id, ts_ns`) and is covered by a unit test. Do not enable HBM v2 until the
+layout is pinned with real output.
+
 ### T26. Overlap Analysis on multi-device captures — only 2 of 4 kinds
 On the multi-device capture the golden Overlap track has **four** threads while we
 emit two:
@@ -761,8 +769,12 @@ not on the near-term roadmap. Kept here only to explain the remaining
 "near-exact" columns in the verifiers.
 
 ### T10. Streaming / memory
-Large datasets currently materialise every row per node. Consider chunked sinks
-for the 50 k-event tracks.
+Large datasets materialise every row per node, and each device's memoised tables
+stay alive for the whole process (the `DeviceSession` registry is process-wide).
+That is deliberate: artifacts share one session so a node needed by several
+reports is computed once, and the streams are not re-read. The cost is peak
+memory proportional to the largest device's decoded tables; a chunked sink would
+be needed only if a single device no longer fits.
 
 ---
 
@@ -810,9 +822,11 @@ memory takes the max across devices.
 ### T14. Device-level parallelism — **done**
 `timeline()` builds one `Vec<TraceEvent>` per device via `rayon` and joins the
 chunks in device order; output is byte-identical to the sequential run.
-Artifact-level fan-out: `export()` runs the selected artifacts in parallel
-(each writes its own file, own `Store`), so a full export uses all cores even
-on a single-device profile.
+Artifact-level fan-out: `export()` runs the selected artifacts in parallel, and
+they share the per-device `DeviceSession` (and therefore its memoised `Store`),
+so a node needed by several reports is computed once; the store lock serialises
+conflicting computations on the same device. Output stays byte-identical to the
+sequential run.
 
 Per-device chunking in the CSV writers: `per_device()` runs a closure once per
 device in parallel and joins chunks in device order. Applied to the four heavy
@@ -892,9 +906,10 @@ Recorded so the next pass does not re-litigate them:
 - **(done)** All clock/config I/O into `Ctx`, and the per-device session — see
   T20. Data streams (`host_cpu.data`, `stars_soc`, …) stay in the nodes: they
   *are* the node inputs, not configuration.
-- **One file per artifact behind a `Report` trait** (§1): partially done — the
-  duplication that mattered (20 verifier twins) is gone and the pure helpers are
-  in the library, but the exporters still live in `main.rs`.
+- **(done)** One module per artifact family behind `src/reports/`: the
+  exporters and their pure builders moved out of `main.rs`, which is now CLI
+  parsing and dispatch only. A `Report` trait was not needed; the shared shape
+  is a free function plus `write_text`/`write_chunks`.
 - **`next_nbi` extraction, `StartLogs`, decoder `read_*_at` helpers, trybuild
   cycle test**: mechanical cleanups with no behavioural effect; deferred.
 
@@ -918,10 +933,14 @@ cannot be mistaken for a passing table.
 Move the verifiers into `cargo test` with checked-in golden CSVs/timelines so
 `cargo test` gates regressions.
 
-### T16. Verify-all command
-One command that runs every verifier and prints the summary table.
+### T16. Verify-all command — **done**
+`mspark verify-all` runs every artifact verifier (including tables without a
+dedicated `verify-*` verb) and prints one summary table.
 
-### T17. Docs
-- `spec/README.md` index (milestones 1–9 + this TODO).
-- Architecture note describing the `Node`/`dep` model and the row-type-per-node
-  convention, with the `Ctx` id→text policy (unknown → `N/A`/`Unknown`).
+### T17. Docs — **done**
+- `spec/README.md` indexes the milestones, the dependency matrix, the
+  verification log and this TODO.
+- The README architecture section describes the `Node`/`dep` model, the
+  row-type-per-node convention and the `Ctx` id→text policy.
+- The README layout/status sections and T14/T19/T20 were reconciled with the
+  session/report refactor.
