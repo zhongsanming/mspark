@@ -27,11 +27,13 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
-        rust = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [
+        # Keep the dev shell on the same pinned toolchain as CI.
+        # `override` replaces the toolchain file's components, so merge the
+        # editor extras back in rather than dropping rustfmt/clippy.
+        rustToolchain = builtins.fromTOML (builtins.readFile ./rust-toolchain.toml);
+        rust = (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml).override {
+          extensions = rustToolchain.toolchain.components ++ [
             "rust-src"
-            "rustfmt"
-            "clippy"
             "rust-analyzer"
           ];
         };

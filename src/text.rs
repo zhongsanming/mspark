@@ -11,7 +11,7 @@ pub fn py_float(value: f64) -> String {
         return "0.0".to_string();
     }
     let abs = value.abs();
-    if abs < 1e-4 || abs >= 1e16 {
+    if !(1e-4..1e16).contains(&abs) {
         let text = format!("{value:e}");
         if let Some((mantissa, exponent)) = text.split_once('e') {
             let (sign, digits) = match exponent.strip_prefix('-') {

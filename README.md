@@ -84,7 +84,7 @@ plausible-looking but wrong output:
 ## Usage
 
 ```bash
-nix develop          # or put a Rust toolchain on PATH
+nix develop          # uses rust-toolchain.toml; or put a Rust toolchain on PATH
 cargo build --release
 ```
 
@@ -310,7 +310,9 @@ fields (`version`, `edition`, `rust-version`, `license`, `repository`, `readme`,
 `keywords`, `categories`) live in `[workspace.package]`; every crate opts in
 with `field.workspace = true`.
 
-MSRV is **1.88** (`slice::as_chunks`).
+MSRV is **1.88** (`slice::as_chunks`). `rust-toolchain.toml` pins **1.88.0**
+with `clippy` and `rustfmt`; the build CI job and `nix develop` both consume
+that file, so the toolchain is not duplicated in the workflows.
 
 The internal crates are referenced with both `path` and `version`, so publish in
 dependency order — each step must be on crates.io before the next resolves:
