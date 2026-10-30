@@ -25,6 +25,32 @@ pub fn read_host_stream(ctx: &Ctx, prefix: &str, trunk: usize) -> Result<Vec<u8>
     read_concat(&ctx.host_data_dir(), prefix, trunk)
 }
 
+/// Does `name` belong to `prefix`?
+///
+/// Stream prefixes end with the separator already (`stars_soc.`,
+/// `host_cpu.data.`), in which case a plain `starts_with` is right — the slice
+/// suffix (`data.7.slice_0`) follows immediately. Configuration prefixes do not
+/// (`start_info`, `info.json`), and there a separator must follow so that
+/// `start_info_extra` does not match. Getting this backwards silently returned
+/// empty streams for every decodes-through-`StreamReader` node.
+fn matches_prefix(name: &str, prefix: &str) -> bool {
+    if prefix.ends_with('.') || prefix.ends_with('_') {
+        return name.starts_with(prefix);
+    }
+    match name.strip_prefix(prefix) {
+        // `.` opens a suffix (`start_info.7`), `_<digits>` is the slice numbering
+        // (`…hash_dic.slice_0`). A bare `_` (`start_info_extra`) is not ours.
+        Some(rest) => {
+            rest.is_empty()
+                || rest.starts_with('.')
+                || rest
+                    .strip_prefix('_')
+                    .is_some_and(|tail| tail.starts_with(|c: char| c.is_ascii_digit()))
+        }
+        None => false,
+    }
+}
+
 /// Files under `dir` whose name starts with one of `prefixes`, in slice order.
 ///
 /// This was implemented four times (`time::find_one`, `ctx::find_info_json`,
@@ -40,16 +66,7 @@ pub fn files_with_prefix(dir: &Path, prefixes: &[&str]) -> Vec<PathBuf> {
         if name.ends_with(".done") || name.ends_with(".complete") {
             continue;
         }
-        // A slice file is `<prefix>.<suffix>` (e.g. `start_info.1234.json`) or
-        // `<prefix>_<n>` (e.g. `...type_info_dic.slice_0`); a bare `<prefix>` is
-        // also accepted.
-        if !prefixes
-            .iter()
-            .any(|prefix| match name.strip_prefix(prefix) {
-                Some(rest) => rest.is_empty() || rest.starts_with('.') || rest.starts_with('_'),
-                None => false,
-            })
-        {
+        if !prefixes.iter().any(|prefix| matches_prefix(&name, prefix)) {
             continue;
         }
         let slice = name
@@ -595,6 +612,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Dotted stream prefixes must match their slice files directly, and
+    /// separator-less config prefixes must still not match a longer name.
+    #[test]
+    fn prefix_matching_rules() {
+        assert!(matches_prefix("stars_soc.data.7.slice_0", "stars_soc."));
+        assert!(matches_prefix("host_cpu.data.3", "host_cpu.data."));
+        assert!(!matches_prefix(
+            "stars_soc_profile.data.7.slice_0",
+            "stars_soc."
+        ));
+        assert!(matches_prefix("start_info", "start_info"));
+        assert!(matches_prefix("start_info.7", "start_info"));
+        assert!(!matches_prefix("start_info_extra", "start_info"));
+        assert!(matches_prefix(
+            "unaging.additional.type_info_dic.slice_0",
+            "unaging.additional.type_info_dic.slice"
+        ));
     }
 
     /// Chunks must be record-aligned across slice boundaries, and the leading

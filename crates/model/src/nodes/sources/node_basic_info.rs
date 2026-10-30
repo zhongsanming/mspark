@@ -6,7 +6,7 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 use mspark_df::{Ctx, Node};
 
 use crate::host::HashDic;
-use crate::stream::{CtxStreams, Stream};
+use crate::stream::Stream;
 
 #[derive(Debug, Clone)]
 pub struct NodeBasicInfoRow {
@@ -22,8 +22,14 @@ impl Node for NodeBasicInfoRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = ctx.stream(Stream::NodeBasicInfo)?;
-        let raws = super::node_basic_info::decode_node_basic_info(&bytes)?;
+        let mut raws = Vec::new();
+        crate::stream::for_each_chunk(
+            crate::stream::StreamReader::open(ctx, Stream::NodeBasicInfo)?,
+            |chunk| {
+                raws.extend(super::node_basic_info::decode_node_basic_info(chunk)?);
+                Ok(())
+            },
+        )?;
         let dic = ctx.require::<HashDic>()?;
         Ok(raws
             .into_iter()

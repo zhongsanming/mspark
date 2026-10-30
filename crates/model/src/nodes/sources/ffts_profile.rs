@@ -10,16 +10,23 @@ use super::stars_soc::normalize_stream_id;
 use super::stars_soc::normalize_task_id;
 use crate::ctx::DeviceInfo;
 use crate::stream::FFTS_PROFILE_TRUNK;
-use crate::stream::{CtxStreams, Stream};
+use crate::stream::Stream;
 
 impl Node for super::ffts_profile::PmuData {
     const NAME: &'static str = "ffts_profile";
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = ctx.stream(Stream::FftsProfile)?;
         let expand = ctx.require::<DeviceInfo>()?.expand_status;
-        Ok(super::ffts_profile::decode_ffts_profile(&bytes, expand)?.0)
+        let mut rows = Vec::new();
+        crate::stream::for_each_chunk(
+            crate::stream::StreamReader::open(ctx, Stream::FftsProfile)?,
+            |chunk| {
+                rows.extend(super::ffts_profile::decode_ffts_profile(chunk, expand)?.0);
+                Ok(())
+            },
+        )?;
+        Ok(rows)
     }
 }
 

@@ -164,7 +164,53 @@ pub struct CounterRow {
     pub args: smallvec::SmallVec<[(&'static str, Num); 4]>,
 }
 
-pub fn write_counter(events: &mut Vec<TraceEvent>, pid: u32, row: CounterRow) {
+/// Batched event sink.
+///
+/// Timeline events are produced grouped by track; a full capture has 2 M+ of
+/// them, and collecting them into one `Vec` (with the doubling slack) was ~1.9 GB
+/// of the export's peak. `Sink` keeps only a small batch and pushes it to the
+/// caller's writer, while the emitters keep their simple `push` API.
+pub struct Sink<'a> {
+    pending: Vec<TraceEvent>,
+    emit: &'a mut dyn FnMut(TraceEvent) -> anyhow::Result<()>,
+    total: usize,
+}
+
+impl<'a> Sink<'a> {
+    const BATCH: usize = 2048;
+
+    pub fn new(emit: &'a mut dyn FnMut(TraceEvent) -> anyhow::Result<()>) -> Self {
+        Self {
+            pending: Vec::with_capacity(Self::BATCH),
+            emit,
+            total: 0,
+        }
+    }
+
+    pub fn push(&mut self, event: TraceEvent) {
+        self.pending.push(event);
+        self.total += 1;
+        if self.pending.len() >= Self::BATCH {
+            // `flush` only fails on write errors, which the caller reports.
+            let _ = self.flush();
+        }
+    }
+
+    fn flush(&mut self) -> anyhow::Result<()> {
+        for event in self.pending.drain(..) {
+            (self.emit)(event)?;
+        }
+        Ok(())
+    }
+
+    /// Flush the last batch; returns how many events were emitted.
+    pub fn finish(mut self) -> anyhow::Result<usize> {
+        self.flush()?;
+        Ok(self.total)
+    }
+}
+
+pub fn write_counter(events: &mut Sink<'_>, pid: u32, row: CounterRow) {
     let CounterRow {
         name,
         tid,
@@ -182,7 +228,7 @@ pub fn write_counter(events: &mut Vec<TraceEvent>, pid: u32, row: CounterRow) {
 }
 
 pub fn push_process_meta(
-    events: &mut Vec<TraceEvent>,
+    events: &mut Sink<'_>,
     pid: u32,
     name: &str,
     label: &str,
@@ -208,13 +254,7 @@ pub fn push_process_meta(
     ));
 }
 
-pub fn push_thread_meta(
-    events: &mut Vec<TraceEvent>,
-    pid: u32,
-    tid: u32,
-    name: &str,
-    sort_index: u32,
-) {
+pub fn push_thread_meta(events: &mut Sink<'_>, pid: u32, tid: u32, name: &str, sort_index: u32) {
     events.push(TraceEvent::meta(
         "thread_name",
         pid,
@@ -272,16 +312,24 @@ mod tests {
     #[test]
     fn counter_rows_are_attached_to_the_requested_pid() {
         let mut events = Vec::new();
-        write_counter(
-            &mut events,
-            42,
-            CounterRow {
-                name: "counter".into(),
-                tid: 3,
-                ts: "1.000".into(),
-                args: smallvec::smallvec![("v", Num::Float(0.5))],
-            },
-        );
+        {
+            let mut collect = |event| {
+                events.push(event);
+                Ok(())
+            };
+            let mut sink = Sink::new(&mut collect);
+            write_counter(
+                &mut sink,
+                42,
+                CounterRow {
+                    name: "counter".into(),
+                    tid: 3,
+                    ts: "1.000".into(),
+                    args: smallvec::smallvec![("v", Num::Float(0.5))],
+                },
+            );
+            assert_eq!(sink.finish().unwrap(), 1);
+        }
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].pid, 42);
         assert_eq!(events[0].tid, 3);

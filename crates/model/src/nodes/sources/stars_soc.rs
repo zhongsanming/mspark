@@ -7,16 +7,23 @@ use mspark_df::{Ctx, Node};
 
 use crate::ctx::DeviceInfo;
 use crate::stream::STARS_SOC_TRUNK;
-use crate::stream::{CtxStreams, Stream};
+use crate::stream::Stream;
 
 impl Node for super::stars_soc::StarsSocEntry {
     const NAME: &'static str = "stars_soc";
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = ctx.stream(Stream::StarsSoc)?;
         let expand = ctx.require::<DeviceInfo>()?.expand_status;
-        Ok(super::stars_soc::decode_stars_soc(&bytes, expand)?.0)
+        let mut rows = Vec::new();
+        crate::stream::for_each_chunk(
+            crate::stream::StreamReader::open(ctx, Stream::StarsSoc)?,
+            |chunk| {
+                rows.extend(super::stars_soc::decode_stars_soc(chunk, expand)?.0);
+                Ok(())
+            },
+        )?;
+        Ok(rows)
     }
 }
 

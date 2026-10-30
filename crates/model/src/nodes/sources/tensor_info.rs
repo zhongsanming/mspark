@@ -23,8 +23,14 @@ impl Node for TensorInfoRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = ctx.stream(Stream::TensorInfo)?;
-        let raws = super::tensor_info::decode_tensor_info(&bytes)?;
+        let mut raws = Vec::new();
+        crate::stream::for_each_chunk(
+            crate::stream::StreamReader::open(ctx, Stream::TensorInfo)?,
+            |chunk| {
+                raws.extend(super::tensor_info::decode_tensor_info(chunk)?);
+                Ok(())
+            },
+        )?;
         // A task's tensors span several 256-byte records that share
         // (op hash, timestamp, threadId); merge them into one descriptor set.
         let mut groups: Vec<TensorInfoRow> = Vec::new();
