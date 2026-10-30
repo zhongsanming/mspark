@@ -12,8 +12,10 @@ use crate::trace::{CounterRow, Num};
 
 /// `start_info` fields needed by the NIC/RoCE summary.
 pub fn start_info_times(device: &Path) -> Result<(i128, i128)> {
-    let text = std::fs::read_to_string(find_start_info(device)?)?;
-    let root: serde_json::Value = serde_json::from_str(&text)?;
+    let path = find_start_info(device)?;
+    let text = mspark_model::errors::read_to_string(&path)?;
+    let root: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| mspark_model::json_error(&path, &text, &error))?;
     let get = |key: &str| -> Result<i128> {
         root.get(key)
             .and_then(|v| v.as_str())

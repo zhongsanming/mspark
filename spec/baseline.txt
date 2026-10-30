@@ -1,100 +1,100 @@
+# capture: PROF_000001_20261021172129266_01494188JDAPPLMF
 # Closeness baseline, one line per artifact column.
 # `mspark verify-all` fails when a column drops below its recorded value;
 # regenerate with `mspark verify-all PROF --update-baseline`.
 # Values are the fraction of values matching the golden file at 3 decimals.
-task_time.Device_id                   85241/85241   100.00%
-task_time.kernel_name                 69998/85241    82.12%
-task_time.kernel_type                 65694/85241    77.07%
-task_time.stream_id                   85241/85241   100.00%
-task_time.task_id                     85241/85241   100.00%
-task_time.task_time(us)               82592/85241    96.89%
-task_time.task_start(us)              84903/85241    99.60%
-task_time.task_stop(us)               84899/85241    99.60%
-op_summary.Device_id                   54422/66455    81.89%
-op_summary.Model ID                    54422/66455    81.89%
-op_summary.Task ID                     54421/66455    81.89%
-op_summary.Stream ID                   54422/66455    81.89%
-op_summary.Op Name                     53752/66455    80.88%
-op_summary.OP Type                     54422/66455    81.89%
-op_summary.OP State                    54422/66455    81.89%
-op_summary.Task Type                   54422/66455    81.89%
-op_summary.Task Start Time(us)         51152/66455    76.97%
-op_summary.Task Duration(us)           50748/66455    76.36%
-op_summary.Task Wait Time(us)          52715/66455    79.32%
-op_summary.Block Num                   53752/66455    80.88%
-op_summary.Mix Block Num               54422/66455    81.89%
-op_summary.HF32 Eligible               54422/66455    81.89%
-op_summary.Input Shapes                54422/66455    81.89%
-op_summary.Input Data Types            54422/66455    81.89%
-op_summary.Input Formats               54422/66455    81.89%
-op_summary.Output Shapes               54422/66455    81.89%
-op_summary.Output Data Types           54422/66455    81.89%
-op_summary.Output Formats              54422/66455    81.89%
-op_summary.Context ID                  54422/66455    81.89%
-op_summary.aicore_time(us)             48621/66455    73.16%
-op_summary.aic_total_cycles            48444/66455    72.90%
-op_summary.aic_mac_time(us)            48082/66455    72.35%
-op_summary.aic_mac_ratio               49365/66455    74.28%
-op_summary.aic_scalar_time(us)         48668/66455    73.23%
-op_summary.aic_scalar_ratio            50671/66455    76.25%
-op_summary.aic_mte1_time(us)           54011/66455    81.27%
-op_summary.aic_mte1_ratio              54422/66455    81.89%
-op_summary.aic_mte2_time(us)           49215/66455    74.06%
-op_summary.aic_mte2_ratio              51729/66455    77.84%
-op_summary.aic_fixpipe_time(us)        48917/66455    73.61%
-op_summary.aic_fixpipe_ratio           51393/66455    77.34%
-op_summary.aic_icache_miss_rate        49626/66455    74.68%
-op_summary.aiv_time(us)                29290/66455    44.07%
-op_summary.aiv_total_cycles            48266/66455    72.63%
-op_summary.aiv_vec_time(us)            21138/66455    31.81%
-op_summary.aiv_vec_ratio               49951/66455    75.17%
-op_summary.aiv_scalar_time(us)         32016/66455    48.18%
-op_summary.aiv_scalar_ratio            51386/66455    77.32%
-op_summary.aiv_mte2_time(us)           34833/66455    52.42%
-op_summary.aiv_mte2_ratio              53013/66455    79.77%
-op_summary.aiv_mte3_time(us)           35187/66455    52.95%
-op_summary.aiv_mte3_ratio              52691/66455    79.29%
-op_summary.aiv_icache_miss_rate        51878/66455    78.06%
-op_summary.cube_utilization(%)         48259/66455    72.62%
-api_statistic.Device_id                     176/176   100.00%
-api_statistic.Level                         176/176   100.00%
-api_statistic.API Name                      176/176   100.00%
-api_statistic.Time(us)                      176/176   100.00%
-api_statistic.Count                         176/176   100.00%
-api_statistic.Avg(us)                       176/176   100.00%
-api_statistic.Min(us)                       176/176   100.00%
-api_statistic.Max(us)                       176/176   100.00%
-api_statistic.Variance                      176/176   100.00%
-op_statistic.Device_id                      31/31   100.00%
-op_statistic.OP Type                        31/31   100.00%
-op_statistic.Core Type                      31/31   100.00%
-op_statistic.Count                          31/31   100.00%
-op_statistic.Total Time(us)                  0/31     0.00%
-op_statistic.Min Time(us)                    0/31     0.00%
-op_statistic.Avg Time(us)                    0/31     0.00%
-op_statistic.Max Time(us)                    0/31     0.00%
-op_statistic.Ratio(%)                        1/31     3.23%
-npu_mem.Device_id                    2238/2238   100.00%
-npu_mem.event                        2238/2238   100.00%
-npu_mem.ddr(KB)                      2238/2238   100.00%
-npu_mem.hbm(KB)                      2238/2238   100.00%
-npu_mem.memory(KB)                   2238/2238   100.00%
-npu_mem.timestamp(us)                1241/2238    55.45%
-npu_module_mem.Device_id                   86086/86086   100.00%
-npu_module_mem.Component                   86086/86086   100.00%
-npu_module_mem.Timestamp(us)               86086/86086   100.00%
-npu_module_mem.Total Reserved(KB)          86086/86086   100.00%
-npu_module_mem.Device                      86086/86086   100.00%
+task_time.Device_id                   54981/54981   100.00%
+task_time.kernel_name                 54949/54981    99.94%
+task_time.kernel_type                 54949/54981    99.94%
+task_time.stream_id                   54981/54981   100.00%
+task_time.task_id                     54981/54981   100.00%
+task_time.task_time(us)               52985/54981    96.37%
+task_time.task_start(us)              54969/54981    99.98%
+task_time.task_stop(us)               54975/54981    99.99%
+op_summary.Device_id                   54914/54946    99.94%
+op_summary.Model ID                    54914/54946    99.94%
+op_summary.Task ID                     54914/54946    99.94%
+op_summary.Stream ID                   54914/54946    99.94%
+op_summary.Op Name                     54914/54946    99.94%
+op_summary.OP Type                     54914/54946    99.94%
+op_summary.OP State                    54914/54946    99.94%
+op_summary.Task Type                   54914/54946    99.94%
+op_summary.Task Start Time(us)         54903/54946    99.92%
+op_summary.Task Duration(us)           52927/54946    96.33%
+op_summary.Task Wait Time(us)          53761/54946    97.84%
+op_summary.Block Num                   54914/54946    99.94%
+op_summary.Mix Block Num               54914/54946    99.94%
+op_summary.HF32 Eligible               49821/54946    90.67%
+op_summary.Input Shapes                54914/54946    99.94%
+op_summary.Input Data Types            54914/54946    99.94%
+op_summary.Input Formats               54914/54946    99.94%
+op_summary.Output Shapes               54914/54946    99.94%
+op_summary.Output Data Types           54914/54946    99.94%
+op_summary.Output Formats              54914/54946    99.94%
+op_summary.Context ID                  54914/54946    99.94%
+op_summary.aicore_time(us)             47346/54946    86.17%
+op_summary.aic_total_cycles            46791/54946    85.16%
+op_summary.aic_mac_time(us)            46767/54946    85.11%
+op_summary.aic_mac_ratio               48427/54946    88.14%
+op_summary.aic_scalar_time(us)         47910/54946    87.19%
+op_summary.aic_scalar_ratio            49390/54946    89.89%
+op_summary.aic_mte1_time(us)           46682/54946    84.96%
+op_summary.aic_mte1_ratio              46785/54946    85.15%
+op_summary.aic_mte2_time(us)           48037/54946    87.43%
+op_summary.aic_mte2_ratio              50525/54946    91.95%
+op_summary.aic_fixpipe_time(us)        47465/54946    86.38%
+op_summary.aic_fixpipe_ratio           49412/54946    89.93%
+op_summary.aic_icache_miss_rate        47913/54946    87.20%
+op_summary.aiv_time(us)                29702/54946    54.06%
+op_summary.aiv_total_cycles            46792/54946    85.16%
+op_summary.aiv_vec_time(us)            21797/54946    39.67%
+op_summary.aiv_vec_ratio               48430/54946    88.14%
+op_summary.aiv_scalar_time(us)         31324/54946    57.01%
+op_summary.aiv_scalar_ratio            49395/54946    89.90%
+op_summary.aiv_mte2_time(us)           35361/54946    64.36%
+op_summary.aiv_mte2_ratio              50534/54946    91.97%
+op_summary.aiv_mte3_time(us)           32938/54946    59.95%
+op_summary.aiv_mte3_ratio              49413/54946    89.93%
+op_summary.aiv_icache_miss_rate        47915/54946    87.20%
+op_summary.cube_utilization(%)         46758/54946    85.10%
+api_statistic.Device_id                     114/114   100.00%
+api_statistic.Level                         114/114   100.00%
+api_statistic.API Name                      114/114   100.00%
+api_statistic.Time(us)                      114/114   100.00%
+api_statistic.Count                         114/114   100.00%
+api_statistic.Avg(us)                       114/114   100.00%
+api_statistic.Min(us)                       114/114   100.00%
+api_statistic.Max(us)                       114/114   100.00%
+api_statistic.Variance                      114/114   100.00%
+op_statistic.Device_id                      28/28   100.00%
+op_statistic.OP Type                        28/28   100.00%
+op_statistic.Core Type                      28/28   100.00%
+op_statistic.Count                          28/28   100.00%
+op_statistic.Total Time(us)                  0/28     0.00%
+op_statistic.Min Time(us)                    3/28    10.71%
+op_statistic.Avg Time(us)                    0/28     0.00%
+op_statistic.Max Time(us)                    4/28    14.29%
+op_statistic.Ratio(%)                        0/28     0.00%
+npu_mem.Device_id                     816/816   100.00%
+npu_mem.event                         816/816   100.00%
+npu_mem.ddr(KB)                       816/816   100.00%
+npu_mem.hbm(KB)                       816/816   100.00%
+npu_mem.memory(KB)                    816/816   100.00%
+npu_mem.timestamp(us)                 758/816    92.89%
+npu_module_mem.Device_id                   31416/31416   100.00%
+npu_module_mem.Component                   31416/31416   100.00%
+npu_module_mem.Timestamp(us)               31416/31416   100.00%
+npu_module_mem.Total Reserved(KB)          31416/31416   100.00%
+npu_module_mem.Device                      31416/31416   100.00%
 hccs.Device_id                       2/2   100.00%
 hccs.Mode                            2/2   100.00%
 hccs.Max                             2/2   100.00%
 hccs.Min                             2/2   100.00%
-hccs.Average                         0/2     0.00%
+hccs.Average                         2/2   100.00%
 hbm.Device_id                       5/5   100.00%
 hbm.Metric                          5/5   100.00%
-hbm.Read(MB/s)                      5/5   100.00%
-hbm.Write(MB/s)                     5/5   100.00%
-# gap: communication_statistic — header width 8 vs 3
+hbm.Read(MB/s)                      3/5    60.00%
+hbm.Write(MB/s)                     4/5    80.00%
 host_cpu_usage.Device_id                       1/1   100.00%
 host_cpu_usage.Total Cpu Numbers               1/1   100.00%
 host_cpu_usage.Occupied Cpu Numbers            1/1   100.00%
@@ -105,7 +105,7 @@ llc_read_write.Task                            3/3   100.00%
 llc_read_write.Hit Rate(%)                     3/3   100.00%
 llc_read_write.Throughput(MB/s)                3/3   100.00%
 nic.Device_id                       1/1   100.00%
-nic.Timestamp(us)                   1/1   100.00%
+nic.Timestamp(us)                   0/1     0.00%
 nic.Bandwidth(MB/s)                 1/1   100.00%
 nic.Rx Bandwidth efficiency(%)        1/1   100.00%
 nic.rxPacket/s                      1/1   100.00%

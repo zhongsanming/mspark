@@ -110,9 +110,9 @@ pub struct DeviceInfo {
 /// Load `info.json` (or `info.json.<id>`) from a device directory.
 pub fn load_device_info(device_dir: &Path) -> Result<DeviceInfo> {
     let path = find_info_json(device_dir)?;
-    let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let root: Value =
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let text = crate::errors::read_to_string(&path)?;
+    let root: Value = serde_json::from_str(&text)
+        .map_err(|error| crate::errors::json_error(&path, &text, &error))?;
 
     let platform_version = root
         .get("platform_version")
@@ -237,8 +237,9 @@ pub fn load_sample_string(
     key: &str,
 ) -> anyhow::Result<Option<String>> {
     let path = device_dir.join("sample.json");
-    let text = std::fs::read_to_string(&path)?;
-    let value: serde_json::Value = serde_json::from_str(&text)?;
+    let text = crate::errors::read_to_string(&path)?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| crate::errors::json_error(&path, &text, &error))?;
     Ok(value
         .get(key)
         .and_then(|v| v.as_str())
@@ -276,8 +277,8 @@ impl HostInfo {
             // Host mem/disk artefacts are optional: an absent file is not an error.
             Err(_) => return Ok(Self::default()),
         };
-        let root: Value =
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let root: Value = serde_json::from_str(&text)
+            .map_err(|error| crate::errors::json_error(&path, &text, &error))?;
         let as_u64 = |key: &str| {
             root.get(key).and_then(|v| {
                 v.as_u64()
@@ -303,8 +304,8 @@ impl SampleConfig {
             Ok(text) => text,
             Err(_) => return Ok(Self(Value::Null)),
         };
-        let value =
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let value = serde_json::from_str(&text)
+            .map_err(|error| crate::errors::json_error(&path, &text, &error))?;
         Ok(Self(value))
     }
 

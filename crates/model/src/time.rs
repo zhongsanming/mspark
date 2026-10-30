@@ -13,10 +13,9 @@
 //! the residual against the golden CSV is ≤1 ns per field.
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 /// All constants needed to map a device tick to wall-clock nanoseconds.
@@ -346,12 +345,12 @@ fn find_one(dir: &Path, prefix: &str) -> Result<PathBuf> {
 }
 
 fn read_json(path: &Path) -> Result<Value> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    let text = crate::errors::read_to_string(path)?;
+    serde_json::from_str(&text).map_err(|error| crate::errors::json_error(path, &text, &error))
 }
 
 fn read_kv(path: &Path) -> Result<HashMap<String, String>> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = crate::errors::read_to_string(path)?;
     let mut map = HashMap::new();
     for line in text.lines() {
         if let Some((k, v)) = line.split_once(':') {

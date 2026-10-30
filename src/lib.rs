@@ -6,6 +6,7 @@
 
 pub mod artifacts;
 pub mod commands;
+pub mod errors;
 pub mod reports;
 pub mod session;
 pub mod text;

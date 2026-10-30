@@ -152,6 +152,10 @@ so ordering and float noise do not count). Any column that drops below its
 recorded value fails the run — that catches a dropped row, a broken column or a
 stream that stopped decoding, without demanding bit-identical output.
 
+The baseline records the capture it was measured on, because closeness is
+capture-specific; comparing a different profile against it reports only, with a
+warning, instead of inventing regressions.
+
 `--strict` on the individual verifiers still gives an exact match when you want
 one:
 

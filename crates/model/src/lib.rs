@@ -5,6 +5,7 @@
 //! the reference profile: `stars_soc`, `ffts_profile`, `ts_track`, `lpmFreqConv`.
 
 pub mod ctx;
+pub mod errors;
 pub(crate) mod format;
 pub mod host;
 pub mod nodes;
@@ -12,6 +13,7 @@ pub mod stream;
 pub mod time;
 
 pub use ctx::{Chip, DeviceInfo, HostInfo, SampleConfig, load_device_info, load_sample_string};
+pub use errors::{describe_position, json_error};
 pub use host::{HashDic, TypeDic, ge_task_type, load_dictionaries};
 pub use nodes::sources::api_event::api_level_name;
 pub use nodes::sources::dvpp::dvpp_engine_name;

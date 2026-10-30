@@ -248,10 +248,19 @@ pub fn export(
     // computations on one device.
     let results: Vec<Result<()>> = artifacts
         .par_iter()
-        .map(|artifact| write_artifact(*artifact, prof, only, &dir))
+        .map(|artifact| {
+            write_artifact(*artifact, prof, only, &dir)
+                .with_context(|| format!("exporting `{}`", artifact.name()))
+        })
         .collect();
-    for result in results {
-        result?;
+    // Report every failing artifact, not just the first: they run in parallel and
+    // one bad stream usually breaks several.
+    let failures: Vec<anyhow::Error> = results.into_iter().filter_map(Result::err).collect();
+    if !failures.is_empty() {
+        for failure in &failures[1..] {
+            eprintln!("{failure:?}\n");
+        }
+        return Err(failures.into_iter().next().expect("checked non-empty"));
     }
     println!("outputs written to {}", dir.display());
     Ok(())
