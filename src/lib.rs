@@ -6,6 +6,8 @@
 
 pub mod artifacts;
 pub mod commands;
+pub mod errors;
+pub use mspark_model::memtrace;
 pub mod reports;
 pub mod session;
 pub mod text;

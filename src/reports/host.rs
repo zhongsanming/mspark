@@ -15,8 +15,10 @@ use crate::trace::{CounterRow, Num};
 /// Host tracks use `host/start_info` (the host process's own report), which is a
 /// few microseconds away from the device one.
 pub fn host_local_offset_milli(prof_root: &Path) -> Result<i128> {
-    let text = std::fs::read_to_string(prof_root.join("host").join("start_info"))?;
-    let root: serde_json::Value = serde_json::from_str(&text)?;
+    let path = prof_root.join("host").join("start_info");
+    let text = mspark_model::errors::read_to_string(&path)?;
+    let root: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| mspark_model::json_error(&path, &text, &error))?;
     let get = |key: &str| -> Result<i128> {
         root.get(key)
             .and_then(|v| v.as_str())

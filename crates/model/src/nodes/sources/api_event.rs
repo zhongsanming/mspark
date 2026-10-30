@@ -7,7 +7,7 @@ use mspark_df::{Ctx, Node};
 
 use crate::host::{HashDic, TypeDic};
 use crate::stream::API_EVENT_TRUNK;
-use crate::stream::{CtxStreams, Stream};
+use crate::stream::Stream;
 
 #[derive(Debug, Clone)]
 pub struct ApiEventRow {
@@ -49,8 +49,16 @@ impl Node for ApiEventRow {
     type Deps = ();
 
     fn compute(ctx: &Ctx, (): ()) -> Result<Vec<Self>> {
-        let bytes = ctx.stream(Stream::ApiEvent)?;
-        let mut raws = super::api_event::decode_api_event(&bytes)?;
+        // Decode slice by slice: a single api_event stream is ~96 MB on a real
+        // capture, and only the decoded rows are needed downstream.
+        let mut raws = Vec::new();
+        crate::stream::for_each_chunk(
+            crate::stream::StreamReader::open(ctx, Stream::ApiEvent)?,
+            |chunk| {
+                raws.extend(super::api_event::decode_api_event(chunk)?);
+                Ok(())
+            },
+        )?;
         // msprof emits the CANN track sorted by the API start timestamp.
         raws.sort_by_key(|r| r.begin);
         let types = ctx.require::<TypeDic>()?;

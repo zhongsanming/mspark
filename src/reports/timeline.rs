@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use mspark_model::{
@@ -175,49 +175,96 @@ pub fn npu_mem_rows(samples: &[NpuMemRow]) -> Vec<CounterRow> {
 
 pub fn timeline(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
     let devices = devices(prof, only)?;
-    let chunks: Vec<(Vec<TraceEvent>, usize)> = devices
-        .par_iter()
-        .map(|device| device_timeline(device))
-        .collect::<Result<Vec<_>>>()?;
-
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Stream device chunks straight into the JSON array: the merged vector used to
-    // be built (and then dropped) in full, which costs a large allocation, a copy
-    // of every event and the peak memory of all devices at once.
+    // Each device streams its events straight to its own part file, so no
+    // `Vec<TraceEvent>` is ever materialised: a full capture produces 2 M+ events
+    // and the vector (with its doubling slack) was ~1.9 GB of the peak.
+    let parts_dir = out.with_extension("parts");
+    std::fs::create_dir_all(&parts_dir)?;
+    let parts: Vec<Result<(PathBuf, usize)>> = devices
+        .par_iter()
+        .enumerate()
+        .map(|(index, device)| {
+            let path = parts_dir.join(format!("{index:04}.part"));
+            let mut writer =
+                std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&path)?);
+            let mut first = true;
+            let count = device_timeline_into(device, &mut |event| {
+                write_event(&mut writer, &mut first, &event)
+            })?;
+            writer.flush()?;
+            Ok((path, count))
+        })
+        .collect();
+
     let file = std::fs::File::create(out)?;
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
     writer.write_all(b"[")?;
     let mut first = true;
     let mut total = 0usize;
-    for (chunk, count) in chunks {
-        for event in &chunk {
+    for part in parts {
+        let (path, count) = part?;
+        let mut reader = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(&path)?);
+        if count > 0 {
             if !first {
                 writer.write_all(b",")?;
             }
             first = false;
-            serde_json::to_writer(&mut writer, event)?;
+            std::io::copy(&mut reader, &mut writer)?;
         }
         total += count;
+        let _ = std::fs::remove_file(&path);
     }
     writer.write_all(b"]")?;
     writer.flush()?;
+    let _ = std::fs::remove_dir_all(&parts_dir);
     println!("wrote {total} timeline events to {}", out.display());
     Ok(())
 }
 
-/// Build one device's timeline events. Devices are independent, so this runs
-/// in parallel; the caller concatenates chunks in device order.
+fn write_event(
+    writer: &mut impl std::io::Write,
+    first: &mut bool,
+    event: &TraceEvent,
+) -> Result<()> {
+    if !*first {
+        writer.write_all(b",")?;
+    }
+    *first = false;
+    serde_json::to_writer(writer, event)?;
+    Ok(())
+}
+
+/// Collect one device's events, for the verifier and the summary.
 pub fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
+    let mut events = Vec::new();
+    let count = device_timeline_into(device, &mut |event| {
+        events.push(event);
+        Ok(())
+    })?;
+    Ok((events, count))
+}
+
+/// Build one device's timeline events, calling `emit` for each one in order.
+///
+/// Events are produced grouped by track, so the caller can serialise immediately
+/// and never hold the whole track in memory.
+pub fn device_timeline_into(
+    device: &Path,
+    emit: &mut dyn FnMut(TraceEvent) -> Result<()>,
+) -> Result<usize> {
     let session = session_for(device)?;
     let ctx = session.ctx();
     let info = &session.info;
-    let mut events: Vec<TraceEvent> = Vec::new();
+    let mut events = crate::trace::Sink::new(emit);
     let mut total = 0usize;
     {
         let clock = ctx.require::<Clock>()?;
+        crate::memtrace::trace("timeline: start");
         let tasks = session.resolve::<TimelineTask>()?;
+        crate::memtrace::trace("timeline: TimelineTask resolved");
 
         let dev = info.device_id.unwrap_or(0);
         let hw_pid = Track::Hardware.pid(info.pid, dev);
@@ -268,7 +315,9 @@ pub fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         }
 
         // --- CANN host track ---
+        crate::memtrace::trace("timeline: cannn phase start");
         let api_events = session.resolve::<ApiEventRow>()?;
+        crate::memtrace::trace("timeline: ApiEventRow resolved");
         let host_clock = ctx
             .require::<mspark_model::HostStartLogs>()?
             .0
@@ -316,6 +365,7 @@ pub fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
 
         // --- SOC profile tracks ---
         let label = format!("NPU {dev}");
+        crate::memtrace::trace("timeline: hardware+SOC phase start");
         let sio = session.resolve::<SioSample>()?;
         let acc = session.resolve::<AccPmuSample>()?;
         let inter = session.resolve::<InterSocSample>()?;
@@ -375,6 +425,7 @@ pub fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         }
 
         // --- QoS ---
+        crate::memtrace::trace("timeline: SOC counters done");
         let qos = session.resolve::<QosRow>()?;
         let qos_events = sample_csv_list(ctx.device_dir()?, "qosEvents")?;
         let qos_pid = track_pid(Track::Qos);
@@ -388,7 +439,9 @@ pub fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
         let npu_mem = session.resolve::<NpuMemRow>()?;
         let npu_mem_pid = track_pid(Track::Communication);
         // --- CPU Usage (host track) ---
+        crate::memtrace::trace("timeline: npu_mem resolved");
         let cpu_usage = session.resolve::<HostCpuUsageRow>()?;
+        crate::memtrace::trace("timeline: HostCpuUsageRow resolved");
         let cpu_pid = Track::CpuUsage.pid(info.pid, HOST_PID);
         events.push(TraceEvent::meta(
             "process_name",
@@ -476,7 +529,10 @@ pub fn device_timeline(device: &Path) -> Result<(Vec<TraceEvent>, usize)> {
             total += 1;
         }
     }
-    Ok((events, total))
+    let emitted = events.finish()?;
+    crate::memtrace::trace("timeline: events emitted");
+    debug_assert_eq!(emitted, total, "event count drifted");
+    Ok(emitted)
 }
 
 #[cfg(test)]

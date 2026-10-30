@@ -13,10 +13,9 @@
 //! the residual against the golden CSV is ≤1 ns per field.
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 /// All constants needed to map a device tick to wall-clock nanoseconds.
@@ -124,6 +123,11 @@ impl StartLogs {
     /// `start_info.collectionTimeBegin` (us).
     pub fn begin_us(&self) -> u64 {
         self.begin_us
+    }
+
+    /// `start_info.clockMonotonicRaw` (ns).
+    pub fn clock_monotonic_raw(&self) -> u64 {
+        self.cmr
     }
 
     /// `end_info.collectionTimeEnd` (us), defaulting to the begin stamp.
@@ -346,12 +350,12 @@ fn find_one(dir: &Path, prefix: &str) -> Result<PathBuf> {
 }
 
 fn read_json(path: &Path) -> Result<Value> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    let text = crate::errors::read_to_string(path)?;
+    serde_json::from_str(&text).map_err(|error| crate::errors::json_error(path, &text, &error))
 }
 
 fn read_kv(path: &Path) -> Result<HashMap<String, String>> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = crate::errors::read_to_string(path)?;
     let mut map = HashMap::new();
     for line in text.lines() {
         if let Some((k, v)) = line.split_once(':') {
@@ -370,6 +374,50 @@ fn as_u64(v: &Value, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: `device_N/start_info.N.done` contains `filesize:178`, not
+    /// JSON. A hand-rolled directory scan picked it up depending on readdir
+    /// order and failed with "expected ident at line 1 column 2".
+    #[test]
+    fn start_logs_ignore_done_markers() {
+        let dir = std::env::temp_dir().join(format!("mspark-startlogs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("start_info.7"),
+            r#"{"collectionTimeBegin":"1792632287145380","clockMonotonicRaw":"5396596301416840"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("start_info.7.done"), "filesize:178").unwrap();
+        std::fs::write(
+            dir.join("dev_start.log.7"),
+            "cntvct:123\nclock_monotonic_raw:456\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("dev_start.log.7.done"), "filesize:40").unwrap();
+        std::fs::write(
+            dir.join("host_start.log.7"),
+            "cntvct:1\nclock_monotonic_raw:2\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("host_start.log.7.done"), "filesize:30").unwrap();
+        std::fs::write(
+            dir.join("end_info.7"),
+            r#"{"collectionTimeEnd":"1792632310813987"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("end_info.7.done"), "filesize:33").unwrap();
+
+        let logs = StartLogs::load(&dir).expect("the `.done` markers must be ignored");
+        assert_eq!(logs.begin_us(), 1792632287145380);
+        assert_eq!(logs.clock_monotonic_raw(), 5396596301416840);
+        assert_eq!(logs.end_us(), 1792632310813987);
+        let mono = logs
+            .mono(None)
+            .expect("dev_start.log/host_start.log parsed");
+        assert_eq!(mono.begin_us, 1792632287145380);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

@@ -111,6 +111,31 @@ pub trait Node: Sized + Send + Sync + 'static {
 
     /// Build this node's full table from its already-computed dependencies.
     fn compute(ctx: &Ctx, deps: <Self::Deps as DepList>::Refs) -> Result<Vec<Self>>;
+
+    /// Emit rows one at a time instead of returning the whole table.
+    ///
+    /// A node whose table is only ever written to a file ("sink" consumers) can
+    /// override this to avoid materialising it: `task_time`/`op_summary` tables
+    /// are hundreds of thousands of rows of strings, and holding them all cost
+    /// more than every input stream combined. The default collects via
+    /// [`Node::compute`], so most nodes need nothing.
+    ///
+    /// Nodes that override this must still implement `compute` (typically by
+    /// collecting from this function) so that `resolve` keeps working for any
+    /// other consumer.
+    fn emit(
+        ctx: &Ctx,
+        deps: <Self::Deps as DepList>::Refs,
+        out: &mut dyn FnMut(Self) -> Result<()>,
+    ) -> Result<()>
+    where
+        Self: Sized,
+    {
+        for row in Self::compute(ctx, deps)? {
+            out(row)?;
+        }
+        Ok(())
+    }
 }
 
 /// Memoisation store for computed tables. Keys are node types.
@@ -154,6 +179,22 @@ impl Store {
 ///
 /// Failure is allowed at every step; a failed node is not memoised, so the error
 /// propagates to the caller with the node name attached.
+/// Resolve a node's dependencies and hand its rows to `out` without memoising
+/// the table.
+///
+/// Use this from reports whose only consumer is a writer: the node's `emit` is
+/// called instead of `compute`, so a large table never exists as a `Vec`. The
+/// dependencies are still memoised, so other artifacts keep their caching.
+pub fn resolve_into<T: Node>(
+    store: &mut Store,
+    ctx: &Ctx,
+    out: &mut dyn FnMut(T) -> Result<()>,
+) -> Result<()> {
+    let deps = <T::Deps as DepList>::resolve_all(store, ctx)
+        .with_context(|| format!("resolving dependencies of `{}`", T::NAME))?;
+    T::emit(ctx, deps, out).with_context(|| format!("computing `{}`", T::NAME))
+}
+
 pub fn resolve<T: Node>(store: &mut Store, ctx: &Ctx) -> Result<Arc<Vec<T>>> {
     if let Some(cached) = store.get::<T>() {
         return Ok(cached);

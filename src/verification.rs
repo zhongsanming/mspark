@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 
 use crate::artifacts::{ALL_ARTIFACTS, Artifact, write_artifact};
 use crate::reports::hbm::hbm_track_rows;
@@ -243,9 +243,9 @@ pub fn golden_pid_for(meta: &HashMap<u64, (String, String)>, name: &str, dev: u3
 }
 
 pub fn verify_timeline(prof: &Path, only: Option<&str>, golden: &Path) -> Result<()> {
-    let text =
-        std::fs::read_to_string(golden).with_context(|| format!("reading {}", golden.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&text)?;
+    let text = mspark_model::errors::read_to_string(golden)?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| mspark_model::json_error(golden, &text, &error))?;
     let array = value
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("golden timeline is not a JSON array"))?;
@@ -648,7 +648,29 @@ pub fn verify_all(
     let baseline_path = baseline
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("spec/baseline.txt"));
-    let previous = read_baseline(&baseline_path)?;
+    let (baseline_capture, previous) = read_baseline(&baseline_path)?;
+    // The recorded closeness is capture-specific (different model, different
+    // device mix), so comparing a different capture against it would report a
+    // pile of meaningless "regressions".
+    let capture = prof
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let capture_matches = match &baseline_capture {
+        Some(recorded) => *recorded == capture,
+        // Older baselines had no capture line: keep them usable.
+        None => true,
+    };
+    if !capture_matches && !update_baseline {
+        eprintln!(
+            "warning: baseline {} was recorded on {} but this run compares {}; \
+             reporting only (use --update-baseline to re-record)",
+            baseline_path.display(),
+            baseline_capture.as_deref().unwrap_or("<unknown>"),
+            capture
+        );
+    }
 
     let dir = std::env::temp_dir().join(format!("mspark-verify-all-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
@@ -710,6 +732,7 @@ pub fn verify_all(
             worst = worst.min(ratio);
             if let Some(recorded) = previous.get(&key(index))
                 && !update_baseline
+                && capture_matches
                 && ratio + 1e-9 < *recorded
             {
                 regressions.push((key(index), *recorded, ratio));
@@ -730,7 +753,7 @@ pub fn verify_all(
     }
 
     if update_baseline {
-        write_baseline(&baseline_path, &checks)?;
+        write_baseline(&baseline_path, &checks, &capture)?;
         println!("\nbaseline written to {}", baseline_path.display());
         return Ok(());
     }
@@ -748,13 +771,20 @@ pub fn verify_all(
     anyhow::bail!("{} column(s) regressed", regressions.len())
 }
 
-fn read_baseline(path: &Path) -> Result<std::collections::HashMap<String, f64>> {
+/// Baseline contents: the capture it was recorded on (if recorded) and the
+/// per-column ratios.
+fn read_baseline(path: &Path) -> Result<(Option<String>, std::collections::HashMap<String, f64>)> {
     let mut map = std::collections::HashMap::new();
+    let mut capture = None;
     let Ok(text) = std::fs::read_to_string(path) else {
-        return Ok(map);
+        return Ok((capture, map));
     };
     for line in text.lines() {
         let line = line.trim();
+        if let Some(rest) = line.strip_prefix("# capture:") {
+            capture = Some(rest.trim().to_string());
+            continue;
+        }
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -777,11 +807,12 @@ fn read_baseline(path: &Path) -> Result<std::collections::HashMap<String, f64>> 
             if total > 0.0 { matched / total } else { 1.0 },
         );
     }
-    Ok(map)
+    Ok((capture, map))
 }
 
-fn write_baseline(path: &Path, checks: &[ArtifactCheck]) -> Result<()> {
-    let mut text = String::from(
+fn write_baseline(path: &Path, checks: &[ArtifactCheck], capture: &str) -> Result<()> {
+    let mut text = format!("# capture: {capture}\n");
+    text.push_str(
         "# Closeness baseline, one line per artifact column.\n\
          # `mspark verify-all` fails when a column drops below its recorded value;\n\
          # regenerate with `mspark verify-all PROF --update-baseline`.\n\

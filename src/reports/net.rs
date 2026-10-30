@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::text::{nic_timestamp_column, py_round3};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use mspark_model::{NetSample, NicRow, RoceRow, fmt_us};
 
 use crate::reports::{round3, write_text};
@@ -11,30 +11,15 @@ use crate::session::{devices, session_for};
 use crate::trace::{CounterRow, Num};
 
 /// `start_info` fields needed by the NIC/RoCE summary.
+///
+/// Reads through [`mspark_model::StartLogs`], which skips msprof's `.done`
+/// markers. A hand-rolled `read_dir` scan here used to return
+/// `start_info.<pid>.done` (contents `filesize:178`) depending on directory
+/// order, and parsing that as JSON failed with "expected ident at line 1
+/// column 2".
 pub fn start_info_times(device: &Path) -> Result<(i128, i128)> {
-    let text = std::fs::read_to_string(find_start_info(device)?)?;
-    let root: serde_json::Value = serde_json::from_str(&text)?;
-    let get = |key: &str| -> Result<i128> {
-        root.get(key)
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<i128>().ok())
-            .ok_or_else(|| anyhow::anyhow!("start_info has no {key}"))
-    };
-    Ok((get("collectionTimeBegin")?, get("clockMonotonicRaw")?))
-}
-
-pub fn find_start_info(device: &Path) -> Result<std::path::PathBuf> {
-    for entry in std::fs::read_dir(device)? {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("start_info")
-        {
-            return Ok(entry.path());
-        }
-    }
-    bail!("no start_info in {}", device.display())
+    let logs = mspark_model::StartLogs::load(device)?;
+    Ok((logs.begin_us() as i128, logs.clock_monotonic_raw() as i128))
 }
 pub fn net_summary_rows(samples: &[NetSample], device: &Path) -> Result<Vec<[String; 10]>> {
     if samples.is_empty() {

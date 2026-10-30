@@ -114,7 +114,33 @@ pub struct DeviceSession {
 impl DeviceSession {
     pub fn resolve<T: mspark_df::Node>(&self) -> Result<Arc<Vec<T>>> {
         let mut store = self.store.lock().expect("store lock");
-        resolve::<T>(&mut store, &self.ctx)
+        resolve::<T>(&mut store, &self.ctx).with_context(|| format!("on {}", self.label()))
+    }
+
+    /// Resolve a node and hand its rows to `out` without memoising the table.
+    ///
+    /// For reports whose only consumer is the writer: `op_summary` emits 300 k+
+    /// rows of 46 strings, which is far more than the inputs it needs.
+    pub fn resolve_into<T: mspark_df::Node>(
+        &self,
+        out: &mut dyn FnMut(T) -> Result<()>,
+    ) -> Result<()> {
+        let mut store = self.store.lock().expect("store lock");
+        mspark_df::resolve_into::<T>(&mut store, &self.ctx, out)
+            .with_context(|| format!("on {}", self.label()))
+    }
+
+    /// Human-readable device identity for error messages.
+    pub fn label(&self) -> String {
+        let device = self
+            .ctx
+            .device_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_else(|_| "<unknown device>".to_string());
+        match self.info.device_id {
+            Some(id) => format!("device {id} ({device})"),
+            None => device,
+        }
     }
 
     pub fn ctx(&self) -> &Ctx {
@@ -199,8 +225,14 @@ pub fn build_ctx(device: &Path) -> Result<(Ctx, DeviceInfo)> {
         mspark_model::StartLogs::load(&root.join("host"))
             .with_context(|| format!("loading host start logs for {}", root.display()))?,
     ));
-    ctx.insert(mspark_model::HostInfo::load(root)?);
-    ctx.insert(mspark_model::SampleConfig::load(device)?);
+    ctx.insert(
+        mspark_model::HostInfo::load(root)
+            .with_context(|| format!("loading host info for {}", root.display()))?,
+    );
+    ctx.insert(
+        mspark_model::SampleConfig::load(device)
+            .with_context(|| format!("loading sample config for {}", device.display()))?,
+    );
     // Host id→text dictionaries are loaded before any node runs.
     let (hash, types) = load_dictionaries(&root.join("host").join("data"));
     ctx.insert(hash);

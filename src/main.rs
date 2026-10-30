@@ -404,7 +404,14 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{}", mspark::errors::report(&error));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     mspark::verify::set_strict(cli.strict);
     if cli.version {

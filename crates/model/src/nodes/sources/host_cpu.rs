@@ -36,7 +36,7 @@ impl Node for HostCpuUsageRow {
         let files = crate::stream::files_with_prefix(&dir, &["host_cpu.data"]);
         let mut out = Vec::new();
         for file in files {
-            let bytes = std::fs::read(&file)?;
+            let bytes = crate::errors::read(&file)?;
             if bytes.is_empty() {
                 continue;
             }
