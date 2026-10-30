@@ -83,6 +83,54 @@ impl OpSummaryRow {
     }
 }
 
+/// `Task Wait Time` for each emitted row.
+///
+/// msprof sorts by the formatted `(Device_id, Task Start Time)` pair and takes
+/// `max(0, start - prev_start - prev_duration)`. The keys are cheap to produce
+/// (two formatted strings per row), so this runs before the rows are built and
+/// the emit loop only has to look the value up — otherwise every row would have
+/// to be held until the sort completed.
+fn wait_times(
+    ordered: &[&DeviceTask],
+    pmu_map: &HashMap<(u16, u16), &PmuData>,
+    clock: &Clock,
+) -> Vec<f64> {
+    // (device, start string, duration string) for the rows that will be emitted.
+    let mut keys: Vec<([u8; 2], compact_str::CompactString, f64)> = Vec::new();
+    for task in ordered {
+        // The emit loop stops at the first task without a PMU row and skips
+        // tasks without a PMU record; mirror that here so indices line up.
+        if !pmu_map.contains_key(&(task.stream_id, task.task_id)) {
+            continue;
+        }
+        let start_ns = clock.to_ns(task.op_start_raw);
+        let dur_ns = clock.dur_ns(task.op_start_raw, task.op_end_raw);
+        keys.push((
+            task.device_id.to_le_bytes(),
+            fmt_us(start_ns, true),
+            dur_ns as f64 / 1000.0,
+        ));
+    }
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by(|a, b| {
+        keys[*a]
+            .0
+            .cmp(&keys[*b].0)
+            .then_with(|| keys[*a].1.as_str().cmp(keys[*b].1.as_str()))
+    });
+    let mut waits = vec![0.0f64; keys.len()];
+    for window in order.windows(2) {
+        let (prev, curr) = (window[0], window[1]);
+        if keys[prev].0 != keys[curr].0 {
+            continue;
+        }
+        let start: f64 = keys[curr].1.trim().parse().unwrap_or(0.0);
+        let prev_start: f64 = keys[prev].1.trim().parse().unwrap_or(0.0);
+        waits[curr] = (start - prev_start - keys[prev].2).max(0.0);
+    }
+    waits
+}
+
 impl Node for OpSummaryRow {
     const NAME: &'static str = "OpSummary";
     type Deps = (
@@ -93,7 +141,14 @@ impl Node for OpSummaryRow {
         super::sources::lpm::LpmInfo,
     );
 
-    fn compute(
+    /// Rows are emitted instead of collected: 300 k+ rows of 46 strings cost more
+    /// than every input stream combined (measured: 257 MB -> 1.08 GB).
+    ///
+    /// msprof sorts the table by the *formatted* `(Device_id, Task Start Time)`
+    /// pair and then derives `Task Wait Time` from the previous row, so the wait
+    /// values are computed up front from the same keys; the rows themselves are
+    /// then emitted in task order, which keeps the tensors/PMU state streaming.
+    fn emit(
         ctx: &Ctx,
         (tasks, nbis, tensor_infos, pmus, lpms): (
             std::sync::Arc<Vec<DeviceTask>>,
@@ -102,7 +157,9 @@ impl Node for OpSummaryRow {
             std::sync::Arc<Vec<PmuData>>,
             std::sync::Arc<Vec<super::sources::lpm::LpmInfo>>,
         ),
-    ) -> Result<Vec<Self>> {
+        out: &mut dyn FnMut(Self) -> Result<()>,
+    ) -> Result<()> {
+        crate::memtrace::trace("op_summary: deps resolved");
         let clock = ctx.require::<Clock>()?;
         let info = ctx.require::<DeviceInfo>()?;
         let mut tensor_queues: HashMap<u64, VecDeque<&TensorInfoRow>> = HashMap::new();
@@ -128,7 +185,9 @@ impl Node for OpSummaryRow {
             .collect();
         ordered.sort_by_key(|task| (task.device_id, task.op_start_raw));
 
-        let mut rows = Vec::with_capacity(ordered.len());
+        crate::memtrace::trace("op_summary: lookups built");
+        let waits = wait_times(&ordered, &pmu_map, clock);
+        let mut emitted = 0usize;
         for (idx, task) in ordered.into_iter().enumerate() {
             let Some(nbi) = nbis.get(idx) else {
                 break;
@@ -165,7 +224,7 @@ impl Node for OpSummaryRow {
             cols.push(ge_task_type(nbi.task_type).to_string());
             cols.push(fmt_us(start_ns, true).to_string());
             cols.push(fmt_us(dur_ns, false).to_string());
-            cols.push("0".to_string()); // wait, filled after sorting
+            cols.push(format!("{:.6}", waits.get(emitted).copied().unwrap_or(0.0)));
             cols.push(blk.to_string());
             cols.push("0".to_string()); // Mix Block Dim
             cols.push("NO".to_string()); // HF32 Eligible
@@ -258,23 +317,20 @@ impl Node for OpSummaryRow {
                 cols.len(),
                 Self::HEADER.len()
             );
-            rows.push(OpSummaryRow { cols });
+            out(OpSummaryRow { cols })?;
+            emitted += 1;
         }
 
-        // C++ sorts by (device, start string), then computes the wait time from
-        // the already-formatted start/duration strings.
-        rows.sort_by(|a, b| {
-            a.cols[0]
-                .cmp(&b.cols[0])
-                .then_with(|| a.cols[8].cmp(&b.cols[8]))
-        });
-        for i in 1..rows.len() {
-            let curr: f64 = rows[i].cols[8].trim().parse().unwrap_or(0.0);
-            let prev: f64 = rows[i - 1].cols[8].trim().parse().unwrap_or(0.0);
-            let prev_dur: f64 = rows[i - 1].cols[9].parse().unwrap_or(0.0);
-            let wait = (curr - prev - prev_dur).max(0.0);
-            rows[i].cols[10] = format!("{wait:.6}");
-        }
+        crate::memtrace::trace("op_summary: rows emitted");
+        Ok(())
+    }
+
+    fn compute(ctx: &Ctx, deps: <Self::Deps as mspark_df::DepList>::Refs) -> Result<Vec<Self>> {
+        let mut rows = Vec::new();
+        Self::emit(ctx, deps, &mut |row| {
+            rows.push(row);
+            Ok(())
+        })?;
         Ok(rows)
     }
 }

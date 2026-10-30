@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Result;
 use mspark_model::{NpuMemRow, OpSummaryRow, TaskTimeRow};
 
-use crate::reports::timeline::device_timeline;
+use crate::reports::timeline::device_timeline_into;
 use crate::reports::write_text;
 use crate::session::{devices, session_for};
 
@@ -19,9 +19,25 @@ pub fn summary(prof: &Path, only: Option<&str>, out: &Path) -> Result<()> {
         let dev = info.device_id.unwrap_or(0);
         // Each `resolve` takes the store lock for one computation only, so the
         // "do not let the guard escape" hazard that used to live here is gone.
-        let tasks = session.resolve::<TaskTimeRow>()?.len() as u64;
-        let ops = session.resolve::<OpSummaryRow>()?.len() as u64;
-        let (_, events) = device_timeline(&device)?;
+        // Count rather than collect: these tables are hundreds of thousands of
+        // rows of strings, and the summary only reports their lengths.
+        let mut tasks = 0u64;
+        session.resolve_into::<TaskTimeRow>(&mut |_| {
+            tasks += 1;
+            Ok(())
+        })?;
+        let mut ops = 0u64;
+        session.resolve_into::<OpSummaryRow>(&mut |_| {
+            ops += 1;
+            Ok(())
+        })?;
+        // Count the events instead of collecting them: `device_timeline` builds a
+        // 4.5 M-event vector just to take its length.
+        let mut events = 0usize;
+        device_timeline_into(&device, &mut |_| {
+            events += 1;
+            Ok(())
+        })?;
         let peak = session
             .resolve::<NpuMemRow>()?
             .iter()

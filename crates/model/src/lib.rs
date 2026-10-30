@@ -8,6 +8,7 @@ pub mod ctx;
 pub mod errors;
 pub(crate) mod format;
 pub mod host;
+pub mod memtrace;
 pub mod nodes;
 pub mod stream;
 pub mod time;

@@ -117,6 +117,19 @@ impl DeviceSession {
         resolve::<T>(&mut store, &self.ctx).with_context(|| format!("on {}", self.label()))
     }
 
+    /// Resolve a node and hand its rows to `out` without memoising the table.
+    ///
+    /// For reports whose only consumer is the writer: `op_summary` emits 300 k+
+    /// rows of 46 strings, which is far more than the inputs it needs.
+    pub fn resolve_into<T: mspark_df::Node>(
+        &self,
+        out: &mut dyn FnMut(T) -> Result<()>,
+    ) -> Result<()> {
+        let mut store = self.store.lock().expect("store lock");
+        mspark_df::resolve_into::<T>(&mut store, &self.ctx, out)
+            .with_context(|| format!("on {}", self.label()))
+    }
+
     /// Human-readable device identity for error messages.
     pub fn label(&self) -> String {
         let device = self
