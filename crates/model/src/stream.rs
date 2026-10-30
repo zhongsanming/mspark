@@ -63,6 +63,170 @@ pub fn files_with_prefix(dir: &Path, prefixes: &[&str]) -> Vec<PathBuf> {
     files.into_iter().map(|(_, path)| path).collect()
 }
 
+/// Streaming reader over one stream's slices.
+///
+/// [`CtxStreams::stream`] returns the whole stream as one `Vec<u8>`; these
+/// captures have streams of 80–160 MB (and `read_concat` held the concatenation
+/// *plus* each slice), which is the largest single allocation in a full export.
+/// This reader instead hands out record-aligned chunks of roughly
+/// [`CHUNK_BYTES`], so a decoder sees the same bytes with only one slice resident.
+///
+/// Alignment mirrors `read_concat` exactly:
+/// - the leading `total % trunk` bytes (a partial first record left by log
+///   rotation) are dropped once, before anything is yielded;
+/// - fixed-record streams only ever yield whole records, carrying the remainder
+///   across slice boundaries;
+/// - text streams (`Trunk::Any`) yield up to the last newline, so a line-oriented
+///   decoder never sees a split line (the final partial line is flushed at EOF,
+///   matching `str::lines`).
+pub struct StreamReader {
+    files: std::vec::IntoIter<PathBuf>,
+    trunk: usize,
+    /// Bytes still to drop from the front (the initial partial record).
+    skip: usize,
+    /// Bytes at the front already handed out; dropped on the next call.
+    spent: usize,
+    buffer: Vec<u8>,
+    finished: bool,
+}
+
+/// Target chunk size: large enough that per-chunk overhead is irrelevant, small
+/// enough that a chunk plus a slice stays well inside L3.
+pub const CHUNK_BYTES: usize = 1 << 21;
+
+/// Refuse to buffer more than this while waiting for a record boundary. Only a
+/// pathological input (a "line" larger than this, or a corrupt record size) can
+/// reach it; without the guard such an input would grow memory without bound.
+const MAX_BUFFER: usize = 8 * CHUNK_BYTES;
+
+impl StreamReader {
+    /// Open a stream without reading it. An absent stream yields no chunks,
+    /// matching [`CtxStreams::stream`].
+    pub fn open(ctx: &Ctx, stream: Stream) -> Result<Self> {
+        let dir = match stream.location() {
+            Location::Device => ctx.device_data_dir()?,
+            Location::Host => ctx.host_data_dir(),
+        };
+        let version = ctx
+            .get::<crate::ctx::DeviceInfo>()
+            .map(version_of)
+            .unwrap_or("1.0");
+        Self::open_in(&dir, stream.prefix(), stream.trunk(version).size())
+    }
+
+    fn open_in(dir: &Path, prefix: &str, trunk: usize) -> Result<Self> {
+        let files = files_with_prefix(dir, &[prefix]);
+        let total: usize = files
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .map(|meta| meta.len() as usize)
+            .sum();
+        Ok(Self {
+            files: files.into_iter(),
+            trunk,
+            skip: if trunk > 1 { total % trunk } else { 0 },
+            spent: 0,
+            buffer: Vec::with_capacity(CHUNK_BYTES + trunk.max(4096)),
+            finished: false,
+        })
+    }
+
+    /// Next record-aligned chunk, or `None` at the end of the stream.
+    ///
+    /// The borrow is tied to `&mut self`: the caller must finish with a chunk
+    /// before asking for the next one, which is the point — only one chunk is
+    /// ever alive. Each call **consumes** the previous chunk.
+    pub fn next_chunk(&mut self) -> Result<Option<&[u8]>> {
+        // Retire the previously yielded bytes.
+        if self.spent > 0 {
+            self.buffer.drain(..self.spent);
+            self.spent = 0;
+        }
+        loop {
+            // Drop the leading partial record.
+            if self.skip > 0 {
+                let take = self.skip.min(self.buffer.len());
+                self.buffer.drain(..take);
+                self.skip -= take;
+                if self.skip > 0 {
+                    self.fill()?;
+                    continue;
+                }
+            }
+            let usable = self.usable();
+            if usable > 0 {
+                self.spent = usable;
+                return Ok(Some(&self.buffer[..usable]));
+            }
+            if self.finished {
+                // Flush a trailing partial record / final unterminated line.
+                if self.buffer.is_empty() {
+                    return Ok(None);
+                }
+                if self.trunk > 1 {
+                    // A whole-record stream is trimmed to whole records, so this
+                    // can only be a corrupt short tail: drop it like `read_concat`.
+                    self.buffer.clear();
+                    return Ok(None);
+                }
+                self.spent = self.buffer.len();
+                return Ok(Some(&self.buffer[..self.spent]));
+            }
+            self.fill()?;
+        }
+    }
+
+    /// How many bytes at the front of `buffer` form whole records.
+    fn usable(&self) -> usize {
+        if self.trunk <= 1 {
+            // Text: stop at the last newline so no line is split.
+            match self.buffer.iter().rposition(|byte| *byte == b'\n') {
+                Some(index) => index + 1,
+                None => 0,
+            }
+        } else {
+            self.buffer.len() / self.trunk * self.trunk
+        }
+    }
+
+    /// Append the next slice, or mark the stream finished.
+    fn fill(&mut self) -> Result<()> {
+        match self.files.next() {
+            Some(path) => {
+                let mut bytes = crate::errors::read(&path)?;
+                self.buffer.append(&mut bytes);
+            }
+            None => self.finished = true,
+        }
+        // Safety valve: if nothing is consumable but the buffer keeps growing,
+        // hand out what we have instead of buffering forever.
+        if self.buffer.len() >= MAX_BUFFER && self.usable() == 0 {
+            self.spent = self.buffer.len();
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    /// Report how many bytes are currently buffered (tests and diagnostics).
+    pub fn buffered(&self) -> usize {
+        self.buffer.len()
+    }
+}
+
+/// Decode a record stream chunk by chunk without materialising it.
+///
+/// `decode` is called once per aligned chunk; decoders are written against
+/// `&[u8]` and use `as_chunks::<N>()`, so they work unchanged.
+pub fn for_each_chunk(
+    mut reader: StreamReader,
+    mut decode: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    while let Some(chunk) = reader.next_chunk()? {
+        decode(chunk)?;
+    }
+    Ok(())
+}
+
 fn read_concat(dir: &Path, prefix: &str, trunk: usize) -> Result<Vec<u8>> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(Vec::new());
@@ -431,6 +595,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Chunks must be record-aligned across slice boundaries, and the leading
+    /// partial record must be dropped exactly like `read_concat` does.
+    #[test]
+    fn stream_reader_matches_read_concat() {
+        let dir = std::env::temp_dir().join(format!("mspark-reader-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 3 slices of 8-byte records, with a 3-byte fragment at the very front.
+        let records: Vec<Vec<u8>> = (0..30u8).map(|i| vec![i; 8]).collect();
+        let mut all = vec![1u8, 2, 3];
+        for record in &records {
+            all.extend_from_slice(record);
+        }
+        for (index, slice) in all.chunks(64).enumerate() {
+            std::fs::write(dir.join(format!("test.data.7.slice_{index}")), slice).unwrap();
+        }
+
+        let expected = read_concat(&dir, "test.data", 8).unwrap();
+        let mut reader = StreamReader::open_in(&dir, "test.data", 8).unwrap();
+        let mut collected = Vec::new();
+        // Bounded on purpose: a reader that never consumes its chunk would spin
+        // here forever (that regression is what this test exists to catch).
+        for round in 0.. {
+            assert!(round < 1_000, "reader did not terminate");
+            let Some(chunk) = reader.next_chunk().unwrap() else {
+                break;
+            };
+            assert_eq!(chunk.len() % 8, 0, "chunk must hold whole records");
+            collected.extend_from_slice(chunk);
+            assert!(
+                reader.buffered() < 1 << 20,
+                "buffer must not grow without bound"
+            );
+        }
+        assert_eq!(collected, expected);
+        assert_eq!(expected.len() % 8, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Text streams must never hand out a partial line.
+    #[test]
+    fn stream_reader_does_not_split_lines() {
+        let dir = std::env::temp_dir().join(format!("mspark-reader-lines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = "a:1\nb:2\nc:3\npartial";
+        for (index, slice) in body.as_bytes().chunks(5).enumerate() {
+            std::fs::write(dir.join(format!("kv.data.7.slice_{index}")), slice).unwrap();
+        }
+        let mut reader = StreamReader::open_in(&dir, "kv.data", 1).unwrap();
+        let mut lines = Vec::new();
+        for round in 0.. {
+            assert!(round < 1_000, "reader did not terminate");
+            let Some(chunk) = reader.next_chunk().unwrap() else {
+                break;
+            };
+            for line in chunk.split(|byte| *byte == b'\n') {
+                if !line.is_empty() {
+                    lines.push(String::from_utf8_lossy(line).into_owned());
+                }
+            }
+        }
+        assert_eq!(lines, ["a:1", "b:2", "c:3", "partial"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// msprof writes a `<name>.done` marker next to every finished file, with
