@@ -433,6 +433,53 @@ mod tests {
         }
     }
 
+    /// msprof writes a `<name>.done` marker next to every finished file, with
+    /// contents like `filesize:178`. Reading one as data yields either an empty
+    /// table or a parse error, so slice listing must skip them.
+    #[test]
+    fn slice_listing_skips_done_markers() {
+        let dir = std::env::temp_dir().join(format!("mspark-slice-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "start_info.7",
+            "start_info.7.done",
+            "start_info.8",
+            "start_info.8.done",
+            "stars_soc.data.7.slice_0",
+            "stars_soc.data.7.slice_0.done",
+            "stars_soc.data.7.slice_1",
+            "stars_soc.data.7.slice_10",
+            "stars_soc.data.7.slice_2",
+            "unaging.additional.hccl_info.slice_0.complete",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let starts = files_with_prefix(&dir, &["start_info"]);
+        let names: Vec<String> = starts
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["start_info.7", "start_info.8"]);
+
+        let slices = files_with_prefix(&dir, &["stars_soc.data"]);
+        let names: Vec<String> = slices
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // Numeric slice order, no `.done`.
+        assert_eq!(
+            names,
+            [
+                "stars_soc.data.7.slice_0",
+                "stars_soc.data.7.slice_1",
+                "stars_soc.data.7.slice_2",
+                "stars_soc.data.7.slice_10",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The versioned streams must switch record size with `info.json:version`.
     #[test]
     fn versioned_trunks() {
