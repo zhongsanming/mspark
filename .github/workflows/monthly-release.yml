@@ -1,0 +1,105 @@
+name: Monthly Version Bump PR
+
+# Opens a PR that bumps the patch version of the whole workspace. Merging that PR
+# is what creates the tag (`tag-on-merge.yml`), and the tag is what publishes
+# (`publish.yml`). Keeping the bump in a PR means the release is reviewable and CI
+# runs on it, instead of a workflow silently rewriting `main`.
+on:
+  schedule:
+    # Runs monthly on the 1st at 04:37 UTC — an offset time to avoid GitHub's
+    # high-load periods.
+    - cron: '37 4 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Calculate next version
+        id: version
+        run: |
+          set -euo pipefail
+          # Highest existing tag, or v0.0.0 when there is none.
+          LAST_TAG=$(git for-each-ref \
+            --sort=-v:refname \
+            --format='%(refname:short)' \
+            refs/tags | head -1 || true)
+          LAST_TAG="${LAST_TAG:-v0.0.0}"
+          echo "Last tag: $LAST_TAG"
+
+          VERSION="${LAST_TAG#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          NEW_PATCH=$(( ${PATCH:-0} + 1 ))
+          NEW_TAG="v${MAJOR}.${MINOR}.${NEW_PATCH}"
+
+          echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+          echo "new_tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+          echo "new_version=${MAJOR}.${MINOR}.${NEW_PATCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Update the workspace version
+        run: |
+          set -euo pipefail
+          NEW_VERSION="${{ steps.version.outputs.new_version }}"
+
+          # `[workspace.package] version` is the single source of truth: every
+          # member inherits it with `version.workspace = true`. The anchored
+          # pattern only matches that line (the third-party entries look like
+          # `foo = { version = "1", … }`).
+          sed -i "s/^version = \"[0-9]\+\.[0-9]\+\.[0-9]\+\"/version = \"${NEW_VERSION}\"/" Cargo.toml
+
+          # The internal path dependencies also carry a version, because crates.io
+          # needs one; keep them in step with the workspace.
+          sed -i "s/^\(mspark-df = { version = \)\"[0-9]\+\.[0-9]\+\.[0-9]\+\"/\1\"${NEW_VERSION}\"/" Cargo.toml
+          sed -i "s/^\(mspark-model = { version = \)\"[0-9]\+\.[0-9]\+\.[0-9]\+\"/\1\"${NEW_VERSION}\"/" Cargo.toml
+
+          # A member that pins its own version would publish a different number
+          # than the tag, so refuse to open the PR instead of shipping a mismatch.
+          if grep -rn '^version = ' crates/*/Cargo.toml; then
+            echo "::error::a member crate pins its own version; it must use version.workspace = true"
+            exit 1
+          fi
+
+          # Refresh the lockfile so `--locked` builds in the publish job work.
+          cargo update --workspace --offline 2>/dev/null || cargo fetch
+
+          echo "--- resulting versions"
+          grep -n '^version = \|^mspark-.*version' Cargo.toml
+
+      - name: Check the workspace builds at the new version
+        run: cargo build --workspace --locked
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          # Use the PAT, not the automatic GITHUB_TOKEN: PRs opened with
+          # GITHUB_TOKEN do not trigger pull_request workflows, so the CI checks
+          # would never run on this PR.
+          token: ${{ secrets.GH_PAT }}
+          commit-message: "chore(release): bump version to ${{ steps.version.outputs.new_tag }}"
+          title: "chore(release): bump version to ${{ steps.version.outputs.new_tag }}"
+          body: |
+            Automated monthly version bump.
+
+            - **Previous tag:** `${{ steps.version.outputs.last_tag }}`
+            - **New tag:** `${{ steps.version.outputs.new_tag }}`
+
+            This PR updates `[workspace.package] version` and the internal
+            dependency constraints in `Cargo.toml`, so all three crates keep the
+            same version. Merging it creates the tag; the tag publishes the
+            crates.
+          branch: chore/monthly-version-bump
+          delete-branch: true
+          labels: |
+            automated
+            release
